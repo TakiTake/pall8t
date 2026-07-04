@@ -1,0 +1,18 @@
+[package]
+name = "pall8t"
+version = "0.1.0"
+edition = "2021"
+description = "Claude in an apple/container — TUI for per-project sandboxed dev containers on macOS"
+license = "MIT"
+repository = "https://github.com/TakiTake/pall8t"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+dirs = "5"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
