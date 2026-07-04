@@ -15,9 +15,9 @@ pub enum State {
 impl State {
     pub fn label(&self) -> &'static str {
         match self {
-            State::Running => "● running",
-            State::Stopped => "○ stopped",
-            State::Absent => "· absent",
+            State::Running => "●",
+            State::Stopped => "○",
+            State::Absent => "·",
         }
     }
 }
@@ -31,24 +31,12 @@ fn read_id(flag: &str) -> Option<u32> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-pub fn slug(name: &str) -> String {
-    let s: String = name
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    s.trim_matches('-').to_string()
-}
-
-pub fn container_name(path: &Path) -> String {
+/// pall8t-<slug(project)>-<sha256(workspace path)[..8]>
+pub fn container_name(project_name: &str, workspace: &Path) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(path.to_string_lossy().as_bytes());
+    let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
     let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-    let dir = path
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "project".to_string());
-    format!("pall8t-{}-{}", slug(&dir), hex)
+    format!("pall8t-{}-{}", crate::workspace::slug(project_name), hex)
 }
 
 pub fn image_tag(base: &str, uid: u32, gid: u32) -> String {
@@ -75,15 +63,10 @@ where
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// True if the `container` CLI is on PATH.
 pub fn cli_available() -> bool {
-    Command::new("container")
-        .arg("--version")
-        .output()
-        .is_ok()
+    Command::new("container").arg("--version").output().is_ok()
 }
 
-/// True if the apple/container system service (apiserver) is running.
 pub fn system_running() -> bool {
     Command::new("container")
         .args(["system", "status"])
@@ -160,7 +143,7 @@ pub fn build_image(containerfile: &Path, ctx_dir: &Path, tag: &str, uid: u32, gi
 
 pub struct RunSpec {
     pub name: String,
-    pub project: PathBuf,
+    pub workspace: PathBuf,
     pub image: String,
     pub cpus: u32,
     pub memory: String,
@@ -168,19 +151,22 @@ pub struct RunSpec {
     pub gid: u32,
 }
 
+/// Identity-path mount: the workspace is visible at the same absolute path
+/// inside the container (ADR-0004).
 pub fn run_detached(spec: &RunSpec) -> Result<()> {
     let home = home_mount()?;
+    let ws = spec.workspace.to_string_lossy().into_owned();
     run_ok([
         "run".to_string(),
         "-d".to_string(),
         "--name".to_string(),
         spec.name.clone(),
         "-v".to_string(),
-        format!("{}:/work", spec.project.display()),
+        format!("{ws}:{ws}"),
         "-v".to_string(),
         format!("{}:/home/dev", home.display()),
         "-w".to_string(),
-        "/work".to_string(),
+        ws.clone(),
         "--user".to_string(),
         "dev".to_string(),
         "--uid".to_string(),
@@ -208,37 +194,25 @@ pub fn stop(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn delete(name: &str) -> Result<()> {
-    run_ok(["delete", name])?;
-    Ok(())
-}
-
 pub fn logs(name: &str) -> Result<String> {
     run_ok(["logs", name])
 }
 
-/// Absolute path to the `container` CLI, resolved once. Spawned terminal
-/// tabs may run with a minimal PATH (e.g. Ghostty uses
-/// `bash --noprofile --norc`), so a bare `container` is not found there.
-pub fn cli_path() -> &'static str {
-    static CLI_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    CLI_PATH.get_or_init(|| {
-        Command::new("which")
-            .arg("container")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "container".to_string())
-    })
-}
-
-/// The command every terminal tab runs. Raw `container exec`, so the tab
-/// keeps working even if pall8t exits.
-pub fn exec_shell_command(name: &str, claude: bool) -> String {
-    let prog = if claude { "claude" } else { "bash -l" };
-    format!("{} exec -it --user dev -w /work {name} {prog}", cli_path())
+/// argv for a tab's PTY child: exec into the project container at the
+/// workspace path. pall8t itself runs with a full PATH, so bare `container`
+/// resolves here (unlike v1's external tabs).
+pub fn exec_argv(name: &str, workspace: &Path, cmd: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "exec".into(),
+        "-it".into(),
+        "--user".into(),
+        "dev".into(),
+        "-w".into(),
+        workspace.to_string_lossy().into_owned(),
+        name.to_string(),
+    ];
+    argv.extend(cmd.iter().cloned());
+    argv
 }
 
 /// Persistent container-side $HOME (claude auth, shell history, dotfiles).

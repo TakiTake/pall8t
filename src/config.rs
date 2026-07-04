@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,8 +11,18 @@ pub struct Config {
     pub cpus: u32,
     #[serde(default = "default_memory")]
     pub memory: String,
+    #[serde(default = "default_workspace_root")]
+    pub workspace_root: PathBuf,
+    #[serde(default = "default_prefix")]
+    pub prefix: String,
+    #[serde(default = "default_notify")]
+    pub notify: String,
+    #[serde(default = "default_agent_command")]
+    pub agent_command: String,
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,
+    #[serde(default)]
+    pub agents: HashMap<String, AgentPatternsConfig>,
 }
 
 impl Default for Config {
@@ -20,7 +31,12 @@ impl Default for Config {
             default_image: default_image(),
             cpus: default_cpus(),
             memory: default_memory(),
+            workspace_root: default_workspace_root(),
+            prefix: default_prefix(),
+            notify: default_notify(),
+            agent_command: default_agent_command(),
             projects: Vec::new(),
+            agents: HashMap::new(),
         }
     }
 }
@@ -34,20 +50,41 @@ fn default_cpus() -> u32 {
 fn default_memory() -> String {
     "4G".to_string()
 }
+fn default_workspace_root() -> PathBuf {
+    PathBuf::from("~/.pall8t/workspaces")
+}
+fn default_prefix() -> String {
+    "ctrl+b".to_string()
+}
+fn default_notify() -> String {
+    "bell".to_string()
+}
+fn default_agent_command() -> String {
+    "claude".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEntry {
     pub name: String,
-    pub path: PathBuf,
+    #[serde(default)]
+    pub repos: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub containerfile: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentPatternsConfig {
+    #[serde(default)]
+    pub waiting_patterns: Vec<String>,
+    #[serde(default)]
+    pub working_patterns: Vec<String>,
+}
+
 pub fn config_path() -> Result<PathBuf> {
     // Deliberately ~/.config (not dirs::config_dir(), which is
-    // ~/Library/Application Support on macOS) — see DESIGN.md §7.
+    // ~/Library/Application Support on macOS) — see DESIGN.md §8.
     let base = dirs::home_dir()
         .map(|h| h.join(".config"))
         .context("cannot determine home directory")?;
@@ -74,4 +111,12 @@ pub fn save(cfg: &Config) -> Result<()> {
     let text = toml::to_string_pretty(cfg).context("cannot serialize config")?;
     std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
     Ok(())
+}
+
+/// Parse a prefix spec like "ctrl+b" into (char). Only ctrl+<char> is supported.
+pub fn parse_prefix(spec: &str) -> char {
+    spec.trim()
+        .strip_prefix("ctrl+")
+        .and_then(|s| s.chars().next())
+        .unwrap_or('b')
 }

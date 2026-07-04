@@ -1,21 +1,23 @@
-use crate::{config, container, filer, spawn};
+use crate::config::{self, Config, ProjectEntry};
+use crate::container::{self, State};
+use crate::detect::{self, AgentPatterns, TabKind, TabState};
+use crate::mux::{self, Tab};
+use crate::workspace;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    Projects,
-    Files,
-}
+use std::time::{Duration, Instant};
 
 pub enum Mode {
     Normal,
+    Prefix,
     AddProject(String),
-    ConfirmDelete,
-    Filter(String),
+    ConfirmClose,
+    ConfirmQuit,
+    Help,
     Logs {
         title: String,
         lines: Vec<String>,
@@ -24,80 +26,96 @@ pub enum Mode {
 }
 
 pub struct ProjectRow {
-    pub entry: config::ProjectEntry,
-    pub state: container::State,
+    pub entry: ProjectEntry,
+    pub workspace: PathBuf,
     pub container: String,
+    pub state: State,
 }
 
-/// Everything the worker needs to build/run a project container.
+/// Snapshot of everything the worker needs for one project.
 #[derive(Clone)]
-pub struct SpawnCtx {
-    pub name: String,
-    pub path: PathBuf,
-    pub image_override: Option<String>,
+pub struct Ctx {
+    pub idx: usize,
+    pub entry: ProjectEntry,
+    pub container: String,
+    pub workspace: PathBuf,
     pub image_base: String,
-    pub containerfile: Option<PathBuf>,
     pub cpus: u32,
     pub memory: String,
 }
 
 pub enum Job {
     Refresh,
-    EnsureAndSpawn { ctx: SpawnCtx, claude: bool },
-    Build(SpawnCtx),
-    Toggle { state: container::State, ctx: SpawnCtx },
-    DeleteContainer(String),
+    Seed(Ctx),
+    Ensure { ctx: Ctx, kind: TabKind },
+    Toggle { ctx: Ctx, state: State },
+    Build(Ctx),
     Logs(String),
 }
 
 pub enum Msg {
-    Containers(Vec<(String, container::State)>),
+    Containers(Vec<(String, State)>),
     Status(String),
     Done(String),
     Warning(String),
     Error(String),
+    Seeded { idx: usize, summary: String },
+    Ready { idx: usize, kind: TabKind },
     Logs { name: String, text: String },
 }
 
 pub struct App {
-    pub config: config::Config,
-    pub rows: Vec<ProjectRow>,
-    pub selected: usize,
-    pub focus: Focus,
+    pub config: Config,
+    pub prefix_char: char,
+    patterns: AgentPatterns,
+    pub projects: Vec<ProjectRow>,
+    pub current_project: usize,
+    pub tabs: Vec<Tab>,
+    pub active_tab: Option<usize>,
+    pub sidebar: bool,
     pub mode: Mode,
-    pub tree: Option<filer::FileTree>,
-    pub preview: Vec<String>,
-    pub preview_title: String,
     pub status: String,
     pub busy: bool,
     pub should_quit: bool,
+    term_rows: u16,
+    term_cols: u16,
+    next_tab_id: u64,
+    auto_agent_tab: Option<usize>,
     jobs: Sender<Job>,
     msgs: Receiver<Msg>,
+    last_refresh: Instant,
 }
 
 impl App {
     pub fn new(path_arg: Option<PathBuf>) -> Result<Self> {
         let mut cfg = config::load()?;
-        let mut select = 0usize;
+        let mut current = 0usize;
+        let mut auto_agent_tab = None;
+
         if let Some(p) = path_arg {
             let abs = std::fs::canonicalize(&p)
                 .with_context(|| format!("cannot resolve path: {}", p.display()))?;
-            if let Some(i) = cfg.projects.iter().position(|e| e.path == abs) {
-                select = i;
+            let name = abs
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "project".to_string());
+            if let Some(i) = cfg
+                .projects
+                .iter()
+                .position(|e| e.repos.first() == Some(&abs) || e.name == name)
+            {
+                current = i;
             } else {
-                let name = abs
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "project".to_string());
-                cfg.projects.push(config::ProjectEntry {
+                cfg.projects.push(ProjectEntry {
                     name,
-                    path: abs,
+                    repos: vec![abs],
                     image: None,
                     containerfile: None,
                 });
                 config::save(&cfg)?;
-                select = cfg.projects.len() - 1;
+                current = cfg.projects.len() - 1;
             }
+            auto_agent_tab = Some(current);
         }
 
         let (uid, gid) = container::host_ids();
@@ -105,52 +123,151 @@ impl App {
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
         thread::spawn(move || worker(job_rx, msg_tx, uid, gid));
 
-        let rows: Vec<ProjectRow> = cfg
+        let projects: Vec<ProjectRow> = cfg
             .projects
             .iter()
-            .map(|e| ProjectRow {
-                container: container::container_name(&e.path),
-                state: container::State::Absent,
-                entry: e.clone(),
+            .map(|e| {
+                let ws = workspace::workspace_path(&cfg.workspace_root, &e.name);
+                ProjectRow {
+                    container: container::container_name(&e.name, &ws),
+                    workspace: ws,
+                    state: State::Absent,
+                    entry: e.clone(),
+                }
             })
             .collect();
 
-        let mut app = Self {
+        let prefix_char = config::parse_prefix(&cfg.prefix);
+        let patterns = AgentPatterns::from_config(&cfg);
+
+        let app = Self {
             config: cfg,
-            rows,
-            selected: select,
-            focus: Focus::Projects,
+            prefix_char,
+            patterns,
+            projects,
+            current_project: current,
+            tabs: Vec::new(),
+            active_tab: None,
+            sidebar: true,
             mode: Mode::Normal,
-            tree: None,
-            preview: Vec::new(),
-            preview_title: String::new(),
-            status: "reconciling with `container list`…".to_string(),
+            status: String::new(),
             busy: false,
             should_quit: false,
+            term_rows: 24,
+            term_cols: 80,
+            next_tab_id: 1,
+            auto_agent_tab,
             jobs: job_tx,
             msgs: msg_rx,
+            last_refresh: Instant::now(),
         };
-        app.load_tree();
+        app.jobs.send(Job::Refresh).ok();
+        if let Some(idx) = app.auto_agent_tab {
+            if let Some(ctx) = app.ctx(idx) {
+                app.jobs.send(Job::Seed(ctx)).ok();
+            }
+        }
         Ok(app)
     }
 
-    pub fn request_refresh(&self) {
-        let _ = self.jobs.send(Job::Refresh);
+    fn ctx(&self, idx: usize) -> Option<Ctx> {
+        self.projects.get(idx).map(|row| Ctx {
+            idx,
+            entry: row.entry.clone(),
+            container: row.container.clone(),
+            workspace: row.workspace.clone(),
+            image_base: self.config.default_image.clone(),
+            cpus: self.config.cpus,
+            memory: self.config.memory.clone(),
+        })
     }
 
-    pub fn drain_worker(&mut self) {
+    /// Inner terminal-widget size, pushed down to every PTY.
+    pub fn set_term_size(&mut self, rows: u16, cols: u16) {
+        if (rows, cols) == (self.term_rows, self.term_cols) {
+            return;
+        }
+        self.term_rows = rows;
+        self.term_cols = cols;
+        for tab in &mut self.tabs {
+            tab.resize(rows, cols);
+        }
+    }
+
+    pub fn waiting_tabs(&self) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.state == TabState::Waiting)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn any_tab_running(&self) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| matches!(t.state, TabState::Working | TabState::Waiting))
+    }
+
+    /// Periodic work: worker messages, container refresh, state detection.
+    pub fn tick(&mut self) {
+        self.drain_worker();
+        if self.last_refresh.elapsed() >= Duration::from_secs(2) {
+            self.jobs.send(Job::Refresh).ok();
+            self.last_refresh = Instant::now();
+        }
+        let mut notifications: Vec<String> = Vec::new();
+        for tab in &mut self.tabs {
+            let exited = tab.exited();
+            let bottom = tab.bottom_text(12);
+            let new = detect::classify(
+                tab.kind,
+                exited,
+                tab.since_output(),
+                &bottom,
+                &self.patterns,
+            );
+            if new == TabState::Waiting && tab.state != TabState::Waiting {
+                notifications.push(format!("{} is waiting for you", tab.title));
+            }
+            tab.state = new;
+        }
+        for n in notifications {
+            self.notify(&n);
+        }
+    }
+
+    fn notify(&self, message: &str) {
+        match self.config.notify.as_str() {
+            "off" => {}
+            "banner" => {
+                let script = format!(
+                    "display notification \"{}\" with title \"pall8t\"",
+                    message.replace('"', "'")
+                );
+                let _ = std::process::Command::new("osascript")
+                    .arg("-e")
+                    .arg(script)
+                    .spawn();
+            }
+            _ => {
+                let mut out = std::io::stdout();
+                let _ = out.write_all(b"\x07");
+                let _ = out.flush();
+            }
+        }
+    }
+
+    fn drain_worker(&mut self) {
         while let Ok(msg) = self.msgs.try_recv() {
             match msg {
                 Msg::Containers(list) => {
-                    for row in &mut self.rows {
+                    for row in &mut self.projects {
                         row.state = list
                             .iter()
                             .find(|(name, _)| *name == row.container)
                             .map(|(_, s)| *s)
-                            .unwrap_or(container::State::Absent);
-                    }
-                    if self.status.starts_with("reconciling") {
-                        self.status.clear();
+                            .unwrap_or(State::Absent);
                     }
                 }
                 Msg::Status(s) => {
@@ -169,99 +286,168 @@ impl App {
                     self.status = format!("error: {e}");
                     self.busy = false;
                 }
+                Msg::Seeded { idx, summary } => {
+                    self.status = summary;
+                    self.busy = false;
+                    if self.auto_agent_tab == Some(idx) {
+                        self.auto_agent_tab = None;
+                        if let Some(ctx) = self.ctx(idx) {
+                            self.busy = true;
+                            self.jobs.send(Job::Ensure {
+                                ctx,
+                                kind: TabKind::Agent,
+                            })
+                            .ok();
+                        }
+                    }
+                }
+                Msg::Ready { idx, kind } => {
+                    self.busy = false;
+                    if let Err(e) = self.open_tab(idx, kind) {
+                        self.status = format!("error: {e:#}");
+                    }
+                }
                 Msg::Logs { name, text } => {
+                    self.busy = false;
                     self.mode = Mode::Logs {
                         title: name,
                         lines: text.lines().map(|s| s.to_string()).collect(),
                         scroll: 0,
                     };
-                    self.busy = false;
                 }
             }
         }
     }
 
-    fn selected_row(&self) -> Option<&ProjectRow> {
-        self.rows.get(self.selected)
+    fn open_tab(&mut self, idx: usize, kind: TabKind) -> Result<()> {
+        let row = self
+            .projects
+            .get(idx)
+            .context("project disappeared")?;
+        let cmd: Vec<String> = match kind {
+            TabKind::Agent => self
+                .config
+                .agent_command
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+            TabKind::Shell => vec!["bash".to_string(), "-l".to_string()],
+        };
+        let title = cmd.first().cloned().unwrap_or_else(|| "tab".to_string());
+        let mut argv = vec!["container".to_string()];
+        argv.extend(container::exec_argv(&row.container, &row.workspace, &cmd));
+        let tab = Tab::spawn(
+            self.next_tab_id,
+            idx,
+            kind,
+            title.clone(),
+            &argv,
+            self.term_rows,
+            self.term_cols,
+        )?;
+        self.next_tab_id += 1;
+        self.tabs.push(tab);
+        self.active_tab = Some(self.tabs.len() - 1);
+        self.current_project = idx;
+        self.status = format!("opened {title} tab");
+        Ok(())
     }
 
-    fn spawn_ctx(&self) -> Option<SpawnCtx> {
-        self.selected_row().map(|row| SpawnCtx {
-            name: row.container.clone(),
-            path: row.entry.path.clone(),
-            image_override: row.entry.image.clone(),
-            image_base: self.config.default_image.clone(),
-            containerfile: row.entry.containerfile.clone(),
-            cpus: self.config.cpus,
-            memory: self.config.memory.clone(),
-        })
-    }
-
-    fn load_tree(&mut self) {
-        self.preview.clear();
-        self.preview_title.clear();
-        self.tree = self
-            .selected_row()
-            .filter(|r| r.entry.path.is_dir())
-            .map(|r| filer::FileTree::new(r.entry.path.clone()));
-    }
-
-    fn update_preview(&mut self) {
-        let node = self
-            .tree
-            .as_ref()
-            .and_then(|t| t.selected_node())
-            .cloned();
-        match node {
-            Some(n) if !n.is_dir => {
-                self.preview = filer::preview(&n.path);
-                self.preview_title = n.name;
-            }
-            _ => {
-                self.preview.clear();
-                self.preview_title.clear();
-            }
+    fn request_tab(&mut self, kind: TabKind) {
+        if let Some(ctx) = self.ctx(self.current_project) {
+            self.busy = true;
+            self.status = "preparing container…".to_string();
+            self.jobs.send(Job::Ensure { ctx, kind }).ok();
+        } else {
+            self.status = "no project — press P to add one".to_string();
         }
     }
 
-    fn select_project(&mut self, index: usize) {
-        if index < self.rows.len() && index != self.selected {
-            self.selected = index;
-            self.load_tree();
+    fn close_active_tab(&mut self, force: bool) {
+        let Some(i) = self.active_tab else { return };
+        let running = matches!(
+            self.tabs[i].state,
+            TabState::Working | TabState::Waiting
+        );
+        if running && !force {
+            self.mode = Mode::ConfirmClose;
+            return;
         }
+        let mut tab = self.tabs.remove(i);
+        tab.kill();
+        self.active_tab = if self.tabs.is_empty() {
+            None
+        } else {
+            Some(i.min(self.tabs.len() - 1))
+        };
+        if let Some(a) = self.active_tab {
+            self.current_project = self.tabs[a].project;
+        }
+    }
+
+    fn select_tab(&mut self, i: usize) {
+        if i < self.tabs.len() {
+            self.active_tab = Some(i);
+            self.current_project = self.tabs[i].project;
+        }
+    }
+
+    fn cycle_tab(&mut self, delta: i64) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let len = self.tabs.len() as i64;
+        let cur = self.active_tab.unwrap_or(0) as i64;
+        let next = (cur + delta).rem_euclid(len) as usize;
+        self.select_tab(next);
+    }
+
+    fn jump_next_waiting(&mut self) {
+        let waiting = self.waiting_tabs();
+        if waiting.is_empty() {
+            self.status = "no tab is waiting".to_string();
+            return;
+        }
+        let cur = self.active_tab.unwrap_or(0);
+        let next = waiting
+            .iter()
+            .copied()
+            .find(|&i| i > cur)
+            .unwrap_or(waiting[0]);
+        self.select_tab(next);
     }
 
     fn add_project(&mut self, input: &str) {
-        let raw = input.trim();
-        if raw.is_empty() {
+        let paths: Vec<PathBuf> = input
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| workspace::expand_tilde(&PathBuf::from(s)))
+            .collect();
+        if paths.is_empty() {
             return;
         }
-        let expanded = if let Some(rest) = raw.strip_prefix("~/") {
-            match dirs::home_dir() {
-                Some(h) => h.join(rest),
-                None => PathBuf::from(raw),
+        let mut repos = Vec::new();
+        for p in paths {
+            match std::fs::canonicalize(&p) {
+                Ok(abs) => repos.push(abs),
+                Err(e) => {
+                    self.status = format!("cannot add {}: {e}", p.display());
+                    return;
+                }
             }
-        } else {
-            PathBuf::from(raw)
-        };
-        let abs = match std::fs::canonicalize(&expanded) {
-            Ok(p) => p,
-            Err(e) => {
-                self.status = format!("cannot add {}: {e}", expanded.display());
-                return;
-            }
-        };
-        if self.config.projects.iter().any(|e| e.path == abs) {
-            self.status = "project already exists".to_string();
-            return;
         }
-        let name = abs
+        let name = repos[0]
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "project".to_string());
-        let entry = config::ProjectEntry {
+        if self.config.projects.iter().any(|e| e.name == name) {
+            self.status = format!("project `{name}` already exists");
+            return;
+        }
+        let entry = ProjectEntry {
             name,
-            path: abs,
+            repos,
             image: None,
             containerfile: None,
         };
@@ -269,40 +455,63 @@ impl App {
         if let Err(e) = config::save(&self.config) {
             self.status = format!("config save failed: {e}");
         }
-        self.rows.push(ProjectRow {
-            container: container::container_name(&entry.path),
-            state: container::State::Absent,
+        let ws = workspace::workspace_path(&self.config.workspace_root, &entry.name);
+        self.projects.push(ProjectRow {
+            container: container::container_name(&entry.name, &ws),
+            workspace: ws,
+            state: State::Absent,
             entry,
         });
-        self.selected = self.rows.len() - 1;
-        self.load_tree();
-        self.request_refresh();
+        self.current_project = self.projects.len() - 1;
+        if let Some(ctx) = self.ctx(self.current_project) {
+            self.busy = true;
+            self.jobs.send(Job::Seed(ctx)).ok();
+        }
     }
 
-    fn remove_project(&mut self, delete_container: bool) {
-        if self.selected >= self.rows.len() {
-            return;
+    pub fn on_paste(&mut self, text: &str) {
+        if matches!(self.mode, Mode::Normal) {
+            if let Some(i) = self.active_tab {
+                let bytes = mux::encode_paste(text);
+                self.tabs[i].write_bytes(&bytes);
+            }
+        } else if let Mode::AddProject(input) = &mut self.mode {
+            input.push_str(text);
         }
-        let row = self.rows.remove(self.selected);
-        self.config.projects.retain(|e| e.path != row.entry.path);
-        if let Err(e) = config::save(&self.config) {
-            self.status = format!("config save failed: {e}");
-        } else {
-            self.status = format!("removed {}", row.entry.name);
-        }
-        if delete_container && row.state != container::State::Absent {
-            let _ = self.jobs.send(Job::DeleteContainer(row.container));
-            self.busy = true;
-        }
-        if self.selected >= self.rows.len() {
-            self.selected = self.rows.len().saturating_sub(1);
-        }
-        self.load_tree();
+    }
+
+    fn is_prefix(&self, code: KeyCode, mods: KeyModifiers) -> bool {
+        mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char(self.prefix_char)
     }
 
     pub fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let mode = std::mem::replace(&mut self.mode, Mode::Normal);
         match mode {
+            Mode::Normal => {
+                if self.is_prefix(code, mods) {
+                    self.mode = Mode::Prefix;
+                } else if self.active_tab.is_some() {
+                    if let Some(bytes) = mux::encode_key(code, mods) {
+                        if let Some(i) = self.active_tab {
+                            self.tabs[i].write_bytes(&bytes);
+                        }
+                    }
+                } else {
+                    // No tabs: commands work without the prefix.
+                    self.command_key(code);
+                }
+            }
+            Mode::Prefix => {
+                if self.is_prefix(code, mods) {
+                    // prefix twice sends the prefix itself to the tab
+                    if let Some(i) = self.active_tab {
+                        let byte = (self.prefix_char.to_ascii_lowercase() as u8) & 0x1f;
+                        self.tabs[i].write_bytes(&[byte]);
+                    }
+                } else {
+                    self.command_key(code);
+                }
+            }
             Mode::AddProject(mut input) => match code {
                 KeyCode::Enter => self.add_project(&input.clone()),
                 KeyCode::Esc => {}
@@ -316,37 +525,21 @@ impl App {
                 }
                 _ => self.mode = Mode::AddProject(input),
             },
-            Mode::ConfirmDelete => match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => self.remove_project(true),
-                KeyCode::Char('n') | KeyCode::Char('N') => self.remove_project(false),
+            Mode::ConfirmClose => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.close_active_tab(true),
                 _ => {}
             },
-            Mode::Filter(mut input) => match code {
-                KeyCode::Enter => {}
-                KeyCode::Esc => {
-                    if let Some(tree) = self.tree.as_mut() {
-                        tree.filter.clear();
-                        tree.rebuild();
-                    }
-                }
-                KeyCode::Backspace => {
-                    input.pop();
-                    self.apply_filter(&input);
-                    self.mode = Mode::Filter(input);
-                }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    self.apply_filter(&input);
-                    self.mode = Mode::Filter(input);
-                }
-                _ => self.mode = Mode::Filter(input),
+            Mode::ConfirmQuit => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.quit(true),
+                _ => {}
             },
+            Mode::Help => {}
             Mode::Logs {
                 title,
                 lines,
                 scroll,
             } => match code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('L') => {}
+                KeyCode::Esc | KeyCode::Char('q') => {}
                 KeyCode::Char('j') | KeyCode::Down => {
                     let max = lines.len().saturating_sub(1);
                     self.mode = Mode::Logs {
@@ -385,142 +578,74 @@ impl App {
                     };
                 }
             },
-            Mode::Normal => self.on_key_normal(code, mods),
         }
     }
 
-    fn apply_filter(&mut self, input: &str) {
-        if let Some(tree) = self.tree.as_mut() {
-            tree.filter = input.to_string();
-            tree.rebuild();
-        }
-        self.update_preview();
-    }
-
-    fn on_key_normal(&mut self, code: KeyCode, _mods: KeyModifiers) {
+    /// A command key: after the prefix, or bare when no tabs exist.
+    fn command_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Tab => {
-                self.focus = match self.focus {
-                    Focus::Projects => Focus::Files,
-                    Focus::Files => Focus::Projects,
-                };
+            KeyCode::Char('a') => self.request_tab(TabKind::Agent),
+            KeyCode::Char('c') => self.request_tab(TabKind::Shell),
+            KeyCode::Char('n') => self.jump_next_waiting(),
+            KeyCode::Char('j') => self.cycle_tab(1),
+            KeyCode::Char('k') => self.cycle_tab(-1),
+            KeyCode::Char(c @ '1'..='9') => {
+                let i = (c as u8 - b'1') as usize;
+                self.select_tab(i);
             }
-            KeyCode::Char('r') => {
-                self.status = "refreshing…".to_string();
-                self.request_refresh();
-            }
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char('g') => match self.focus {
-                Focus::Projects => self.select_project(0),
-                Focus::Files => {
-                    if let Some(t) = self.tree.as_mut() {
-                        t.top();
-                    }
-                    self.update_preview();
-                }
-            },
-            KeyCode::Char('G') => match self.focus {
-                Focus::Projects => self.select_project(self.rows.len().saturating_sub(1)),
-                Focus::Files => {
-                    if let Some(t) = self.tree.as_mut() {
-                        t.bottom();
-                    }
-                    self.update_preview();
-                }
-            },
-            KeyCode::Char('h') | KeyCode::Left => {
-                if self.focus == Focus::Files {
-                    if let Some(t) = self.tree.as_mut() {
-                        t.collapse();
-                    }
-                    self.update_preview();
+            KeyCode::Char('p') => {
+                if !self.projects.is_empty() {
+                    self.current_project = (self.current_project + 1) % self.projects.len();
+                    let name = self.projects[self.current_project].entry.name.clone();
+                    self.status = format!("project: {name}");
                 }
             }
-            KeyCode::Char('l') | KeyCode::Right => {
-                if self.focus == Focus::Files {
-                    if let Some(t) = self.tree.as_mut() {
-                        t.expand();
-                    }
-                    self.update_preview();
-                }
-            }
-            KeyCode::Enter => match self.focus {
-                Focus::Projects => self.spawn_tab(false),
-                Focus::Files => {
-                    if let Some(t) = self.tree.as_mut() {
-                        t.toggle();
-                    }
-                    self.update_preview();
-                }
-            },
-            KeyCode::Char('c') => self.spawn_tab(true),
+            KeyCode::Char('P') => self.mode = Mode::AddProject(String::new()),
+            KeyCode::Char('x') => self.close_active_tab(false),
             KeyCode::Char('s') => {
-                let state = self.selected_row().map(|r| r.state);
-                if let (Some(state), Some(ctx)) = (state, self.spawn_ctx()) {
-                    self.status = "…".to_string();
+                let state = self.projects.get(self.current_project).map(|r| r.state);
+                if let (Some(state), Some(ctx)) = (state, self.ctx(self.current_project)) {
                     self.busy = true;
-                    let _ = self.jobs.send(Job::Toggle { state, ctx });
+                    self.status = "…".to_string();
+                    self.jobs.send(Job::Toggle { ctx, state }).ok();
                 }
             }
             KeyCode::Char('b') => {
-                if let Some(ctx) = self.spawn_ctx() {
+                if let Some(ctx) = self.ctx(self.current_project) {
                     self.busy = true;
-                    let _ = self.jobs.send(Job::Build(ctx));
+                    self.jobs.send(Job::Build(ctx)).ok();
                 }
             }
             KeyCode::Char('L') => {
-                let info = self.selected_row().map(|r| (r.state, r.container.clone()));
+                let info = self
+                    .projects
+                    .get(self.current_project)
+                    .map(|r| (r.state, r.container.clone()));
                 if let Some((state, name)) = info {
-                    if state == container::State::Absent {
+                    if state == State::Absent {
                         self.status = "no container yet".to_string();
                     } else {
                         self.busy = true;
-                        let _ = self.jobs.send(Job::Logs(name));
+                        self.jobs.send(Job::Logs(name)).ok();
                     }
                 }
             }
-            KeyCode::Char('a') => self.mode = Mode::AddProject(String::new()),
-            KeyCode::Char('d') => {
-                if !self.rows.is_empty() {
-                    self.mode = Mode::ConfirmDelete;
-                }
-            }
-            KeyCode::Char('/') => {
-                if self.focus == Focus::Files && self.tree.is_some() {
-                    self.mode = Mode::Filter(String::new());
-                }
-            }
+            KeyCode::Char('z') => self.sidebar = !self.sidebar,
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('q') => self.quit(false),
             _ => {}
         }
     }
 
-    fn move_selection(&mut self, delta: i64) {
-        match self.focus {
-            Focus::Projects => {
-                if self.rows.is_empty() {
-                    return;
-                }
-                let len = self.rows.len() as i64;
-                let next = (self.selected as i64 + delta).clamp(0, len - 1) as usize;
-                self.select_project(next);
-            }
-            Focus::Files => {
-                if let Some(t) = self.tree.as_mut() {
-                    t.move_by(delta);
-                }
-                self.update_preview();
-            }
+    fn quit(&mut self, force: bool) {
+        if self.any_tab_running() && !force {
+            self.mode = Mode::ConfirmQuit;
+            return;
         }
-    }
-
-    fn spawn_tab(&mut self, claude: bool) {
-        if let Some(ctx) = self.spawn_ctx() {
-            self.status = "preparing container…".to_string();
-            self.busy = true;
-            let _ = self.jobs.send(Job::EnsureAndSpawn { ctx, claude });
+        for tab in &mut self.tabs {
+            tab.kill();
         }
+        self.should_quit = true;
     }
 }
 
@@ -553,40 +678,44 @@ fn handle_job(job: Job, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
                 }
             }
         },
-        Job::EnsureAndSpawn { ctx, claude } => {
+        Job::Seed(ctx) => {
+            let _ = msgs.send(Msg::Status(format!(
+                "seeding workspace for {}…",
+                ctx.entry.name
+            )));
+            let summary = workspace::seed(&ctx.workspace, &ctx.entry)?;
+            let _ = msgs.send(Msg::Seeded {
+                idx: ctx.idx,
+                summary,
+            });
+        }
+        Job::Ensure { ctx, kind } => {
+            workspace::seed(&ctx.workspace, &ctx.entry)?;
             ensure_running(&ctx, msgs, uid, gid)?;
-            let cmd = container::exec_shell_command(&ctx.name, claude);
-            let result = spawn::spawn_tab(&cmd)?;
+            let _ = msgs.send(Msg::Ready { idx: ctx.idx, kind });
             refresh(msgs);
-            let _ = msgs.send(Msg::Done(result));
         }
-        Job::Build(ctx) => {
-            let tag = build_image(&ctx, msgs, uid, gid)?;
-            let _ = msgs.send(Msg::Done(format!("image built: {tag}")));
-        }
-        Job::Toggle { state, ctx } => {
+        Job::Toggle { ctx, state } => {
             match state {
-                container::State::Running => {
-                    let _ = msgs.send(Msg::Status(format!("stopping {}…", ctx.name)));
-                    container::stop(&ctx.name)?;
+                State::Running => {
+                    let _ = msgs.send(Msg::Status(format!("stopping {}…", ctx.container)));
+                    container::stop(&ctx.container)?;
                 }
-                container::State::Stopped => {
-                    let _ = msgs.send(Msg::Status(format!("starting {}…", ctx.name)));
-                    container::start(&ctx.name)?;
+                State::Stopped => {
+                    let _ = msgs.send(Msg::Status(format!("starting {}…", ctx.container)));
+                    container::start(&ctx.container)?;
                 }
-                container::State::Absent => {
+                State::Absent => {
+                    workspace::seed(&ctx.workspace, &ctx.entry)?;
                     ensure_running(&ctx, msgs, uid, gid)?;
                 }
             }
             refresh(msgs);
             let _ = msgs.send(Msg::Done("done".to_string()));
         }
-        Job::DeleteContainer(name) => {
-            let _ = msgs.send(Msg::Status(format!("deleting {name}…")));
-            let _ = container::stop(&name);
-            container::delete(&name)?;
-            refresh(msgs);
-            let _ = msgs.send(Msg::Done(format!("deleted {name}")));
+        Job::Build(ctx) => {
+            let tag = build_image(&ctx, msgs, uid, gid)?;
+            let _ = msgs.send(Msg::Done(format!("image built: {tag}")));
         }
         Job::Logs(name) => {
             let text = container::logs(&name)?;
@@ -602,20 +731,21 @@ fn refresh(msgs: &Sender<Msg>) {
     }
 }
 
-fn resolve_image(ctx: &SpawnCtx, uid: u32, gid: u32) -> String {
-    ctx.image_override
+fn resolve_image(ctx: &Ctx, uid: u32, gid: u32) -> String {
+    ctx.entry
+        .image
         .clone()
         .unwrap_or_else(|| container::image_tag(&ctx.image_base, uid, gid))
 }
 
-fn build_image(ctx: &SpawnCtx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<String> {
+fn build_image(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<String> {
     let tag = resolve_image(ctx, uid, gid);
-    let containerfile = match &ctx.containerfile {
+    let containerfile = match &ctx.entry.containerfile {
         Some(cf) => {
             if cf.is_absolute() {
                 cf.clone()
             } else {
-                ctx.path.join(cf)
+                ctx.workspace.join(cf)
             }
         }
         None => container::default_containerfile_path()?,
@@ -631,29 +761,29 @@ fn build_image(ctx: &SpawnCtx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result
     Ok(tag)
 }
 
-/// Absent → build image if missing → run; Stopped → start; Running → no-op.
-fn ensure_running(ctx: &SpawnCtx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
+fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
+    std::fs::create_dir_all(&ctx.workspace)?;
     let list = container::list_all()?;
     let state = list
         .iter()
-        .find(|(name, _)| *name == ctx.name)
+        .find(|(name, _)| *name == ctx.container)
         .map(|(_, s)| *s)
-        .unwrap_or(container::State::Absent);
+        .unwrap_or(State::Absent);
     match state {
-        container::State::Running => {}
-        container::State::Stopped => {
-            let _ = msgs.send(Msg::Status(format!("starting {}…", ctx.name)));
-            container::start(&ctx.name)?;
+        State::Running => {}
+        State::Stopped => {
+            let _ = msgs.send(Msg::Status(format!("starting {}…", ctx.container)));
+            container::start(&ctx.container)?;
         }
-        container::State::Absent => {
+        State::Absent => {
             let tag = resolve_image(ctx, uid, gid);
             if !container::image_exists(&tag) {
                 build_image(ctx, msgs, uid, gid)?;
             }
-            let _ = msgs.send(Msg::Status(format!("creating {}…", ctx.name)));
+            let _ = msgs.send(Msg::Status(format!("creating {}…", ctx.container)));
             container::run_detached(&container::RunSpec {
-                name: ctx.name.clone(),
-                project: ctx.path.clone(),
+                name: ctx.container.clone(),
+                workspace: ctx.workspace.clone(),
                 image: tag,
                 cpus: ctx.cpus,
                 memory: ctx.memory.clone(),
