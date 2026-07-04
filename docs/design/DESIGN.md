@@ -4,11 +4,21 @@
 
 A Rust + ratatui TUI that runs AI coding agents (and shells) inside per-project sandboxed dev containers on macOS using [apple/container](https://github.com/apple/container) — with correct host↔container file ownership — and multiplexes them as tabs, herdr-style: you always see which agent is working, which is waiting for your approval, and which is done.
 
+## Why
+
+The workflow pall8t serves: **several tasks in parallel on the same git repo, one AI agent session per task**, so sessions never mix. Previously this ran on Podman + DevContainer (one DevContainer per project) — a redundant stack on macOS, where apple/container provides lightweight per-container VMs natively.
+
+The barrier to switching is that apple/container's CLI is completely different from docker's, so none of the existing devcontainer tooling can drive it. Docker-CLI-compatibility wrappers over apple/container exist, but emulating docker semantics on top of a different engine is a leaky extra layer; a small purpose-built tool for this one workflow is simpler. pall8t wraps apple/container natively (see ADR-0001) and gives up docker compatibility on purpose.
+
+**Sales point:** pall8t is just a TUI on stdin/stdout — it runs identically in a standalone terminal (Ghostty, iTerm2, …) and inside an IDE's integrated terminal (VS Code etc.). The embedded multiplexer (ADR-0003) is what makes this portable; spawning external terminal tabs could not offer it.
+
 ## 1. Goals / Non-goals
 
 **Goals**
 
 - Run AI agents (`claude`, later others) and arbitrary shells inside an apple/container VM, never on the host. This is the core of the tool.
+- Run anywhere a terminal runs: standalone or from an IDE's integrated terminal (VS Code etc.). No dependency on a specific terminal app.
+- One agent session per task, many tasks per project: tabs are independent `container exec` sessions sharing the project's container.
 - Files created in the mounted project dir are owned by the host user — never root.
 - One keep-alive container per project, created lazily, shared by all of that project's tabs.
 - Minimal multiplexer: a shortcut creates a new tab running a terminal or an AI agent *inside the TUI*. No panes, no splits, no mouse requirements.

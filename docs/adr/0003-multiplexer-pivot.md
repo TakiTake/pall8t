@@ -10,6 +10,7 @@ Prototype testing of v1 produced two findings:
 
 1. The read-only filer (file tree + preview) went unused. Its job is done better by tools inside the container tab.
 2. Spawning *external* terminal tabs (Ghostty/iTerm2/…) works, but pall8t then has zero visibility into them. The core use case — running several AI agents in sandboxed containers concurrently — needs [herdr](https://github.com/ogulcancelik/herdr)-style awareness: which agent is working, which is blocked on an approval prompt, which is done. That requires owning the agents' terminals.
+3. pall8t must also work from an IDE's integrated terminal (VS Code etc.), a primary usage mode. External-tab spawning breaks there: tabs open in a separate terminal app, away from the IDE. An embedded multiplexer keeps everything in whatever terminal pall8t was launched from.
 
 herdr itself is close but is a general multiplexer (server/client detach model, workspaces, panes, mouse-native, socket API) and knows nothing about apple/container. pall8t's value is the container sandbox; it needs only a thin slice of multiplexing.
 
