@@ -1,0 +1,22 @@
+# Dev tools for pall8t (https://mise.jdx.dev)
+# Note: apple/container itself is a system service (installer pkg + launchd),
+# not manageable via mise — install from https://github.com/apple/container/releases
+
+[tools]
+rust = "1.96"
+
+[tasks.check]
+description = "Type-check without building"
+run = "cargo check"
+
+[tasks.build]
+description = "Release build"
+run = "cargo build --release"
+
+[tasks.install]
+description = "Install pall8t to ~/.cargo/bin"
+run = "cargo install --path ."
+
+[tasks.lint]
+description = "Clippy + rustfmt check"
+run = ["cargo clippy -- -D warnings", "cargo fmt --check"]
