@@ -828,7 +828,21 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
                         "image changed ({current} → {tag}) — recreating {}…",
                         ctx.container
                     )));
-                    container::delete(&ctx.container)?;
+                    // A just-stopped container can still be shutting down
+                    // ("stopping" reads as non-running); stop is a no-op if
+                    // already down, and delete gets a few retries.
+                    let _ = container::stop(&ctx.container);
+                    let mut result = Ok(());
+                    for attempt in 0..5 {
+                        result = container::delete(&ctx.container);
+                        if result.is_ok() {
+                            break;
+                        }
+                        if attempt < 4 {
+                            std::thread::sleep(Duration::from_millis(800));
+                        }
+                    }
+                    result?;
                     state = State::Absent;
                 }
             }
