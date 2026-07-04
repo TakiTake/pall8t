@@ -7,13 +7,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
 pub struct Tab {
     pub project: usize,
     pub kind: TabKind,
     pub title: String,
     pub state: TabState,
     parser: Arc<Mutex<vt100::Parser>>,
-    writer: Box<dyn Write + Send>,
+    writer: SharedWriter,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
     last_output: Arc<Mutex<Instant>>,
@@ -51,7 +53,9 @@ impl Tab {
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().context("clone reader")?;
-        let writer = pair.master.take_writer().context("take writer")?;
+        let writer: SharedWriter = Arc::new(Mutex::new(
+            pair.master.take_writer().context("take writer")?,
+        ));
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000)));
         let last_output = Arc::new(Mutex::new(Instant::now()));
@@ -59,10 +63,12 @@ impl Tab {
 
         {
             let parser = Arc::clone(&parser);
+            let writer = Arc::clone(&writer);
             let last_output = Arc::clone(&last_output);
             let eof = Arc::clone(&eof);
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
+                let mut tail: Vec<u8> = Vec::new();
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => {
@@ -75,6 +81,20 @@ impl Tab {
                             }
                             if let Ok(mut t) = last_output.lock() {
                                 *t = Instant::now();
+                            }
+                            // A real terminal answers queries like "where is
+                            // the cursor?" (DSR); vt100 only parses. Without
+                            // replies, apps using them (gh/survey, some TUIs)
+                            // block forever. Sniff and answer here.
+                            let mut data = std::mem::take(&mut tail);
+                            data.extend_from_slice(&buf[..n]);
+                            let mut replies: Vec<u8> = Vec::new();
+                            tail = answer_queries(&data, &parser, &mut replies);
+                            if !replies.is_empty() {
+                                if let Ok(mut w) = writer.lock() {
+                                    let _ = w.write_all(&replies);
+                                    let _ = w.flush();
+                                }
                             }
                         }
                     }
@@ -98,8 +118,10 @@ impl Tab {
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        if let Ok(mut w) = self.writer.lock() {
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        }
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -154,6 +176,73 @@ impl Tab {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
+}
+
+/// Scan child output for terminal queries and append the replies a real
+/// terminal would send. Returns trailing bytes that might be the start of an
+/// incomplete query (carried over to the next chunk).
+fn answer_queries(
+    data: &[u8],
+    parser: &Arc<Mutex<vt100::Parser>>,
+    out: &mut Vec<u8>,
+) -> Vec<u8> {
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= data.len() {
+            return data[i..].to_vec();
+        }
+        if data[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        // CSI: params, then a final byte in 0x40..=0x7e.
+        let mut j = i + 2;
+        let mut fin: Option<u8> = None;
+        while j < data.len() && j - i <= 18 {
+            let b = data[j];
+            if (0x40..=0x7e).contains(&b) {
+                fin = Some(b);
+                break;
+            }
+            j += 1;
+        }
+        let Some(fin) = fin else {
+            if data.len() - i <= 18 {
+                return data[i..].to_vec();
+            }
+            i += 2;
+            continue;
+        };
+        let params = &data[i + 2..j];
+        match fin {
+            // DSR: cursor position report (this is what gh/survey block on)
+            b'n' if params == b"6" => {
+                if let Ok(p) = parser.lock() {
+                    let (row, col) = p.screen().cursor_position();
+                    out.extend_from_slice(
+                        format!("\x1b[{};{}R", row + 1, col + 1).as_bytes(),
+                    );
+                }
+            }
+            // DSR: device status → OK
+            b'n' if params == b"5" => out.extend_from_slice(b"\x1b[0n"),
+            // Primary device attributes → VT220 with color
+            b'c' if params.is_empty() || params == b"0" => {
+                out.extend_from_slice(b"\x1b[?62;22c");
+            }
+            // Secondary device attributes
+            b'c' if params.first() == Some(&b'>') => {
+                out.extend_from_slice(b"\x1b[>1;10;0c");
+            }
+            _ => {}
+        }
+        i = j + 1;
+    }
+    Vec::new()
 }
 
 /// Encode a key event as the byte sequence a terminal would send.
