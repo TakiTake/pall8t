@@ -99,16 +99,18 @@ impl App {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "project".to_string());
-            if let Some(i) = cfg
-                .projects
-                .iter()
-                .position(|e| e.repos.first() == Some(&abs) || e.name == name)
-            {
+            if let Some(i) = cfg.projects.iter().position(|e| e.repos.contains(&abs)) {
+                current = i;
+            } else if let Some(i) = cfg.projects.iter().position(|e| e.name == name) {
+                // Same project name: register this repo with it.
+                cfg.projects[i].repos.push(abs);
+                config::save(&cfg)?;
                 current = i;
             } else {
                 cfg.projects.push(ProjectEntry {
                     name,
                     repos: vec![abs],
+                    path: None,
                     image: None,
                     containerfile: None,
                 });
@@ -456,6 +458,7 @@ impl App {
         let entry = ProjectEntry {
             name,
             repos,
+            path: None,
             image: None,
             containerfile: None,
         };
@@ -802,11 +805,36 @@ fn build_image(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<Stri
 fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
     std::fs::create_dir_all(&ctx.workspace)?;
     let list = container::list_all()?;
-    let state = list
+    let mut state = list
         .iter()
         .find(|(name, _)| *name == ctx.container)
         .map(|(_, s)| *s)
         .unwrap_or(State::Absent);
+    let tag = resolve_image(ctx, uid, gid);
+
+    // The resolved image can change after a container was created (e.g. a
+    // .pall8t/Containerfile appeared). Recreate stopped containers; only
+    // warn for running ones (they may have live exec sessions).
+    if state != State::Absent {
+        if let Some(current) = container::image_ref(&ctx.container) {
+            if current != tag {
+                if state == State::Running {
+                    let _ = msgs.send(Msg::Warning(format!(
+                        "{} runs outdated image {current} (want {tag}) — close its tabs, then reopen to recreate",
+                        ctx.container
+                    )));
+                } else {
+                    let _ = msgs.send(Msg::Status(format!(
+                        "image changed ({current} → {tag}) — recreating {}…",
+                        ctx.container
+                    )));
+                    container::delete(&ctx.container)?;
+                    state = State::Absent;
+                }
+            }
+        }
+    }
+
     match state {
         State::Running => {}
         State::Stopped => {
@@ -814,7 +842,6 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
             container::start(&ctx.container)?;
         }
         State::Absent => {
-            let tag = resolve_image(ctx, uid, gid);
             if !container::image_exists(&tag) {
                 build_image(ctx, msgs, uid, gid)?;
             }

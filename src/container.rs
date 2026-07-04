@@ -194,8 +194,22 @@ pub fn stop(name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn delete(name: &str) -> Result<()> {
+    run_ok(["delete", name])?;
+    Ok(())
+}
+
 pub fn logs(name: &str) -> Result<String> {
     run_ok(["logs", name])
+}
+
+/// Image reference a container was created from (via `container inspect`).
+pub fn image_ref(name: &str) -> Option<String> {
+    let out = run_ok(["inspect", name]).ok()?;
+    let v: Value = serde_json::from_str(out.trim()).ok()?;
+    v.pointer("/0/configuration/image/reference")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// argv for a tab's PTY child: exec into the project container at the

@@ -68,6 +68,9 @@ pub struct ProjectEntry {
     pub name: String,
     #[serde(default)]
     pub repos: Vec<PathBuf>,
+    /// Legacy v1 field; migrated into `repos` by `load()`.
+    #[serde(default, skip_serializing)]
+    pub path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,8 +101,16 @@ pub fn load() -> Result<Config> {
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", path.display()))?;
-    let cfg: Config =
+    let mut cfg: Config =
         toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
+    // v1 → v2 migration: `path = "..."` becomes `repos = ["..."]`.
+    for entry in &mut cfg.projects {
+        if entry.repos.is_empty() {
+            if let Some(p) = entry.path.take() {
+                entry.repos.push(p);
+            }
+        }
+    }
     Ok(cfg)
 }
 
