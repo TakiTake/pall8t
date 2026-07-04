@@ -6,7 +6,7 @@ A Rust + ratatui TUI that runs AI coding agents (and shells) inside per-project 
 
 ## Why
 
-The workflow pall8t serves: **several tasks in parallel on the same git repo, one AI agent session per task**, so sessions never mix. Previously this ran on Podman + DevContainer (one DevContainer per project) — a redundant stack on macOS, where apple/container provides lightweight per-container VMs natively.
+The workflow pall8t serves: **several tasks in parallel, one AI agent session per task**, so sessions never mix. Tasks often span repositories — one shared platform repo plus per-service repos, with PRs split across them — so a task works in git worktrees cut from several repos at once. Previously this ran on Podman + DevContainer (one DevContainer per project) — a redundant stack on macOS, where apple/container provides lightweight per-container VMs natively.
 
 The barrier to switching is that apple/container's CLI is completely different from docker's, so none of the existing devcontainer tooling can drive it. Docker-CLI-compatibility wrappers over apple/container exist, but emulating docker semantics on top of a different engine is a leaky extra layer; a small purpose-built tool for this one workflow is simpler. pall8t wraps apple/container natively (see ADR-0001) and gives up docker compatibility on purpose.
 
@@ -19,6 +19,7 @@ The barrier to switching is that apple/container's CLI is completely different f
 - Run AI agents (`claude`, later others) and arbitrary shells inside an apple/container VM, never on the host. This is the core of the tool.
 - Run anywhere a terminal runs: standalone or from an IDE's integrated terminal (VS Code etc.). No dependency on a specific terminal app.
 - One agent session per task, many tasks per project: tabs are independent `container exec` sessions sharing the project's container.
+- A project references **multiple repos**; agents create git worktrees freely in a **host-persistent workspace** that survives container restarts. Canonical checkouts are never writable by agents (see §3, ADR-0004).
 - Files created in the mounted project dir are owned by the host user — never root.
 - One keep-alive container per project, created lazily, shared by all of that project's tabs.
 - Minimal multiplexer: a shortcut creates a new tab running a terminal or an AI agent *inside the TUI*. No panes, no splits, no mouse requirements.
@@ -44,23 +45,31 @@ apple/container runs each container in a lightweight VM; bind mounts go through 
 - Containers are started with `--user dev`, so every process — shell, claude, compilers — creates files as your UID.
 - Belt-and-suspenders: `container run/exec --uid/--gid` are also passed.
 
-## 3. Container lifecycle
+## 3. Project workspaces and container lifecycle
 
-One keep-alive container per project:
+A project = a name + a list of source repos + a **workspace**: a unique host directory that holds everything agents produce, mounted into the container **at the identical absolute path** (identity-path mount), so git metadata and IDE file links are valid on both sides. Full rationale in ADR-0004.
 
 ```
-name  = pall8t-<slug(dirname)>-<sha256(abs_path)[..8]>    e.g. pall8t-myapp-3fa9c21b
+workspace = <workspace_root>/<slug(name)>-<sha256(name)[..8]>/   default root: ~/.pall8t/workspaces
+  repos/<repo>/    seeded clone of each source repo — the worktree parent
+  wt/              worktrees the agents cut per task
+
+name  = pall8t-<slug(name)>-<sha256(workspace)[..8]>
 mounts:
-  <project abs path>   -> /work        (the project)
-  ~/.pall8t/home       -> /home/dev    (persistent shared home: claude auth,
-                                        shell history, dotfiles survive rebuilds)
+  <workspace>      -> <workspace>   (rw)  the only writable project surface
+  ~/.pall8t/home   -> /home/dev     (rw)  persistent agent home: claude auth,
+                                          shell history, dotfiles
 run:
   container run -d --name <name> \
-    -v <project>:/work -v ~/.pall8t/home:/home/dev \
-    -w /work --user dev --uid <uid> --gid <gid> \
+    -v <workspace>:<workspace> -v ~/.pall8t/home:/home/dev \
+    -w <workspace> --user dev --uid <uid> --gid <gid> \
     --cpus <n> --memory <m> \
     pall8t-base:<uid>-<gid> sleep infinity
 ```
+
+**Seeding.** At project creation pall8t clones each source repo host-side: `git clone <repo> <ws>/repos/<name>`. Same-filesystem clones hardlink objects (fast, near-zero extra space); the origin URL is copied from the source repo so fetch/push work inside the container. Agents then work with plain git: `git -C <ws>/repos/A worktree add ../../wt/task1-A -b task1`. Worktrees persist across container restarts because the whole workspace is a host directory.
+
+**Why the canonical repos are not mounted:** apple/container has no read-only mounts yet ([#990](https://github.com/apple/container/issues/990)), and `git worktree add` needs to write in the parent repo anyway. Not mounting them protects the real checkouts absolutely. When #990 ships, canonical repos get RO identity-path mounts and seeding switches to `--reference` alternates (ADR-0004).
 
 State machine per project: `Absent → Created/Stopped → Running`. pall8t reconciles on a 2s tick via `container list --all --format json` (absolute CLI path — spawned environments may have a minimal PATH), warns if the `container` system service is not running, and lazily creates/starts on demand: opening a tab on a project with no container triggers build image (if missing) → run → attach, with progress in the status bar. Stopped containers are restarted with `container start`, not recreated.
 
@@ -157,31 +166,35 @@ memory = "4G"
 prefix = "ctrl+b"
 notify = "bell"                  # off | bell | banner (macOS notification)
 agent_command = "claude"         # what `prefix a` runs
+workspace_root = "~/.pall8t/workspaces"
 
 [[projects]]
-name = "myapp"
-path = "/Users/you/src/myapp"
+name = "checkout-flow"
+repos = [
+  "/Users/you/src/platform",
+  "/Users/you/src/svc-payment",
+]
 # image = "my-custom:dev"        # optional per-project override
-# containerfile = ".pall8t/Containerfile"
+# containerfile = "Containerfile"  # relative to the workspace
 
 [agents.claude]
 waiting_patterns = ["Do you want", "❯ 1\\. Yes"]
 working_patterns = ["esc to interrupt"]
 ```
 
-`pall8t .` adds the cwd as a project, selects it, and opens an agent tab.
+`pall8t .` adds the cwd as a single-repo project (named after the directory), seeds its workspace, selects it, and opens an agent tab.
 
 ## 9. Security notes
 
-- Container has no access to host beyond the two mounts (project dir, pall8t home). SSH agent (`--ssh`) is opt-in per project, off by default.
+- Container has no access to host beyond the two mounts (project workspace, pall8t home). Canonical repo checkouts are not mounted at all. SSH agent (`--ssh`) is opt-in per project, off by default.
 - Host claude credentials never enter the container; the sandboxed claude has its own login.
 - `sudo` inside the container is convenience only — root in the VM guest, not on the host; virtiofs writes still land as the mapped host-side owner.
 - YOLO-mode claude (`--dangerously-skip-permissions`) becomes reasonable here: blast radius is the project dir + throwaway VM. With `Waiting` detection you can also run permission-mode claude across many tabs without babysitting each one.
 
 ## 10. Roadmap
 
-1. **v2.0 (next prototype):** tab multiplexer (PTY + vt100 + tui-term), agent/shell tabs, claude `Waiting`/`Working` detection, sidebar + status bar + bell, `prefix n`, container lifecycle carried over from v1.
-2. **v2.1:** macOS banner notifications, detection patterns for more agents (codex etc.), per-project `.pall8t/Containerfile` auto-detection, container stats in sidebar.
+1. **v2.0 (next prototype):** tab multiplexer (PTY + vt100 + tui-term), agent/shell tabs, claude `Waiting`/`Working` detection, sidebar + status bar + bell, `prefix n`, multi-repo workspaces with seeding, container lifecycle carried over from v1.
+2. **v2.1:** macOS banner notifications, detection patterns for more agents (codex etc.), workspace repo sync/refresh command, container stats in sidebar; RO identity-path mounts of canonical repos once [apple/container#990](https://github.com/apple/container/issues/990) ships.
 3. **v2.2:** copy-mode in scrollback, port publish UI, `--ssh` toggle.
 4. **Later:** session restore (reopen tab set), minimal devcontainer.json subset, socket API for scripting.
 
@@ -193,4 +206,6 @@ Decisions live in [`docs/adr/`](../adr/); this section only summarizes them.
 
 **[ADR-0002: Rename cabin → pall8t](../adr/0002-rename-to-pall8t.md)** (Accepted, 2026-07-04). "cabin" was too generic (crates.io/search collisions); "pall8t" keeps the pallet-under-containers metaphor, is collision-free, and stays pronounceable.
 
-**[ADR-0003: Pivot to an embedded agent multiplexer](../adr/0003-multiplexer-pivot.md)** (Accepted, 2026-07-04). Prototype testing showed the filer was unused and external terminal tabs (Ghostty et al.) made agent monitoring impossible. v2 drops the filer and embeds a minimal herdr-style multiplexer: tabs with real PTYs (`portable-pty` + `vt100` + `tui-term`) running `container exec`, plus heuristic `Waiting`/`Working` detection and notifications. Supersedes v1's "no embedded terminal emulation" non-goal. Depending on herdr/tmux underneath was rejected (heavy dependency, and the container-exec integration + agent monitoring is the product).
+**[ADR-0003: Pivot to an embedded agent multiplexer](../adr/0003-multiplexer-pivot.md)** (Accepted, 2026-07-04). Prototype testing showed the filer was unused and external terminal tabs (Ghostty et al.) made agent monitoring impossible — and broke the IDE-integrated-terminal usage mode. v2 drops the filer and embeds a minimal herdr-style multiplexer: tabs with real PTYs (`portable-pty` + `vt100` + `tui-term`) running `container exec`, plus heuristic `Waiting`/`Working` detection and notifications. Supersedes v1's "no embedded terminal emulation" non-goal. Depending on herdr/tmux underneath was rejected (heavy dependency, and the container-exec integration + agent monitoring is the product).
+
+**[ADR-0004: Multi-repo project workspaces with identity-path mounts](../adr/0004-workspace-model.md)** (Accepted, 2026-07-04). A project references multiple repos; agents work in a host-persistent workspace mounted at the identical absolute path inside the container, seeded with hardlink clones of each repo. Canonical checkouts are not mounted (apple/container lacks RO mounts, [#990](https://github.com/apple/container/issues/990); `git worktree add` writes to the parent repo anyway) — worktrees are cut from the workspace clones and survive container restarts. Switch to RO mounts + `--reference` alternates when #990 ships.
