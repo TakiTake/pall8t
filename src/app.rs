@@ -385,9 +385,11 @@ impl App {
         }
         // Resource optimization: when a project's last tab closes, stop its
         // container. The next tab restarts it via `container start` (cheap).
-        if !self.tabs.iter().any(|t| t.project == project)
-            && self.projects.get(project).map(|r| r.state) == Some(State::Running)
-        {
+        // State-independent on purpose: the cached project state is only
+        // updated by the 2s reconcile and is *not* set when a tab opens, so
+        // gating on it here leaks a just-opened container that's closed before
+        // the first reconcile. StopIdle queries live state instead.
+        if !self.tabs.iter().any(|t| t.project == project) {
             if let Some(ctx) = self.ctx(project) {
                 self.busy = true;
                 self.jobs.send(Job::StopIdle(ctx)).ok();
@@ -725,13 +727,30 @@ fn handle_job(job: Job, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
             let _ = msgs.send(Msg::Done("done".to_string()));
         }
         Job::StopIdle(ctx) => {
-            let _ = msgs.send(Msg::Status(format!(
-                "no tabs left — stopping {}…",
-                ctx.container
-            )));
-            container::stop(&ctx.container)?;
-            refresh(msgs);
-            let _ = msgs.send(Msg::Done(format!("stopped {} (idle)", ctx.container)));
+            // Query live state rather than trusting the cached project state,
+            // which lags a just-opened container (see close-path note in
+            // close_active_tab). Stop only if it's actually running so this
+            // stays idempotent when the container is already stopped/absent.
+            let running = container::list_all()
+                .map(|list| {
+                    list.iter()
+                        .any(|(name, s)| *name == ctx.container && *s == State::Running)
+                })
+                .unwrap_or(false);
+            if running {
+                let _ = msgs.send(Msg::Status(format!(
+                    "no tabs left — stopping {}…",
+                    ctx.container
+                )));
+                container::stop(&ctx.container)?;
+                refresh(msgs);
+                let _ = msgs.send(Msg::Done(format!("stopped {} (idle)", ctx.container)));
+            } else {
+                let _ = msgs.send(Msg::Done(format!(
+                    "{} already stopped",
+                    ctx.container
+                )));
+            }
         }
         Job::Build(ctx) => {
             let tag = build_image(&ctx, msgs, uid, gid)?;
