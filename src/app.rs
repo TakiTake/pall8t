@@ -70,8 +70,6 @@ pub struct App {
     pub status: String,
     pub busy: bool,
     pub should_quit: bool,
-    pub uid: u32,
-    pub gid: u32,
     jobs: Sender<Job>,
     msgs: Receiver<Msg>,
 }
@@ -128,8 +126,6 @@ impl App {
             status: "reconciling with `container list`…".to_string(),
             busy: false,
             should_quit: false,
-            uid,
-            gid,
             jobs: job_tx,
             msgs: msg_rx,
         };
