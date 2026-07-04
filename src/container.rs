@@ -75,6 +75,23 @@ where
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// True if the `container` CLI is on PATH.
+pub fn cli_available() -> bool {
+    Command::new("container")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// True if the apple/container system service (apiserver) is running.
+pub fn system_running() -> bool {
+    Command::new("container")
+        .args(["system", "status"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Reconcile source of truth: `container list --all --format json`.
 /// Parsed defensively (schema is pre-1.0, see ADR-0001).
 pub fn list_all() -> Result<Vec<(String, State)>> {

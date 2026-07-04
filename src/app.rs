@@ -54,6 +54,7 @@ pub enum Msg {
     Containers(Vec<(String, container::State)>),
     Status(String),
     Done(String),
+    Warning(String),
     Error(String),
     Logs { name: String, text: String },
 }
@@ -158,6 +159,10 @@ impl App {
                 }
                 Msg::Done(s) => {
                     self.status = s;
+                    self.busy = false;
+                }
+                Msg::Warning(s) => {
+                    self.status = format!("⚠ {s}");
                     self.busy = false;
                 }
                 Msg::Error(e) => {
@@ -529,10 +534,25 @@ fn worker(jobs: Receiver<Job>, msgs: Sender<Msg>, uid: u32, gid: u32) {
 
 fn handle_job(job: Job, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
     match job {
-        Job::Refresh => {
-            let list = container::list_all()?;
-            let _ = msgs.send(Msg::Containers(list));
-        }
+        Job::Refresh => match container::list_all() {
+            Ok(list) => {
+                let _ = msgs.send(Msg::Containers(list));
+            }
+            Err(e) => {
+                if !container::cli_available() {
+                    let _ = msgs.send(Msg::Warning(
+                        "`container` CLI not found — install apple/container first".to_string(),
+                    ));
+                } else if !container::system_running() {
+                    let _ = msgs.send(Msg::Warning(
+                        "container system is not running — run `container system start`"
+                            .to_string(),
+                    ));
+                } else {
+                    return Err(e);
+                }
+            }
+        },
         Job::EnsureAndSpawn { ctx, claude } => {
             ensure_running(&ctx, msgs, uid, gid)?;
             let cmd = container::exec_shell_command(&ctx.name, claude);
