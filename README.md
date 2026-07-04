@@ -38,7 +38,7 @@ Press the prefix (`ctrl+b` by default), release, then:
 | `n` | Jump to the next tab **waiting for you** |
 | `j` / `k`, `1`–`9` | Cycle tabs / jump to tab N |
 | `p` / `P` | Cycle project / add project (comma-separated repo paths) |
-| `x` | Close tab |
+| `x` | Close tab (stops the container when it was the project's last tab) |
 | `s` / `b` / `L` | Start-stop container / rebuild image / logs |
 | `z` | Toggle sidebar |
 | `?` | Help |

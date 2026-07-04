@@ -112,7 +112,7 @@ tab = {
 - **Input routing:** all keys go to the active tab's PTY, except the prefix key (default `ctrl+b`, configurable). Prefix, release, then an action key — one reserved key keeps pall8t out of the shell's way (same model as tmux/herdr).
 - **Reader threads:** one thread per tab reads PTY output, feeds the parser, records `last_output_at`, and wakes the UI. Writes go through the PTY master from the UI thread.
 - **Resize:** terminal area size changes propagate to every PTY via `TIOCSWINSZ` (portable-pty `resize`).
-- **Tab lifecycle:** child exit → state `Done` (tab stays visible with its final screen until closed). Closing the last tab of a project does not stop the container.
+- **Tab lifecycle:** child exit → state `Done` (tab stays visible with its final screen until closed). Closing a project's **last** tab stops its container (`container stop`) to free VM resources; opening the next tab restarts it via `container start` (cheap, state preserved).
 - **Scrollback:** vt100's built-in scrollback, view-only (prefix `[` enters scroll mode, `q` leaves). No copy-mode in v1.
 
 ## 6. Agent status detection
@@ -148,7 +148,7 @@ Left sidebar: projects with container state, and their tabs with agent state. Ma
 | `n` | Jump to next tab in `Waiting` state |
 | `j` / `k`, `1`–`9` | Next / previous tab, jump to tab N |
 | `p` / `P` | Next project / add project (path prompt) |
-| `x` | Close tab (confirm if child still running) |
+| `x` | Close tab (confirm if child still running); stops the container if it was the project's last tab |
 | `s` / `b` / `L` | Start/stop container / rebuild image / container logs |
 | `z` | Toggle sidebar |
 | `[` | Scrollback view (q to exit) |

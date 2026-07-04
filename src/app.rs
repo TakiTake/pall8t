@@ -49,6 +49,7 @@ pub enum Job {
     Seed(Ctx),
     Ensure { ctx: Ctx, kind: TabKind },
     Toggle { ctx: Ctx, state: State },
+    StopIdle(Ctx),
     Build(Ctx),
     Logs(String),
 }
@@ -371,6 +372,7 @@ impl App {
         }
         let mut tab = self.tabs.remove(i);
         tab.kill();
+        let project = tab.project;
         self.active_tab = if self.tabs.is_empty() {
             None
         } else {
@@ -378,6 +380,16 @@ impl App {
         };
         if let Some(a) = self.active_tab {
             self.current_project = self.tabs[a].project;
+        }
+        // Resource optimization: when a project's last tab closes, stop its
+        // container. The next tab restarts it via `container start` (cheap).
+        if !self.tabs.iter().any(|t| t.project == project)
+            && self.projects.get(project).map(|r| r.state) == Some(State::Running)
+        {
+            if let Some(ctx) = self.ctx(project) {
+                self.busy = true;
+                self.jobs.send(Job::StopIdle(ctx)).ok();
+            }
         }
     }
 
@@ -708,6 +720,15 @@ fn handle_job(job: Job, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
             }
             refresh(msgs);
             let _ = msgs.send(Msg::Done("done".to_string()));
+        }
+        Job::StopIdle(ctx) => {
+            let _ = msgs.send(Msg::Status(format!(
+                "no tabs left — stopping {}…",
+                ctx.container
+            )));
+            container::stop(&ctx.container)?;
+            refresh(msgs);
+            let _ = msgs.send(Msg::Done(format!("stopped {} (idle)", ctx.container)));
         }
         Job::Build(ctx) => {
             let tag = build_image(&ctx, msgs, uid, gid)?;
