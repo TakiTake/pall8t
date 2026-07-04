@@ -260,9 +260,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default().fg(Color::Yellow)
         };
+        let spinner = if app.busy { "⋯ " } else { "" };
         Line::from(vec![
             Span::raw(" "),
-            Span::styled(app.status.clone(), style),
+            Span::styled(format!("{spinner}{}", app.status), style),
         ])
     } else if let Some(row) = app.projects.get(app.current_project) {
         Line::from(vec![

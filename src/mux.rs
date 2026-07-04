@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub struct Tab {
-    pub id: u64,
     pub project: usize,
     pub kind: TabKind,
     pub title: String,
@@ -25,7 +24,6 @@ pub struct Tab {
 impl Tab {
     /// Spawn `argv[0] argv[1..]` on a fresh PTY of `rows`x`cols`.
     pub fn spawn(
-        id: u64,
         project: usize,
         kind: TabKind,
         title: String,
@@ -85,7 +83,6 @@ impl Tab {
         }
 
         Ok(Self {
-            id,
             project,
             kind,
             title,

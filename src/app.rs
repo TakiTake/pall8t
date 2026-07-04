@@ -79,7 +79,6 @@ pub struct App {
     pub should_quit: bool,
     term_rows: u16,
     term_cols: u16,
-    next_tab_id: u64,
     auto_agent_tab: Option<usize>,
     jobs: Sender<Job>,
     msgs: Receiver<Msg>,
@@ -155,7 +154,6 @@ impl App {
             should_quit: false,
             term_rows: 24,
             term_cols: 80,
-            next_tab_id: 1,
             auto_agent_tab,
             jobs: job_tx,
             msgs: msg_rx,
@@ -337,7 +335,6 @@ impl App {
         let mut argv = vec!["container".to_string()];
         argv.extend(container::exec_argv(&row.container, &row.workspace, &cmd));
         let tab = Tab::spawn(
-            self.next_tab_id,
             idx,
             kind,
             title.clone(),
@@ -345,7 +342,6 @@ impl App {
             self.term_rows,
             self.term_cols,
         )?;
-        self.next_tab_id += 1;
         self.tabs.push(tab);
         self.active_tab = Some(self.tabs.len() - 1);
         self.current_project = idx;
