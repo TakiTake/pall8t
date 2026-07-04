@@ -49,3 +49,5 @@ All other keys go straight to the active tab's terminal.
 ## Config
 
 `~/.config/pall8t/config.toml` — see [docs/design/DESIGN.md](docs/design/DESIGN.md) for the full design and [docs/adr/](docs/adr/) for architecture decisions.
+
+If a repo contains `.pall8t/Containerfile`, pall8t builds that project's image from it automatically (this repo ships one with a Rust toolchain, so agents can develop pall8t inside pall8t). Toolchains in custom Containerfiles must live outside `/home/dev` — the persistent home mount shadows it.

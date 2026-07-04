@@ -1,0 +1,29 @@
+FROM ubuntu:24.04
+
+ARG UID=501
+ARG GID=501
+
+# Base tools + node + claude CLI; dev user with host UID/GID (same as the
+# default pall8t image), plus a Rust toolchain for developing pall8t itself.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git sudo ripgrep less vim openssh-client \
+      build-essential pkg-config && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
+    (getent group ${GID} || groupadd -g ${GID} dev) && \
+    useradd -m -u ${UID} -g ${GID} -s /bin/bash dev && \
+    echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
+
+# Rust goes to /usr/local, NOT /home/dev: pall8t mounts a persistent home
+# over /home/dev at runtime, which would shadow a ~/.cargo install.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | \
+      sh -s -- -y --no-modify-path --default-toolchain 1.96 --profile default && \
+    chown -R ${UID}:${GID} /usr/local/rustup /usr/local/cargo && \
+    echo 'export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH' \
+      > /etc/profile.d/rust.sh
+
+USER dev
+WORKDIR /work

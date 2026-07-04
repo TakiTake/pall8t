@@ -748,23 +748,44 @@ fn refresh(msgs: &Sender<Msg>) {
     }
 }
 
-fn resolve_image(ctx: &Ctx, uid: u32, gid: u32) -> String {
+/// Containerfile for a project. Priority: explicit config `containerfile`
+/// (workspace-relative) > auto-detected `<repo>/.pall8t/Containerfile`
+/// (first source repo that has one) > None (embedded default).
+fn project_containerfile(ctx: &Ctx) -> Option<PathBuf> {
+    if let Some(cf) = &ctx.entry.containerfile {
+        return Some(if cf.is_absolute() {
+            cf.clone()
+        } else {
+            ctx.workspace.join(cf)
+        });
+    }
     ctx.entry
-        .image
-        .clone()
-        .unwrap_or_else(|| container::image_tag(&ctx.image_base, uid, gid))
+        .repos
+        .iter()
+        .map(|r| {
+            workspace::expand_tilde(r)
+                .join(".pall8t")
+                .join("Containerfile")
+        })
+        .find(|p| p.is_file())
+}
+
+fn resolve_image(ctx: &Ctx, uid: u32, gid: u32) -> String {
+    if let Some(img) = &ctx.entry.image {
+        return img.clone();
+    }
+    if project_containerfile(ctx).is_some() {
+        // Project-specific tag so the shared pall8t-base is not overwritten.
+        let base = format!("pall8t-{}", workspace::slug(&ctx.entry.name));
+        return container::image_tag(&base, uid, gid);
+    }
+    container::image_tag(&ctx.image_base, uid, gid)
 }
 
 fn build_image(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<String> {
     let tag = resolve_image(ctx, uid, gid);
-    let containerfile = match &ctx.entry.containerfile {
-        Some(cf) => {
-            if cf.is_absolute() {
-                cf.clone()
-            } else {
-                ctx.workspace.join(cf)
-            }
-        }
+    let containerfile = match project_containerfile(ctx) {
+        Some(cf) => cf,
         None => container::default_containerfile_path()?,
     };
     let ctx_dir = containerfile

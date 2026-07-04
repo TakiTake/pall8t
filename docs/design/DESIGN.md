@@ -93,7 +93,9 @@ USER dev
 WORKDIR /work
 ```
 
-Users can point `image` in config at their own Containerfile per project; pall8t passes the same UID/GID build args.
+**Per-project Containerfile (auto-detected).** If any source repo contains `.pall8t/Containerfile`, pall8t builds the project's image from it instead of the default — tag `pall8t-<project>:<uid>-<gid>` (so the shared base image is not overwritten), build context = that `.pall8t/` directory, same UID/GID build args. Explicit config (`image` / `containerfile`) takes priority over auto-detection. This is how dogfooding works: pall8t's own repo ships a `.pall8t/Containerfile` with a Rust toolchain, so agents inside the container can build pall8t itself.
+
+**Caveat for custom Containerfiles:** the persistent home mount shadows `/home/dev` at runtime, so toolchains must be installed *outside* the home directory (e.g. `RUSTUP_HOME=/usr/local/rustup`, `CARGO_HOME=/usr/local/cargo`, plus an `/etc/profile.d` PATH entry for login shells).
 
 ## 5. Multiplexer architecture
 
@@ -176,6 +178,7 @@ repos = [
 ]
 # image = "my-custom:dev"        # optional per-project override
 # containerfile = "Containerfile"  # relative to the workspace
+# (without these, <repo>/.pall8t/Containerfile is auto-detected — see §4)
 
 [agents.claude]
 waiting_patterns = ["Do you want", "❯ 1\\. Yes"]
