@@ -1,49 +1,52 @@
-<svg viewBox="0 0 680 400" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
-  <title>pall8t TUI mockup</title>
-  <desc>Three areas: project list (left), file tree and preview (right), status line and keybar (bottom).</desc>
+<svg viewBox="0 0 700 430" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5">
+  <title>pall8t v2 TUI mockup</title>
+  <desc>Left sidebar with projects and tabs showing agent states, main area with the active tab's embedded terminal showing a Claude Code approval prompt, alert line and keybar at the bottom.</desc>
   <defs>
-    <clipPath id="frame"><rect x="0.5" y="0.5" width="679" height="399" rx="10"/></clipPath>
+    <clipPath id="frame"><rect x="0.5" y="0.5" width="699" height="429" rx="10"/></clipPath>
   </defs>
   <g clip-path="url(#frame)">
-    <rect x="0" y="0" width="680" height="400" fill="#16161e"/>
-    <rect x="0" y="0" width="680" height="30" fill="#1a1b26"/>
+    <rect x="0" y="0" width="700" height="430" fill="#16161e"/>
+    <rect x="0" y="0" width="700" height="30" fill="#1a1b26"/>
     <circle cx="20" cy="15" r="5.5" fill="#f7768e"/>
     <circle cx="37" cy="15" r="5.5" fill="#e0af68"/>
     <circle cx="54" cy="15" r="5.5" fill="#9ece6a"/>
     <text x="70" y="19" fill="#565f89" font-size="12">pall8t</text>
-    <line x1="0" y1="30" x2="680" y2="30" stroke="#2a2c3d"/>
+    <line x1="0" y1="30" x2="700" y2="30" stroke="#2a2c3d"/>
 
-    <line x1="190" y1="30" x2="190" y2="325" stroke="#2a2c3d"/>
-    <text x="12" y="50" fill="#7aa2f7" font-size="11" letter-spacing="1">PROJECTS ── focus</text>
-    <rect x="1" y="60" width="189" height="20" fill="#283457"/>
-    <text x="12" y="74" fill="#c0caf5">▸ myapp</text>
-    <text x="180" y="74" fill="#9ece6a" text-anchor="end">● running</text>
-    <text x="26" y="96" fill="#787c99">blog</text>
-    <text x="180" y="96" fill="#787c99" text-anchor="end">○ stopped</text>
-    <text x="26" y="118" fill="#565f89">infra</text>
-    <text x="180" y="118" fill="#565f89" text-anchor="end">· absent</text>
+    <line x1="205" y1="30" x2="205" y2="358" stroke="#2a2c3d"/>
+    <text x="12" y="50" fill="#565f89" font-size="11" letter-spacing="1">PROJECTS / TABS</text>
+    <text x="12" y="74" fill="#c0caf5">▾ myapp <tspan fill="#9ece6a">●</tspan></text>
+    <rect x="1" y="82" width="204" height="19" fill="#283457"/>
+    <text x="24" y="96" fill="#c0caf5">1 claude</text>
+    <text x="196" y="96" fill="#f7768e" text-anchor="end">⚠ waiting</text>
+    <text x="24" y="118" fill="#787c99">2 claude</text>
+    <text x="196" y="118" fill="#e0af68" text-anchor="end">● working</text>
+    <text x="24" y="140" fill="#787c99">3 bash</text>
+    <text x="196" y="140" fill="#565f89" text-anchor="end">○ idle</text>
+    <text x="12" y="168" fill="#787c99">▾ blog <tspan fill="#9ece6a">●</tspan></text>
+    <text x="24" y="190" fill="#787c99">1 claude</text>
+    <text x="196" y="190" fill="#7aa2f7" text-anchor="end">✓ done</text>
+    <text x="12" y="218" fill="#565f89">▸ infra ·</text>
 
-    <text x="202" y="50" fill="#565f89" font-size="11" letter-spacing="1">FILES&#160;&#160;~/src/myapp</text>
-    <text x="202" y="74" fill="#7aa2f7">▸ src/</text>
-    <rect x="191" y="80" width="489" height="20" fill="#1f2335"/>
-    <text x="218" y="94" fill="#c0caf5">main.rs</text>
-    <text x="218" y="116" fill="#c0caf5">lib.rs</text>
-    <text x="202" y="138" fill="#e0af68">Cargo.toml</text>
-    <text x="202" y="160" fill="#565f89">.pall8t/</text>
+    <text x="220" y="50" fill="#565f89" font-size="11" letter-spacing="1">myapp / 1 claude&#160;&#160;(pall8t-myapp-3fa9c21b)</text>
+    <text x="220" y="76" fill="#c0caf5"><tspan fill="#bb9af7">●</tspan> I'll add the config parser now.</text>
+    <text x="234" y="98" fill="#787c99">Edit <tspan fill="#c0caf5">src/config.rs</tspan></text>
+    <text x="234" y="120" fill="#9ece6a">+ pub fn load() -&gt; Result&lt;Config&gt; {</text>
+    <text x="234" y="142" fill="#9ece6a">+&#160;&#160;&#160;&#160;let text = fs::read_to_string(path)?;</text>
+    <text x="234" y="164" fill="#565f89">…</text>
+    <rect x="220" y="178" width="460" height="96" rx="4" fill="none" stroke="#e0af68"/>
+    <text x="232" y="200" fill="#e0af68">Do you want to make this edit to config.rs?</text>
+    <text x="232" y="222" fill="#c0caf5">❯ 1. Yes</text>
+    <text x="232" y="244" fill="#787c99">&#160;&#160;2. Yes, allow all edits during this session</text>
+    <text x="232" y="266" fill="#787c99">&#160;&#160;3. No, and tell Claude what to do differently</text>
+    <text x="220" y="344" fill="#565f89" font-size="11">▌ keys go to this terminal — ^b for pall8t commands</text>
 
-    <line x1="190" y1="178" x2="680" y2="178" stroke="#2a2c3d"/>
-    <text x="202" y="198" fill="#565f89" font-size="11" letter-spacing="1">PREVIEW&#160;&#160;Cargo.toml</text>
-    <text x="202" y="222" fill="#bb9af7">[package]</text>
-    <text x="202" y="244" fill="#787c99">name = <tspan fill="#9ece6a">"myapp"</tspan></text>
-    <text x="202" y="266" fill="#787c99">version = <tspan fill="#9ece6a">"0.1.0"</tspan></text>
-    <text x="202" y="288" fill="#787c99">edition = <tspan fill="#9ece6a">"2024"</tspan></text>
+    <line x1="0" y1="358" x2="700" y2="358" stroke="#2a2c3d"/>
+    <text x="12" y="378" fill="#f7768e">⚠ 1 tab waiting for you (myapp/1 claude) — press ^b n to jump</text>
 
-    <line x1="0" y1="325" x2="680" y2="325" stroke="#2a2c3d"/>
-    <text x="12" y="345" fill="#787c99">myapp: <tspan fill="#9ece6a">running</tspan> (pall8t-myapp-3fa9c21b)&#160;&#160;cpu 4&#160;&#160;mem 4G</text>
-
-    <rect x="0" y="358" width="680" height="42" fill="#1a1b26"/>
-    <line x1="0" y1="358" x2="680" y2="358" stroke="#2a2c3d"/>
-    <text x="12" y="383" font-size="12" fill="#565f89"><tspan fill="#7aa2f7">⏎</tspan> shell tab&#160;&#160;&#160;<tspan fill="#7aa2f7">c</tspan> claude tab&#160;&#160;&#160;<tspan fill="#7aa2f7">s</tspan> start/stop&#160;&#160;&#160;<tspan fill="#7aa2f7">b</tspan> build image&#160;&#160;&#160;<tspan fill="#7aa2f7">a</tspan> add&#160;&#160;&#160;<tspan fill="#7aa2f7">Tab</tspan> focus&#160;&#160;&#160;<tspan fill="#7aa2f7">q</tspan> quit</text>
+    <rect x="0" y="390" width="700" height="40" fill="#1a1b26"/>
+    <line x1="0" y1="390" x2="700" y2="390" stroke="#2a2c3d"/>
+    <text x="12" y="414" font-size="12" fill="#565f89"><tspan fill="#7aa2f7">^b</tspan>&#160;&#160;<tspan fill="#7aa2f7">a</tspan> agent tab&#160;&#160;<tspan fill="#7aa2f7">c</tspan> shell tab&#160;&#160;<tspan fill="#f7768e">n</tspan> next waiting&#160;&#160;<tspan fill="#7aa2f7">j/k 1-9</tspan> tabs&#160;&#160;<tspan fill="#7aa2f7">p</tspan> project&#160;&#160;<tspan fill="#7aa2f7">x</tspan> close&#160;&#160;<tspan fill="#7aa2f7">z</tspan> sidebar&#160;&#160;<tspan fill="#7aa2f7">?</tspan> help</text>
   </g>
-  <rect x="0.5" y="0.5" width="679" height="399" rx="10" fill="none" stroke="#2a2c3d"/>
+  <rect x="0.5" y="0.5" width="699" height="429" rx="10" fill="none" stroke="#2a2c3d"/>
 </svg>
