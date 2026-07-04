@@ -217,11 +217,28 @@ pub fn logs(name: &str) -> Result<String> {
     run_ok(["logs", name])
 }
 
+/// Absolute path to the `container` CLI, resolved once. Spawned terminal
+/// tabs may run with a minimal PATH (e.g. Ghostty uses
+/// `bash --noprofile --norc`), so a bare `container` is not found there.
+pub fn cli_path() -> &'static str {
+    static CLI_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CLI_PATH.get_or_init(|| {
+        Command::new("which")
+            .arg("container")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "container".to_string())
+    })
+}
+
 /// The command every terminal tab runs. Raw `container exec`, so the tab
 /// keeps working even if pall8t exits.
 pub fn exec_shell_command(name: &str, claude: bool) -> String {
     let prog = if claude { "claude" } else { "bash -l" };
-    format!("container exec -it --user dev -w /work {name} {prog}")
+    format!("{} exec -it --user dev -w /work {name} {prog}", cli_path())
 }
 
 /// Persistent container-side $HOME (claude auth, shell history, dotfiles).
