@@ -87,7 +87,72 @@ pub fn seed(workspace: &Path, entry: &ProjectEntry) -> Result<String> {
         }
         cloned += 1;
     }
+    write_claude_md(workspace, entry)?;
     Ok(format!(
         "workspace ready: {cloned} repo(s) seeded, {skipped} already present"
     ))
+}
+
+/// Generate CLAUDE.md at the workspace root (agent tabs start here, outside
+/// any repo, so per-repo .claude/ skills are not loaded). Only written if
+/// missing — user edits are preserved.
+fn write_claude_md(workspace: &Path, entry: &ProjectEntry) -> Result<()> {
+    let path = workspace.join("CLAUDE.md");
+    if path.exists() {
+        return Ok(());
+    }
+    let repo_names: Vec<String> = entry
+        .repos
+        .iter()
+        .filter_map(|r| r.file_name().map(|s| s.to_string_lossy().into_owned()))
+        .collect();
+    let repo_list = if repo_names.is_empty() {
+        "(none seeded yet)".to_string()
+    } else {
+        repo_names.join(", ")
+    };
+    let content = format!(
+        r#"# pall8t workspace: {name}
+
+You are running inside a Linux VM (apple/container) launched by **pall8t**, an
+agent multiplexer on macOS. This directory is the project workspace — a host
+directory mounted at the identical absolute path inside the container.
+Everything here **persists** across container restarts and is readable by the
+human's IDE on the host at the same path.
+
+## Environment facts
+
+- Files you create are owned by the host user. `sudo` works, but grants root
+  only inside this VM.
+- You have no access to the host beyond this workspace and your `$HOME`
+  (`/home/dev`, persistent — login state survives rebuilds).
+- The `container` CLI does **not** exist here; you are inside the container.
+
+## Layout
+
+- `repos/` — seeded clones of the source repos ({repo_list}); treat them as
+  worktree parents, keep their checkouts clean.
+- `wt/` — one git worktree per task. **Do your work here.**
+
+## Git workflow (one worktree per task)
+
+1. `git -C repos/<repo> fetch origin`
+2. `git -C repos/<repo> worktree add ../../wt/<task>-<repo> -b <task-branch> origin/main`
+3. Work, commit, and push from `wt/<task>-<repo>` (`origin` is the real
+   upstream; credentials live in your persistent home).
+
+Tasks may span multiple repos: one worktree per repo, same branch name.
+
+## Being a good tab citizen
+
+- pall8t watches your screen: approval/input prompts notify the human, who can
+  jump to your tab. Ask normally — no special protocol.
+- If your tab is closed, this process ends but the workspace persists.
+"#,
+        name = entry.name,
+        repo_list = repo_list
+    );
+    std::fs::write(&path, content)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(())
 }

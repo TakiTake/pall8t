@@ -67,7 +67,7 @@ run:
     pall8t-base:<uid>-<gid> sleep infinity
 ```
 
-**Seeding.** At project creation pall8t clones each source repo host-side: `git clone <repo> <ws>/repos/<name>`. Same-filesystem clones hardlink objects (fast, near-zero extra space); the origin URL is copied from the source repo so fetch/push work inside the container. Agents then work with plain git: `git -C <ws>/repos/A worktree add ../../wt/task1-A -b task1`. Worktrees persist across container restarts because the whole workspace is a host directory.
+**Seeding.** At project creation pall8t clones each source repo host-side: `git clone <repo> <ws>/repos/<name>`. Same-filesystem clones hardlink objects (fast, near-zero extra space); the origin URL is copied from the source repo so fetch/push work inside the container. Agents then work with plain git: `git -C <ws>/repos/A worktree add ../../wt/task1-A -b task1`. Worktrees persist across container restarts because the whole workspace is a host directory. Seeding also generates a `CLAUDE.md` at the workspace root (only if missing) explaining the layout and worktree workflow to agents — tabs start at the workspace root, outside any repo, where per-repo `.claude/` files are not loaded.
 
 **Why the canonical repos are not mounted:** apple/container has no read-only mounts yet ([#990](https://github.com/apple/container/issues/990)), and `git worktree add` needs to write in the parent repo anyway. Not mounting them protects the real checkouts absolutely. When #990 ships, canonical repos get RO identity-path mounts and seeding switches to `--reference` alternates (ADR-0004).
 
