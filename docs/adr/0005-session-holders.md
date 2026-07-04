@@ -39,6 +39,65 @@ Option **D**: two binaries — `pall8t` (TUI/attacher) and `pall8t-tab` (session
 
 The essential insight: of everything a tmux-style server does, pall8t only *needs* "PTYs that outlive the TUI" and "one source of truth for mutations". A per-tab holder delivers the first with minimal, freezable code; a locked file delivers the second. The central daemon bundles both with a control plane we don't need yet, at the cost of making every future TUI bug fatal to running agents.
 
+## System architecture
+
+```mermaid
+flowchart LR
+    subgraph clients["pall8t TUI clients — attach/detach freely, iterate freely"]
+        T1["pall8t<br/>(standalone terminal)"]
+        T2["pall8t<br/>(VS Code integrated terminal)"]
+    end
+
+    subgraph shared["Shared state — every mutation under flock"]
+        REG[("~/.pall8t/state.json<br/>tab registry")]
+        CFG[("~/.config/pall8t/<br/>config.toml")]
+    end
+
+    subgraph holders["Session holders — one per tab, frozen byte-pump"]
+        H1["pall8t-tab<br/>PTY + 256 KiB ring buffer<br/>~/.pall8t/tabs/t1.sock"]
+        H2["pall8t-tab<br/>PTY + ring buffer<br/>~/.pall8t/tabs/t2.sock"]
+    end
+
+    subgraph vm["apple/container (lightweight VM per project)"]
+        A1["claude · tab 1"]
+        A2["bash · tab 2"]
+    end
+
+    T1 -- "lock / re-read / write" --> REG
+    T1 -- "lock / re-read / write" --> CFG
+    T2 -- "lock / re-read / write" --> REG
+    T1 == "attach: replay + live output<br/>input + resize" ==> H1
+    T2 == "attach (same tab,<br/>broadcast)" ==> H1
+    T1 == "attach" ==> H2
+    H1 -- "container exec -it (PTY child)" --> A1
+    H2 -- "container exec -it (PTY child)" --> A2
+```
+
+The TUI boxes can disappear at any time (crash, `^b q`, closed IDE window) — holders and agents are unaffected. A holder crash kills exactly one tab. Container lifecycle transitions (stop-on-last-tab, recreate-on-image-change) consult the registry under the lock, so instances never act on each other's live tabs.
+
+```mermaid
+sequenceDiagram
+    participant U as user
+    participant T as pall8t (TUI)
+    participant R as state.json (flock)
+    participant H as pall8t-tab (holder)
+    participant A as claude (in container)
+
+    U->>T: ^b a — new agent tab
+    T->>R: lock · register tab · unlock
+    T->>H: spawn detached holder
+    H->>A: container exec -it … claude (PTY)
+    T->>H: connect tabs/&lt;id&gt;.sock
+    H-->>T: replay ring buffer, then live bytes
+    U->>T: ^b q — detach
+    T--xH: disconnect (holder keeps running)
+    A-->>H: agent keeps working, output buffered
+    U->>T: pall8t — relaunch
+    T->>R: read registry, prune stale entries
+    T->>H: reconnect + resize nudge
+    H-->>T: replay + live bytes (screen restored)
+```
+
 ## Consequences
 
 - `q` becomes **detach** (agents keep running); killing an agent is explicit (`x` per tab). The quit-confirmation dialog disappears.
