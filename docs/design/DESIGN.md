@@ -1,6 +1,6 @@
 # pall8t — Claude in an apple/container
 
-> Formerly named "cabin" (see ADR-0002). This is **DESIGN v2**: the v1 filer was removed and the external-terminal-tab model was replaced by an embedded multiplexer after prototype testing (see ADR-0003).
+> Formerly named "cabin" (see ADR-0002). This is **DESIGN v3**: v2 replaced the filer + external terminal tabs with an embedded multiplexer (ADR-0003); v3 re-architects state into per-tab session holders so agents survive TUI exit and multiple pall8t instances stay consistent (ADR-0005, prompted by [#2](https://github.com/TakiTake/pall8t/issues/2)).
 
 A Rust + ratatui TUI that runs AI coding agents (and shells) inside per-project sandboxed dev containers on macOS using [apple/container](https://github.com/apple/container) — with correct host↔container file ownership — and multiplexes them as tabs, herdr-style: you always see which agent is working, which is waiting for your approval, and which is done.
 
@@ -24,12 +24,15 @@ The barrier to switching is that apple/container's CLI is completely different f
 - One keep-alive container per project, created lazily, shared by all of that project's tabs.
 - Minimal multiplexer: a shortcut creates a new tab running a terminal or an AI agent *inside the TUI*. No panes, no splits, no mouse requirements.
 - Agent awareness: each tab's agent is monitored; tabs waiting for approval/input are surfaced in the sidebar, the status bar, and (optionally) a macOS notification. One key jumps to the next tab that needs you.
+- **Sessions outlive the TUI:** quitting pall8t (or losing the terminal/IDE window) detaches; agents keep running and reattach on next launch (ADR-0005).
+- **Multi-instance safe:** several pall8t processes (IDE terminal + standalone, etc.) share one source of truth; config writes and container lifecycle transitions never race.
 
 **Non-goals**
 
 - File browser / preview (v1 had one; removed — unused in practice).
 - Rich multiplexing: panes, splits, workspaces, mouse-driven layout (use herdr/tmux if you need that).
-- Detach/reattach server persistence. If pall8t exits, its exec sessions end (containers keep running; agents inside a tab die with the PTY). Accepted for now — revisit trigger in ADR-0003.
+- A central daemon / control-plane RPC. Persistence comes from per-tab holders, coordination from a locked registry file — see ADR-0005 for why this beats a tmux-style server here, and its revisit triggers.
+- Notifications while **zero** TUIs are attached (accepted gap; would require a daemon).
 - devcontainer.json compatibility (may come later; see Roadmap).
 
 ## 2. The UID problem and the strategy
@@ -97,25 +100,38 @@ WORKDIR /work
 
 **Caveat for custom Containerfiles:** the persistent home mount shadows `/home/dev` at runtime, so toolchains must be installed *outside* the home directory (e.g. `RUSTUP_HOME=/usr/local/rustup`, `CARGO_HOME=/usr/local/cargo`, plus an `/etc/profile.d` PATH entry for login shells).
 
-## 5. Multiplexer architecture
+## 5. Multiplexer architecture (session holders)
 
-Each tab is a real PTY running `container exec` — the agent's own screen, rendered inside the TUI.
+Two binaries (ADR-0005). A tab is a real PTY running `container exec`, but the PTY is owned by a tiny detached **holder** process, not by the TUI — so tabs survive any TUI's exit.
 
 ```
-tab = {
-  pty:    portable-pty PtyPair, child = container exec -it --user dev -w /work <name> <cmd>
-  parser: vt100::Parser (screen state, fed from a reader thread)
-  kind:   Shell | Agent(claude)
-  state:  Working | Waiting | Idle | Done   (see §6)
-}
+pall8t-tab (holder, one per tab; ~300 lines, treated as frozen)
+  - spawns: container exec -it --user dev -w <ws> <container> <cmd> on a PTY
+  - keeps a raw-output ring buffer (256 KiB)
+  - serves ~/.pall8t/tabs/<tab-id>.sock:
+      on attach  -> replay ring buffer, then broadcast live output
+      from client -> input bytes, resize (rows, cols)
+  - on child exit: marks the registry entry exited, keeps final screen
+    available until the tab is closed
+
+pall8t (TUI/attacher, iterates freely)
+  - discovers tabs in the registry, connects to their sockets
+  - client-side vt100 per tab (fed by replay + live bytes), rendering,
+    agent-state detection (§6), terminal-query answering — as in v2
+  - key input -> active tab's socket; prefix key (^b) stays local
+
+~/.pall8t/state.json (registry, guarded by flock)
+  - tabs: { id, project, kind, title, pid, socket, exited }
+  - every mutation (config.toml too): take lock -> re-read -> apply -> write
 ```
 
-- **Crates:** `portable-pty` (PTY + child process), `vt100` (terminal state machine), `tui-term` (ratatui widget rendering a vt100 screen). All battle-tested together; no custom escape-sequence handling.
-- **Input routing:** all keys go to the active tab's PTY, except the prefix key (default `ctrl+b`, configurable). Prefix, release, then an action key — one reserved key keeps pall8t out of the shell's way (same model as tmux/herdr).
-- **Reader threads:** one thread per tab reads PTY output, feeds the parser, records `last_output_at`, and wakes the UI. Writes go through the PTY master from the UI thread.
-- **Resize:** terminal area size changes propagate to every PTY via `TIOCSWINSZ` (portable-pty `resize`).
-- **Tab lifecycle:** child exit → state `Done` (tab stays visible with its final screen until closed). Closing a project's **last** tab stops its container (`container stop`) to free VM resources; opening the next tab restarts it via `container start` (cheap, state preserved).
-- **Scrollback:** vt100's built-in scrollback, view-only (prefix `[` enters scroll mode, `q` leaves). No copy-mode in v1.
+- **Crates:** `portable-pty` + `vt100` as in v2; holders and TUI share the byte-oriented socket protocol (1-byte frame tag + length; versioned, backward compatible — holders from old releases must keep working).
+- **Detach/reattach:** `q` or a killed terminal just drops the socket connections. Next `pall8t` reads the registry, reconnects, replays each ring buffer into a fresh vt100, then sends a resize nudge so full-screen apps repaint. Multiple TUIs may attach to the same tab simultaneously (output is broadcast; last resize wins).
+- **Input routing:** unchanged — all keys to the active tab, prefix key (default `ctrl+b`) for commands.
+- **Tab lifecycle:** `x` kills the holder (and its child). Child exit → `Done` (tab visible until closed). Closing a project's last tab stops its container **only if the registry shows zero live tabs for that project across all instances**; same lock guards recreate-on-image-change.
+- **Failure isolation:** a TUI crash detaches (agents unaffected). A holder crash kills only its own tab. Stale registry entries (dead pid / connrefused socket) are pruned on TUI startup under the lock.
+- **Config consistency:** the TUI re-reads `config.toml`/registry on mtime change, so a project added in one instance appears in the others.
+- **Scrollback:** vt100's built-in scrollback, view-only (prefix `[` planned). No copy-mode yet.
 
 ## 6. Agent status detection
 
@@ -155,7 +171,7 @@ Left sidebar: projects with container state, and their tabs with agent state. Ma
 | `z` | Toggle sidebar |
 | `[` | Scrollback view (q to exit) |
 | `?` | Help overlay |
-| `q` | Quit pall8t (confirm if any tab is `Working`/`Waiting`; containers keep running) |
+| `q` | Detach: quit the TUI, agents and containers keep running (reattach = relaunch `pall8t`) |
 
 ## 8. Config
 
@@ -196,10 +212,11 @@ working_patterns = ["esc to interrupt"]
 
 ## 10. Roadmap
 
-1. **v2.0 (next prototype):** tab multiplexer (PTY + vt100 + tui-term), agent/shell tabs, claude `Waiting`/`Working` detection, sidebar + status bar + bell, `prefix n`, multi-repo workspaces with seeding, container lifecycle carried over from v1.
-2. **v2.1:** macOS banner notifications, detection patterns for more agents (codex etc.), workspace repo sync/refresh command, container stats in sidebar; RO identity-path mounts of canonical repos once [apple/container#990](https://github.com/apple/container/issues/990) ships.
-3. **v2.2:** copy-mode in scrollback, port publish UI, `--ssh` toggle.
-4. **Later:** session restore (reopen tab set), minimal devcontainer.json subset, socket API for scripting.
+1. **v2.0 (shipped):** tab multiplexer (PTY + vt100), agent/shell tabs, claude `Waiting`/`Working` detection, sidebar + status bar + bell/banner, `prefix n`, multi-repo workspaces with seeding, `.pall8t/Containerfile` auto-detection, terminal-query answering.
+2. **v3.0 (next):** session-holder re-architecture (ADR-0005): `pall8t-tab` holder binary, registry + flock coordination, detach/reattach, multi-instance safety, `q` = detach.
+3. **v3.1:** detection patterns for more agents (codex etc.), workspace repo sync/refresh command, container stats in sidebar; RO identity-path mounts of canonical repos once [apple/container#990](https://github.com/apple/container/issues/990) ships.
+4. **v3.2:** copy-mode in scrollback, port publish UI, `--ssh` toggle.
+5. **Later:** minimal devcontainer.json subset, socket API for scripting (revisit trigger for a central daemon, ADR-0005).
 
 ## 11. Architecture decision records
 
@@ -210,5 +227,7 @@ Decisions live in [`docs/adr/`](../adr/); this section only summarizes them.
 **[ADR-0002: Rename cabin → pall8t](../adr/0002-rename-to-pall8t.md)** (Accepted, 2026-07-04). "cabin" was too generic (crates.io/search collisions); "pall8t" keeps the pallet-under-containers metaphor, is collision-free, and stays pronounceable.
 
 **[ADR-0003: Pivot to an embedded agent multiplexer](../adr/0003-multiplexer-pivot.md)** (Accepted, 2026-07-04). Prototype testing showed the filer was unused and external terminal tabs (Ghostty et al.) made agent monitoring impossible — and broke the IDE-integrated-terminal usage mode. v2 drops the filer and embeds a minimal herdr-style multiplexer: tabs with real PTYs (`portable-pty` + `vt100` + `tui-term`) running `container exec`, plus heuristic `Waiting`/`Working` detection and notifications. Supersedes v1's "no embedded terminal emulation" non-goal. Depending on herdr/tmux underneath was rejected (heavy dependency, and the container-exec integration + agent monitoring is the product).
+
+**[ADR-0005: Per-tab session holders instead of a central daemon](../adr/0005-session-holders.md)** (Accepted, 2026-07-05, prompted by [#2](https://github.com/TakiTake/pall8t/issues/2)). Config clobbering, no detach, and cross-instance container races all stem from state living in one foreground process. Rather than a tmux-style central daemon (single point of failure for every agent session, upgrade kills sessions, RPC + lifecycle machinery), each tab gets a tiny frozen `pall8t-tab` holder process owning its PTY (ring buffer + per-tab socket, dtach-style), and mutations go through a flock-protected registry. `q` becomes detach. A central daemon remains the documented escalation path if detached-state notifications or a socket API become requirements.
 
 **[ADR-0004: Multi-repo project workspaces with identity-path mounts](../adr/0004-workspace-model.md)** (Accepted, 2026-07-04). A project references multiple repos; agents work in a host-persistent workspace mounted at the identical absolute path inside the container, seeded with hardlink clones of each repo. Canonical checkouts are not mounted (apple/container lacks RO mounts, [#990](https://github.com/apple/container/issues/990); `git worktree add` writes to the parent repo anyway) — worktrees are cut from the workspace clones and survive container restarts. Switch to RO mounts + `--reference` alternates when #990 ships.
