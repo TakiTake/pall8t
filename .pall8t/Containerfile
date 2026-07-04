@@ -3,13 +3,18 @@ FROM ubuntu:24.04
 ARG UID=501
 ARG GID=501
 
-# Base tools + node + claude CLI; dev user with host UID/GID (same as the
-# default pall8t image), plus a Rust toolchain for developing pall8t itself.
+# Base tools + node + claude CLI + gh; dev user with host UID/GID (same as
+# the default pall8t image), plus a Rust toolchain for developing pall8t.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git sudo ripgrep less vim openssh-client \
       build-essential pkg-config && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
     (getent group ${GID} || groupadd -g ${GID} dev) && \
     useradd -m -u ${UID} -g ${GID} -s /bin/bash dev && \
     echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
