@@ -49,8 +49,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &app.mode {
         Mode::Help => draw_help(f, app),
         Mode::AddProject(input) => draw_input_overlay(f, "add project (repo paths, comma-separated)", input),
-        Mode::ConfirmClose => draw_confirm(f, "close tab?", "the process inside is still running — y: close  esc: cancel"),
-        Mode::ConfirmQuit => draw_confirm(f, "quit pall8t?", "tabs are working/waiting; exec sessions will end (containers keep running) — y: quit  esc: cancel"),
+        Mode::ConfirmClose => draw_confirm(f, "close tab?", "the process inside is still running and will be killed — y: close  esc: cancel (tip: ^b q detaches without killing anything)"),
         Mode::Logs { title, lines, scroll } => draw_logs(f, title, lines, *scroll),
         _ => {}
     }
@@ -305,7 +304,7 @@ fn draw_keybar(f: &mut Frame, app: &App, area: Rect) {
         ("x", "close"),
         ("z", "sidebar"),
         ("?", "help"),
-        ("q", "quit"),
+        ("q", "detach"),
     ];
     for (key, label) in keys {
         let key_color = if *key == "n" { ALERT } else { ACCENT };
@@ -374,12 +373,12 @@ fn draw_help(f: &mut Frame, app: &App) {
         ("1-9", "jump to tab N"),
         ("p", "cycle project"),
         ("P", "add project"),
-        ("x", "close tab"),
+        ("x", "close tab (kills the agent inside)"),
         ("s", "start/stop container"),
         ("b", "rebuild image"),
         ("L", "container logs"),
         ("z", "toggle sidebar"),
-        ("q", "quit"),
+        ("q", "detach — agents keep running, relaunch to reattach"),
     ];
     let mut lines: Vec<Line> = vec![Line::from(Span::styled(
         format!("press ctrl+{p}, release, then:"),

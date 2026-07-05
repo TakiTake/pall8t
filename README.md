@@ -13,6 +13,7 @@ Run AI coding agents inside [apple/container](https://github.com/apple/container
 - **Multi-repo projects.** A project references several repos; agents cut git worktrees in a host-persistent workspace that survives container restarts (mounted at the identical path inside the container).
 - **Runs anywhere a terminal runs** — standalone or inside an IDE's integrated terminal (VS Code etc.).
 - **Agent awareness, herdr-style.** Waiting-for-approval detection with bell/banner notification and one-key jump (`^b n`).
+- **Sessions survive the TUI.** Each tab lives in a tiny detached `pall8t-tab` holder process: quit pall8t (or close the IDE window) and agents keep running; relaunching reattaches. Multiple pall8t instances share one source of truth (ADR-0005).
 
 Replaces a Podman + DevContainer stack on macOS without pretending to be docker (see `docs/adr/`).
 
@@ -38,11 +39,11 @@ Press the prefix (`ctrl+b` by default), release, then:
 | `n` | Jump to the next tab **waiting for you** |
 | `j` / `k`, `1`–`9` | Cycle tabs / jump to tab N |
 | `p` / `P` | Cycle project / add project (comma-separated repo paths) |
-| `x` | Close tab (stops the container when it was the project's last tab) |
+| `x` | Close tab, killing the agent inside (stops the container when it was the project's last tab, across all instances) |
 | `s` / `b` / `L` | Start-stop container / rebuild image / logs |
 | `z` | Toggle sidebar |
 | `?` | Help |
-| `q` | Quit (containers keep running) |
+| `q` | Detach: quit the TUI, agents and containers keep running; relaunch `pall8t` to reattach |
 
 All other keys go straight to the active tab's terminal.
 

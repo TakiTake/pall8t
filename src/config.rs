@@ -114,6 +114,22 @@ pub fn load() -> Result<Config> {
     Ok(cfg)
 }
 
+/// Lock → re-read → mutate → write (same lock as the tab registry), so
+/// concurrent pall8t instances never clobber each other's config edits
+/// (ADR-0005). Returns the post-mutation config.
+pub fn locked_mutate(f: impl FnOnce(&mut Config)) -> Result<Config> {
+    let _lock = crate::registry::Lock::acquire()?;
+    let mut cfg = load()?;
+    f(&mut cfg);
+    save(&cfg)?;
+    Ok(cfg)
+}
+
+/// mtime of config.toml, for cheap cross-instance change detection.
+pub fn mtime() -> Option<std::time::SystemTime> {
+    config_path().ok()?.metadata().ok()?.modified().ok()
+}
+
 pub fn save(cfg: &Config) -> Result<()> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
