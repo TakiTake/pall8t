@@ -87,7 +87,7 @@ sequenceDiagram
     T->>R: lock · register tab · unlock
     T->>H: spawn detached holder
     H->>A: container exec -it … claude (PTY)
-    T->>H: connect tabs/&lt;id&gt;.sock
+    T->>H: connect the tab socket (tabs/id.sock)
     H-->>T: replay ring buffer, then live bytes
     U->>T: ^b q — detach
     T--xH: disconnect (holder keeps running)
