@@ -314,6 +314,7 @@ fn draw_keybar(f: &mut Frame, app: &App, area: Rect) {
         ("j/k 1-9", "tabs"),
         ("p/P", "project"),
         ("x", "close"),
+        ("b", "build"),
         ("z", "sidebar"),
         ("?", "help"),
         ("q", "detach"),

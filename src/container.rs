@@ -43,6 +43,37 @@ pub fn image_tag(base: &str, uid: u32, gid: u32) -> String {
     format!("{base}:{uid}-{gid}")
 }
 
+/// Like [`image_tag`], but suffixed with a Containerfile commit hash (see
+/// [`containerfile_commit_hash`]) so a new commit resolves to a new tag.
+pub fn image_tag_hashed(base: &str, uid: u32, gid: u32, hash: &str) -> String {
+    format!("{base}:{uid}-{gid}-{hash}")
+}
+
+/// Short hash of the last commit that touched `containerfile`, used to tag
+/// images with the Containerfile revision they were built from. `None` if
+/// git fails, the file isn't inside a repo, or it has no commits (e.g. it's
+/// untracked).
+pub fn containerfile_commit_hash(containerfile: &Path) -> Option<String> {
+    let dir = containerfile.parent()?;
+    let file_name = containerfile.file_name()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["log", "-n", "1", "--format=%h", "--"])
+        .arg(file_name)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if hash.is_empty() {
+        None
+    } else {
+        Some(hash)
+    }
+}
+
 fn run_ok<I, S>(args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
@@ -248,4 +279,74 @@ pub fn default_containerfile_path() -> Result<PathBuf> {
     let path = dir.join("Containerfile");
     std::fs::write(&path, DEFAULT_CONTAINERFILE)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git installed");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn containerfile_commit_hash_matches_git_log() {
+        let dir = std::env::temp_dir().join(format!("pall8t-test-tracked-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "test"]);
+        let file = dir.join("Containerfile");
+        fs::write(&file, "FROM scratch\n").unwrap();
+        git(&dir, &["add", "Containerfile"]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        let expected = String::from_utf8(
+            Command::new("git")
+                .current_dir(&dir)
+                .args(["log", "-n", "1", "--format=%h"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        assert_eq!(containerfile_commit_hash(&file), Some(expected));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn containerfile_commit_hash_none_when_untracked() {
+        let dir =
+            std::env::temp_dir().join(format!("pall8t-test-untracked-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        let file = dir.join("Containerfile");
+        fs::write(&file, "FROM scratch\n").unwrap();
+
+        assert_eq!(containerfile_commit_hash(&file), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn containerfile_commit_hash_none_outside_repo() {
+        let dir = std::env::temp_dir().join(format!("pall8t-test-norepo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Containerfile");
+        fs::write(&file, "FROM scratch\n").unwrap();
+
+        assert_eq!(containerfile_commit_hash(&file), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

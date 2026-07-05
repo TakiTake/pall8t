@@ -958,10 +958,17 @@ fn resolve_image(ctx: &Ctx, uid: u32, gid: u32) -> String {
     if let Some(img) = &ctx.entry.image {
         return img.clone();
     }
-    if project_containerfile(ctx).is_some() {
+    if let Some(cf) = project_containerfile(ctx) {
         // Project-specific tag so the shared pall8t-base is not overwritten.
         let base = format!("pall8t-{}", workspace::slug(&ctx.entry.name));
-        return container::image_tag(&base, uid, gid);
+        // Suffix with the Containerfile's last commit hash so a new commit
+        // resolves to a new tag, which `ensure_running` sees as stale and
+        // rebuilds. Falls back to the unsuffixed tag when the hash is
+        // unavailable (e.g. the Containerfile isn't tracked in a repo).
+        return match container::containerfile_commit_hash(&cf) {
+            Some(hash) => container::image_tag_hashed(&base, uid, gid, &hash),
+            None => container::image_tag(&base, uid, gid),
+        };
     }
     container::image_tag(&ctx.image_base, uid, gid)
 }

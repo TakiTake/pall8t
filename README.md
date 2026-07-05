@@ -51,7 +51,7 @@ All other keys go straight to the active tab's terminal. The mouse wheel scrolls
 
 `~/.config/pall8t/config.toml` — see [docs/design/DESIGN.md](docs/design/DESIGN.md) for the full design and [docs/adr/](docs/adr/) for architecture decisions.
 
-If a repo contains `.pall8t/Containerfile`, pall8t builds that project's image from it automatically (this repo ships one with a Rust toolchain, so agents can develop pall8t inside pall8t). Toolchains in custom Containerfiles must live outside `/home/dev` — the persistent home mount shadows it.
+If a repo contains `.pall8t/Containerfile`, pall8t builds that project's image from it automatically (this repo ships one with a Rust toolchain, so agents can develop pall8t inside pall8t). Toolchains in custom Containerfiles must live outside `/home/dev` — the persistent home mount shadows it. The built image is tagged with the Containerfile's last commit hash, so committing a change to it makes pall8t rebuild automatically the next time the project's image is needed.
 
 ## Claude Code agent teams (split panes)
 
