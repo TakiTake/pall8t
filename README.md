@@ -52,3 +52,21 @@ All other keys go straight to the active tab's terminal. The mouse wheel scrolls
 `~/.config/pall8t/config.toml` — see [docs/design/DESIGN.md](docs/design/DESIGN.md) for the full design and [docs/adr/](docs/adr/) for architecture decisions.
 
 If a repo contains `.pall8t/Containerfile`, pall8t builds that project's image from it automatically (this repo ships one with a Rust toolchain, so agents can develop pall8t inside pall8t). Toolchains in custom Containerfiles must live outside `/home/dev` — the persistent home mount shadows it.
+
+## Claude Code agent teams (split panes)
+
+Claude Code can show teammate agents as tmux split panes (`teammateMode: "auto"` / `"tmux"`), but it only creates panes if it's already running inside a tmux session — pall8t's image ships tmux for exactly this.
+
+1. Rebuild the image after upgrading (`prefix b` in pall8t) so tmux is available.
+2. In `~/.config/pall8t/config.toml`, set:
+   ```toml
+   agent_command = "tmux new -A -s claude claude"
+   ```
+3. Inside the container, one-time (persists in the container home): add `"teammateMode": "auto"` to `~/.claude/settings.json`.
+
+**Prefix collision:** pall8t's default prefix (`ctrl+b`) is also tmux's. Pressing `ctrl+b` twice from a pall8t tab passes the second one through to tmux, but for comfortable pane navigation it's worth changing one side — e.g. `prefix = "ctrl+q"` in `config.toml`, or remap tmux's prefix in `~/.tmux.conf` inside the container.
+
+**Behavior notes:**
+- `-A -s claude` means the tmux session persists in the container and re-attaches when the tab is reopened; open only one agent tab per project when using this, since a second tab would just mirror the same session.
+- pall8t's waiting/working state detection (§6 in DESIGN.md) is per-tab, not per-teammate-pane — it only sees the pane tmux happens to show.
+- The image ships `/etc/tmux.conf` with `status off`; override in `~/.tmux.conf` inside the container if you want the status bar back.
