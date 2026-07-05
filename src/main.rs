@@ -1,11 +1,3 @@
-mod app;
-mod config;
-mod container;
-mod detect;
-mod mux;
-mod ui;
-mod workspace;
-
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
@@ -13,13 +5,15 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use pall8t::{app, ui};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// Run AI coding agents in apple/container sandboxes — a minimal agent
-/// multiplexer TUI.
+/// multiplexer TUI. Quitting detaches; tabs live in pall8t-tab holders and
+/// reattach on the next launch.
 #[derive(Parser)]
 #[command(name = "pall8t", version)]
 struct Cli {
@@ -65,7 +59,6 @@ fn run(
 
         if event::poll(Duration::from_millis(100))? {
             handle_event(app, event::read()?);
-            // Drain any burst (fast typing, paste) before redrawing.
             while event::poll(Duration::from_millis(0))? {
                 handle_event(app, event::read()?);
             }

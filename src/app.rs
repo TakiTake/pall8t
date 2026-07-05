@@ -2,6 +2,8 @@ use crate::config::{self, Config, ProjectEntry};
 use crate::container::{self, State};
 use crate::detect::{self, AgentPatterns, TabKind, TabState};
 use crate::mux::{self, Tab};
+use crate::proto;
+use crate::registry::{self, TabEntry};
 use crate::workspace;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -9,14 +11,13 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub enum Mode {
     Normal,
     Prefix,
     AddProject(String),
     ConfirmClose,
-    ConfirmQuit,
     Help,
     Logs {
         title: String,
@@ -81,6 +82,7 @@ pub struct App {
     term_rows: u16,
     term_cols: u16,
     auto_agent_tab: Option<usize>,
+    config_mtime: Option<SystemTime>,
     jobs: Sender<Job>,
     msgs: Receiver<Msg>,
     last_refresh: Instant,
@@ -99,24 +101,34 @@ impl App {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "project".to_string());
-            if let Some(i) = cfg.projects.iter().position(|e| e.repos.contains(&abs)) {
-                current = i;
-            } else if let Some(i) = cfg.projects.iter().position(|e| e.name == name) {
-                // Same project name: register this repo with it.
-                cfg.projects[i].repos.push(abs);
-                config::save(&cfg)?;
-                current = i;
-            } else {
-                cfg.projects.push(ProjectEntry {
-                    name,
-                    repos: vec![abs],
+            let abs_for_mutation = abs.clone();
+            let name_for_mutation = name.clone();
+            cfg = config::locked_mutate(move |c| {
+                if c.projects.iter().any(|e| e.repos.contains(&abs_for_mutation)) {
+                    return;
+                }
+                if let Some(e) = c
+                    .projects
+                    .iter_mut()
+                    .find(|e| e.name == name_for_mutation)
+                {
+                    e.repos.push(abs_for_mutation);
+                    return;
+                }
+                c.projects.push(ProjectEntry {
+                    name: name_for_mutation,
+                    repos: vec![abs_for_mutation],
                     path: None,
                     image: None,
                     containerfile: None,
                 });
-                config::save(&cfg)?;
-                current = cfg.projects.len() - 1;
-            }
+            })?;
+            current = cfg
+                .projects
+                .iter()
+                .position(|e| e.repos.contains(&abs))
+                .or_else(|| cfg.projects.iter().position(|e| e.name == name))
+                .unwrap_or(0);
             auto_agent_tab = Some(current);
         }
 
@@ -142,7 +154,7 @@ impl App {
         let prefix_char = config::parse_prefix(&cfg.prefix);
         let patterns = AgentPatterns::from_config(&cfg);
 
-        let app = Self {
+        let mut app = Self {
             config: cfg,
             prefix_char,
             patterns,
@@ -158,17 +170,80 @@ impl App {
             term_rows: 24,
             term_cols: 80,
             auto_agent_tab,
+            config_mtime: config::mtime(),
             jobs: job_tx,
             msgs: msg_rx,
             last_refresh: Instant::now(),
         };
         app.jobs.send(Job::Refresh).ok();
+        app.reattach_existing();
         if let Some(idx) = app.auto_agent_tab {
             if let Some(ctx) = app.ctx(idx) {
+                app.busy = true;
                 app.jobs.send(Job::Seed(ctx)).ok();
             }
         }
         Ok(app)
+    }
+
+    /// Reconnect to holders left behind by previous instances (detach →
+    /// reattach), pruning entries whose holder died.
+    fn reattach_existing(&mut self) {
+        let reg = registry::locked(|reg| {
+            reg.tabs.retain(|t| {
+                if registry::pid_alive(t.pid) {
+                    true
+                } else {
+                    let _ = std::fs::remove_file(&t.socket);
+                    let _ = std::fs::remove_file(proto::exited_marker(&t.socket));
+                    false
+                }
+            });
+            reg.clone()
+        });
+        let reg = match reg {
+            Ok(r) => r,
+            Err(e) => {
+                self.status = format!("error: {e:#}");
+                return;
+            }
+        };
+        for entry in &reg.tabs {
+            let Some(project) = self
+                .projects
+                .iter()
+                .position(|r| r.entry.name == entry.project)
+            else {
+                self.status = format!(
+                    "tab {} belongs to unknown project `{}` — left detached",
+                    entry.title, entry.project
+                );
+                continue;
+            };
+            let kind = if entry.kind == "agent" {
+                TabKind::Agent
+            } else {
+                TabKind::Shell
+            };
+            match mux::attach(
+                &entry.id,
+                project,
+                &entry.project,
+                kind,
+                &entry.title,
+                &entry.socket,
+                self.term_rows,
+                self.term_cols,
+            ) {
+                Ok(tab) => self.tabs.push(tab),
+                Err(e) => self.status = format!("reattach {} failed: {e:#}", entry.title),
+            }
+        }
+        if !self.tabs.is_empty() {
+            self.active_tab = Some(0);
+            self.current_project = self.tabs[0].project;
+            self.status = format!("reattached {} tab(s)", self.tabs.len());
+        }
     }
 
     fn ctx(&self, idx: usize) -> Option<Ctx> {
@@ -183,7 +258,7 @@ impl App {
         })
     }
 
-    /// Inner terminal-widget size, pushed down to every PTY.
+    /// Inner terminal-widget size, pushed down to every holder.
     pub fn set_term_size(&mut self, rows: u16, cols: u16) {
         if (rows, cols) == (self.term_rows, self.term_cols) {
             return;
@@ -204,18 +279,17 @@ impl App {
             .collect()
     }
 
-    pub fn any_tab_running(&self) -> bool {
-        self.tabs
-            .iter()
-            .any(|t| matches!(t.state, TabState::Working | TabState::Waiting))
-    }
-
-    /// Periodic work: worker messages, container refresh, state detection.
+    /// Periodic work: worker messages, container refresh, config reload,
+    /// per-tab state detection.
     pub fn tick(&mut self) {
         self.drain_worker();
         if self.last_refresh.elapsed() >= Duration::from_secs(2) {
             self.jobs.send(Job::Refresh).ok();
             self.last_refresh = Instant::now();
+            let mtime = config::mtime();
+            if mtime != self.config_mtime {
+                self.reload_config();
+            }
         }
         let mut notifications: Vec<String> = Vec::new();
         for tab in &mut self.tabs {
@@ -236,6 +310,51 @@ impl App {
         for n in notifications {
             self.notify(&n);
         }
+    }
+
+    /// Re-read config.toml (another instance may have changed it) and remap
+    /// runtime state onto the new project list.
+    fn reload_config(&mut self) {
+        let Ok(cfg) = config::load() else { return };
+        let old_states: Vec<(String, State)> = self
+            .projects
+            .iter()
+            .map(|r| (r.entry.name.clone(), r.state))
+            .collect();
+        self.projects = cfg
+            .projects
+            .iter()
+            .map(|e| {
+                let ws = workspace::workspace_path(&cfg.workspace_root, &e.name);
+                let state = old_states
+                    .iter()
+                    .find(|(n, _)| *n == e.name)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(State::Absent);
+                ProjectRow {
+                    container: container::container_name(&e.name, &ws),
+                    workspace: ws,
+                    state,
+                    entry: e.clone(),
+                }
+            })
+            .collect();
+        self.prefix_char = config::parse_prefix(&cfg.prefix);
+        self.patterns = AgentPatterns::from_config(&cfg);
+        self.config = cfg;
+        for tab in &mut self.tabs {
+            if let Some(i) = self
+                .projects
+                .iter()
+                .position(|r| r.entry.name == tab.project_name)
+            {
+                tab.project = i;
+            }
+        }
+        if self.current_project >= self.projects.len() {
+            self.current_project = self.projects.len().saturating_sub(1);
+        }
+        self.config_mtime = config::mtime();
     }
 
     fn notify(&self, message: &str) {
@@ -294,11 +413,12 @@ impl App {
                         self.auto_agent_tab = None;
                         if let Some(ctx) = self.ctx(idx) {
                             self.busy = true;
-                            self.jobs.send(Job::Ensure {
-                                ctx,
-                                kind: TabKind::Agent,
-                            })
-                            .ok();
+                            self.jobs
+                                .send(Job::Ensure {
+                                    ctx,
+                                    kind: TabKind::Agent,
+                                })
+                                .ok();
                         }
                     }
                 }
@@ -320,11 +440,16 @@ impl App {
         }
     }
 
+    /// Container is running: spawn a detached holder, register it, attach.
     fn open_tab(&mut self, idx: usize, kind: TabKind) -> Result<()> {
-        let row = self
-            .projects
-            .get(idx)
-            .context("project disappeared")?;
+        let (project_name, container_name, ws) = {
+            let row = self.projects.get(idx).context("project disappeared")?;
+            (
+                row.entry.name.clone(),
+                row.container.clone(),
+                row.workspace.clone(),
+            )
+        };
         let cmd: Vec<String> = match kind {
             TabKind::Agent => self
                 .config
@@ -336,12 +461,38 @@ impl App {
         };
         let title = cmd.first().cloned().unwrap_or_else(|| "tab".to_string());
         let mut argv = vec!["container".to_string()];
-        argv.extend(container::exec_argv(&row.container, &row.workspace, &cmd));
-        let tab = Tab::spawn(
+        argv.extend(container::exec_argv(&container_name, &ws, &cmd));
+
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let id = format!("t{:x}-{:x}", nanos, std::process::id());
+        let socket = registry::tabs_dir()?.join(format!("{id}.sock"));
+
+        let pid = mux::spawn_holder(&id, &socket, self.term_rows, self.term_cols, &argv)?;
+        registry::locked(|reg| {
+            reg.tabs.push(TabEntry {
+                id: id.clone(),
+                project: project_name.clone(),
+                kind: match kind {
+                    TabKind::Agent => "agent".to_string(),
+                    TabKind::Shell => "shell".to_string(),
+                },
+                title: title.clone(),
+                pid,
+                socket: socket.clone(),
+                container: container_name.clone(),
+                workspace: ws.clone(),
+            });
+        })?;
+        let tab = mux::attach(
+            &id,
             idx,
+            &project_name,
             kind,
-            title.clone(),
-            &argv,
+            &title,
+            &socket,
             self.term_rows,
             self.term_cols,
         )?;
@@ -374,7 +525,9 @@ impl App {
         }
         let mut tab = self.tabs.remove(i);
         tab.kill();
-        let project = tab.project;
+        let tab_id = tab.id.clone();
+        let project_name = tab.project_name.clone();
+        let project_idx = tab.project;
         self.active_tab = if self.tabs.is_empty() {
             None
         } else {
@@ -383,14 +536,21 @@ impl App {
         if let Some(a) = self.active_tab {
             self.current_project = self.tabs[a].project;
         }
-        // Resource optimization: when a project's last tab closes, stop its
-        // container. The next tab restarts it via `container start` (cheap).
-        // State-independent on purpose: the cached project state is only
-        // updated by the 2s reconcile and is *not* set when a tab opens, so
-        // gating on it here leaks a just-opened container that's closed before
-        // the first reconcile. StopIdle queries live state instead.
-        if !self.tabs.iter().any(|t| t.project == project) {
-            if let Some(ctx) = self.ctx(project) {
+        // Resource optimization, multi-instance safe: stop the container
+        // only when the registry shows zero live tabs for this project
+        // across ALL pall8t instances (ADR-0005).
+        let remaining = registry::locked(|reg| {
+            reg.tabs.retain(|t| t.id != tab_id);
+            reg.tabs
+                .iter()
+                .filter(|t| t.project == project_name && registry::pid_alive(t.pid))
+                .count()
+        })
+        .unwrap_or(usize::MAX);
+        if remaining == 0
+            && self.projects.get(project_idx).map(|r| r.state) == Some(State::Running)
+        {
+            if let Some(ctx) = self.ctx(project_idx) {
                 self.busy = true;
                 self.jobs.send(Job::StopIdle(ctx)).ok();
             }
@@ -453,32 +613,29 @@ impl App {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "project".to_string());
-        if self.config.projects.iter().any(|e| e.name == name) {
-            self.status = format!("project `{name}` already exists");
+        let name_check = name.clone();
+        let result = config::locked_mutate(move |c| {
+            if !c.projects.iter().any(|e| e.name == name_check) {
+                c.projects.push(ProjectEntry {
+                    name: name_check,
+                    repos,
+                    path: None,
+                    image: None,
+                    containerfile: None,
+                });
+            }
+        });
+        if let Err(e) = result {
+            self.status = format!("config save failed: {e}");
             return;
         }
-        let entry = ProjectEntry {
-            name,
-            repos,
-            path: None,
-            image: None,
-            containerfile: None,
-        };
-        self.config.projects.push(entry.clone());
-        if let Err(e) = config::save(&self.config) {
-            self.status = format!("config save failed: {e}");
-        }
-        let ws = workspace::workspace_path(&self.config.workspace_root, &entry.name);
-        self.projects.push(ProjectRow {
-            container: container::container_name(&entry.name, &ws),
-            workspace: ws,
-            state: State::Absent,
-            entry,
-        });
-        self.current_project = self.projects.len() - 1;
-        if let Some(ctx) = self.ctx(self.current_project) {
-            self.busy = true;
-            self.jobs.send(Job::Seed(ctx)).ok();
+        self.reload_config();
+        if let Some(i) = self.projects.iter().position(|r| r.entry.name == name) {
+            self.current_project = i;
+            if let Some(ctx) = self.ctx(i) {
+                self.busy = true;
+                self.jobs.send(Job::Seed(ctx)).ok();
+            }
         }
     }
 
@@ -510,13 +667,11 @@ impl App {
                         }
                     }
                 } else {
-                    // No tabs: commands work without the prefix.
                     self.command_key(code);
                 }
             }
             Mode::Prefix => {
                 if self.is_prefix(code, mods) {
-                    // prefix twice sends the prefix itself to the tab
                     if let Some(i) = self.active_tab {
                         let byte = (self.prefix_char.to_ascii_lowercase() as u8) & 0x1f;
                         self.tabs[i].write_bytes(&[byte]);
@@ -540,10 +695,6 @@ impl App {
             },
             Mode::ConfirmClose => match code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.close_active_tab(true),
-                _ => {}
-            },
-            Mode::ConfirmQuit => match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => self.quit(true),
                 _ => {}
             },
             Mode::Help => {}
@@ -645,20 +796,10 @@ impl App {
             }
             KeyCode::Char('z') => self.sidebar = !self.sidebar,
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('q') => self.quit(false),
+            // Detach: holders (and the agents inside) keep running.
+            KeyCode::Char('q') => self.should_quit = true,
             _ => {}
         }
-    }
-
-    fn quit(&mut self, force: bool) {
-        if self.any_tab_running() && !force {
-            self.mode = Mode::ConfirmQuit;
-            return;
-        }
-        for tab in &mut self.tabs {
-            tab.kill();
-        }
-        self.should_quit = true;
     }
 }
 
@@ -727,30 +868,13 @@ fn handle_job(job: Job, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
             let _ = msgs.send(Msg::Done("done".to_string()));
         }
         Job::StopIdle(ctx) => {
-            // Query live state rather than trusting the cached project state,
-            // which lags a just-opened container (see close-path note in
-            // close_active_tab). Stop only if it's actually running so this
-            // stays idempotent when the container is already stopped/absent.
-            let running = container::list_all()
-                .map(|list| {
-                    list.iter()
-                        .any(|(name, s)| *name == ctx.container && *s == State::Running)
-                })
-                .unwrap_or(false);
-            if running {
-                let _ = msgs.send(Msg::Status(format!(
-                    "no tabs left — stopping {}…",
-                    ctx.container
-                )));
-                container::stop(&ctx.container)?;
-                refresh(msgs);
-                let _ = msgs.send(Msg::Done(format!("stopped {} (idle)", ctx.container)));
-            } else {
-                let _ = msgs.send(Msg::Done(format!(
-                    "{} already stopped",
-                    ctx.container
-                )));
-            }
+            let _ = msgs.send(Msg::Status(format!(
+                "no tabs left — stopping {}…",
+                ctx.container
+            )));
+            container::stop(&ctx.container)?;
+            refresh(msgs);
+            let _ = msgs.send(Msg::Done(format!("stopped {} (idle)", ctx.container)));
         }
         Job::Build(ctx) => {
             let tag = build_image(&ctx, msgs, uid, gid)?;

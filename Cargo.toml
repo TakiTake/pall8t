@@ -1,10 +1,22 @@
 [package]
 name = "pall8t"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Run AI coding agents in apple/container sandboxes — a minimal agent multiplexer TUI"
 license = "MIT"
 repository = "https://github.com/TakiTake/pall8t"
+
+[[bin]]
+name = "pall8t"
+path = "src/main.rs"
+
+[[bin]]
+name = "pall8t-tab"
+path = "src/bin/pall8t-tab.rs"
+
+[lib]
+name = "pall8t"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
