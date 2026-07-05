@@ -86,12 +86,17 @@ ARG UID=501
 ARG GID=501
 # node + claude CLI + common tools; dev user with host UID/GID
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git sudo ripgrep less vim openssh-client && \
+      ca-certificates curl git sudo ripgrep less vim openssh-client tmux && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
     (getent group ${GID} || groupadd -g ${GID} dev) && \
     useradd -m -u ${UID} -g ${GID} -s /bin/bash dev && \
     echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
+RUN printf '%s\n' \
+      '# pall8t: keep the tmux chrome minimal inside agent tabs.' \
+      '# Users can override in ~/.tmux.conf (persistent home).' \
+      'set -g status off' \
+      > /etc/tmux.conf
 USER dev
 WORKDIR /work
 ```
@@ -99,6 +104,8 @@ WORKDIR /work
 **Per-project Containerfile (auto-detected).** If any source repo contains `.pall8t/Containerfile`, pall8t builds the project's image from it instead of the default — tag `pall8t-<project>:<uid>-<gid>` (so the shared base image is not overwritten), build context = that `.pall8t/` directory, same UID/GID build args. Explicit config (`image` / `containerfile`) takes priority over auto-detection. This is how dogfooding works: pall8t's own repo ships a `.pall8t/Containerfile` with a Rust toolchain, so agents inside the container can build pall8t itself.
 
 **Caveat for custom Containerfiles:** the persistent home mount shadows `/home/dev` at runtime, so toolchains must be installed *outside* the home directory (e.g. `RUSTUP_HOME=/usr/local/rustup`, `CARGO_HOME=/usr/local/cargo`, plus an `/etc/profile.d` PATH entry for login shells).
+
+**tmux.** Both images install tmux and ship a minimal `/etc/tmux.conf` (`status off`) so Claude Code's agent-teams split-pane mode (`teammateMode: "auto"`/`"tmux"`) has somewhere to create panes — it only does so when already running inside a tmux session. See README: "Claude Code agent teams (split panes)" for the `agent_command` and settings needed to opt in.
 
 ## 5. Multiplexer architecture (session holders)
 
@@ -148,6 +155,7 @@ herdr-style awareness, minimal implementation. Two signals, no hooks required:
 | `Done` | process exited | child exited |
 
 - Patterns live in config (`[agents.claude]` regex list) so new agents or prompt-format changes don't need a release. Shell tabs only use activity + exit.
+- Detection is per-tab: if `agent_command` runs claude under tmux for agent-teams split panes (README: "Claude Code agent teams (split panes)"), the vt100 only sees whichever tmux pane is currently displayed, not the teammates in other panes.
 - **Notification surfaces:** sidebar badge per tab, aggregate in the status bar ("⚠ 2 tabs waiting — ^b n"), terminal bell, and optional macOS banner via `osascript -e 'display notification …'` (off by default, `notify = "banner"` to enable). Only fired on transition *into* `Waiting`.
 - **`prefix n` jumps to the next `Waiting` tab** — the single most important binding in the tool.
 
@@ -185,6 +193,7 @@ prefix = "ctrl+b"
 notify = "bell"                  # off | bell | banner (macOS notification)
 mouse = true                     # wheel = scrollback (false: leave mouse to the terminal)
 agent_command = "claude"         # what `prefix a` runs
+# agent_command = "tmux new -A -s claude claude"  # Claude Code agent-teams split panes (README)
 workspace_root = "~/.pall8t/workspaces"
 
 [[projects]]
