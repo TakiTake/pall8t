@@ -43,35 +43,24 @@ pub fn image_tag(base: &str, uid: u32, gid: u32) -> String {
     format!("{base}:{uid}-{gid}")
 }
 
-/// Like [`image_tag`], but suffixed with a Containerfile commit hash (see
-/// [`containerfile_commit_hash`]) so a new commit resolves to a new tag.
+/// Like [`image_tag`], but suffixed with a Containerfile content hash (see
+/// [`containerfile_content_hash`]) so a change to its contents resolves to
+/// a new tag.
 pub fn image_tag_hashed(base: &str, uid: u32, gid: u32, hash: &str) -> String {
     format!("{base}:{uid}-{gid}-{hash}")
 }
 
-/// Short hash of the last commit that touched `containerfile`, used to tag
-/// images with the Containerfile revision they were built from. `None` if
-/// git fails, the file isn't inside a repo, or it has no commits (e.g. it's
-/// untracked).
-pub fn containerfile_commit_hash(containerfile: &Path) -> Option<String> {
-    let dir = containerfile.parent()?;
-    let file_name = containerfile.file_name()?;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["log", "-n", "1", "--format=%h", "--"])
-        .arg(file_name)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if hash.is_empty() {
-        None
-    } else {
-        Some(hash)
-    }
+/// First 12 hex chars of the sha256 of `containerfile`'s current bytes.
+/// Hashing the working-tree contents (rather than, say, the last commit
+/// that touched the file) means uncommitted edits are detected too, and a
+/// rebuild can never poison a tag: the same content always resolves to the
+/// same tag, so the tag always corresponds to the image built from it.
+/// `None` if the file can't be read.
+pub fn containerfile_content_hash(containerfile: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(containerfile).ok()?;
+    let digest = Sha256::digest(&bytes);
+    Some(digest.iter().take(6).map(|b| format!("{b:02x}")).collect())
 }
 
 fn run_ok<I, S>(args: I) -> Result<String>
@@ -141,19 +130,60 @@ pub fn list_all() -> Result<Vec<(String, State)>> {
 }
 
 pub fn image_exists(tag: &str) -> bool {
-    fn any_str_contains(v: &Value, needle: &str) -> bool {
+    // Exact match, not `contains`: with hash-suffixed tags, the unsuffixed
+    // form (e.g. `pall8t-x:501-20`) is a substring of the suffixed one
+    // (`pall8t-x:501-20-abc123456789`), so a substring match would report
+    // a tag as existing when only a differently-hashed sibling does.
+    fn any_str_equals(v: &Value, needle: &str) -> bool {
         match v {
-            Value::String(s) => s.contains(needle),
-            Value::Array(a) => a.iter().any(|x| any_str_contains(x, needle)),
-            Value::Object(m) => m.values().any(|x| any_str_contains(x, needle)),
+            Value::String(s) => s == needle,
+            Value::Array(a) => a.iter().any(|x| any_str_equals(x, needle)),
+            Value::Object(m) => m.values().any(|x| any_str_equals(x, needle)),
             _ => false,
         }
     }
     run_ok(["image", "list", "--format", "json"])
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
-        .map(|v| any_str_contains(&v, tag))
+        .map(|v| any_str_equals(&v, tag))
         .unwrap_or(false)
+}
+
+/// Image reference strings from `container image list` that start with
+/// `prefix`, matched the same defensive way as [`image_exists`] (schema is
+/// pre-1.0, see ADR-0001). Used to find superseded project image builds to
+/// prune after a successful rebuild.
+pub fn image_tags_with_prefix(prefix: &str) -> Result<Vec<String>> {
+    fn collect(v: &Value, prefix: &str, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                if s.starts_with(prefix) {
+                    out.push(s.clone());
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| collect(x, prefix, out)),
+            Value::Object(m) => m.values().for_each(|x| collect(x, prefix, out)),
+            _ => {}
+        }
+    }
+    let stdout = run_ok(["image", "list", "--format", "json"])?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let v: Value =
+        serde_json::from_str(trimmed).context("unexpected `container image list` JSON")?;
+    let mut out = Vec::new();
+    collect(&v, prefix, &mut out);
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Delete an image by tag/reference.
+pub fn image_delete(tag: &str) -> Result<()> {
+    run_ok(["image", "delete", tag])?;
+    Ok(())
 }
 
 pub fn build_image(containerfile: &Path, ctx_dir: &Path, tag: &str, uid: u32, gid: u32) -> Result<()> {
@@ -286,67 +316,46 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("git installed");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
     #[test]
-    fn containerfile_commit_hash_matches_git_log() {
-        let dir = std::env::temp_dir().join(format!("pall8t-test-tracked-{}", std::process::id()));
+    fn containerfile_content_hash_is_stable_and_12_chars() {
+        let dir = std::env::temp_dir().join(format!("pall8t-test-hash-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        git(&dir, &["init", "-q"]);
-        git(&dir, &["config", "user.email", "test@example.com"]);
-        git(&dir, &["config", "user.name", "test"]);
         let file = dir.join("Containerfile");
         fs::write(&file, "FROM scratch\n").unwrap();
-        git(&dir, &["add", "Containerfile"]);
-        git(&dir, &["commit", "-q", "-m", "init"]);
 
-        let expected = String::from_utf8(
-            Command::new("git")
-                .current_dir(&dir)
-                .args(["log", "-n", "1", "--format=%h"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
+        let first = containerfile_content_hash(&file).expect("hash");
+        let second = containerfile_content_hash(&file).expect("hash");
+        assert_eq!(first.len(), 12);
+        assert_eq!(first, second);
 
-        assert_eq!(containerfile_commit_hash(&file), Some(expected));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn containerfile_commit_hash_none_when_untracked() {
+    fn containerfile_content_hash_changes_with_content() {
         let dir =
-            std::env::temp_dir().join(format!("pall8t-test-untracked-{}", std::process::id()));
+            std::env::temp_dir().join(format!("pall8t-test-hash-diff-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        git(&dir, &["init", "-q"]);
         let file = dir.join("Containerfile");
-        fs::write(&file, "FROM scratch\n").unwrap();
 
-        assert_eq!(containerfile_commit_hash(&file), None);
+        fs::write(&file, "FROM scratch\n").unwrap();
+        let a = containerfile_content_hash(&file).unwrap();
+        fs::write(&file, "FROM scratch\nRUN true\n").unwrap();
+        let b = containerfile_content_hash(&file).unwrap();
+
+        assert_ne!(a, b);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn containerfile_commit_hash_none_outside_repo() {
-        let dir = std::env::temp_dir().join(format!("pall8t-test-norepo-{}", std::process::id()));
+    fn containerfile_content_hash_none_when_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("pall8t-test-hash-missing-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
         let file = dir.join("Containerfile");
-        fs::write(&file, "FROM scratch\n").unwrap();
 
-        assert_eq!(containerfile_commit_hash(&file), None);
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(containerfile_content_hash(&file), None);
     }
 }

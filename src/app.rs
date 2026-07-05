@@ -915,7 +915,8 @@ fn handle_job(job: Job, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
             let _ = msgs.send(Msg::Done(format!("stopped {} (idle)", ctx.container)));
         }
         Job::Build(ctx) => {
-            let tag = build_image(&ctx, msgs, uid, gid)?;
+            let (tag, prune_base) = resolve_image(&ctx, uid, gid);
+            build_image(&ctx, &tag, prune_base.as_deref(), msgs, uid, gid)?;
             let _ = msgs.send(Msg::Done(format!("image built: {tag}")));
         }
         Job::Logs(name) => {
@@ -954,27 +955,46 @@ fn project_containerfile(ctx: &Ctx) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn resolve_image(ctx: &Ctx, uid: u32, gid: u32) -> String {
+/// Resolves the image tag for a project. When it's a hash-suffixed project
+/// tag (built from a `.pall8t/Containerfile`), also returns the bare
+/// `pall8t-<slug>` base that superseded builds share, so a successful
+/// build can prune them; `None` for the explicit-`image` and default-image
+/// cases, which are never pruned.
+fn resolve_image(ctx: &Ctx, uid: u32, gid: u32) -> (String, Option<String>) {
     if let Some(img) = &ctx.entry.image {
-        return img.clone();
+        return (img.clone(), None);
     }
     if let Some(cf) = project_containerfile(ctx) {
         // Project-specific tag so the shared pall8t-base is not overwritten.
         let base = format!("pall8t-{}", workspace::slug(&ctx.entry.name));
-        // Suffix with the Containerfile's last commit hash so a new commit
-        // resolves to a new tag, which `ensure_running` sees as stale and
-        // rebuilds. Falls back to the unsuffixed tag when the hash is
-        // unavailable (e.g. the Containerfile isn't tracked in a repo).
-        return match container::containerfile_commit_hash(&cf) {
-            Some(hash) => container::image_tag_hashed(&base, uid, gid, &hash),
-            None => container::image_tag(&base, uid, gid),
+        // Hash the Containerfile's working-tree contents (not its last
+        // commit), so uncommitted edits are detected too, and a rebuild can
+        // never poison a tag: the same content always resolves to the same
+        // tag, so tag and image content always correspond. Falls back to
+        // the unsuffixed tag when the file can't be read.
+        return match container::containerfile_content_hash(&cf) {
+            Some(hash) => (
+                container::image_tag_hashed(&base, uid, gid, &hash),
+                Some(base),
+            ),
+            None => (container::image_tag(&base, uid, gid), None),
         };
     }
-    container::image_tag(&ctx.image_base, uid, gid)
+    (container::image_tag(&ctx.image_base, uid, gid), None)
 }
 
-fn build_image(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<String> {
-    let tag = resolve_image(ctx, uid, gid);
+/// Builds `tag` (already resolved by the caller — see [`resolve_image`] —
+/// so build and run always agree on the tag even if the Containerfile
+/// changes in between). When `prune_base` is set, superseded builds under
+/// that base are deleted afterwards on a best-effort basis.
+fn build_image(
+    ctx: &Ctx,
+    tag: &str,
+    prune_base: Option<&str>,
+    msgs: &Sender<Msg>,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
     let containerfile = match project_containerfile(ctx) {
         Some(cf) => cf,
         None => container::default_containerfile_path()?,
@@ -986,8 +1006,34 @@ fn build_image(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<Stri
     let _ = msgs.send(Msg::Status(format!(
         "building {tag} (this can take a few minutes)…"
     )));
-    container::build_image(&containerfile, &ctx_dir, &tag, uid, gid)?;
-    Ok(tag)
+    container::build_image(&containerfile, &ctx_dir, tag, uid, gid)?;
+    if let Some(base) = prune_base {
+        prune_superseded_images(base, tag, msgs);
+    }
+    Ok(())
+}
+
+/// Deletes older builds sharing `base`'s tag prefix, keeping only
+/// `keep_tag`. Best-effort: a failure to list or delete images is reported
+/// as a warning but never aborts the build that just succeeded.
+fn prune_superseded_images(base: &str, keep_tag: &str, msgs: &Sender<Msg>) {
+    let prefix = format!("{base}:");
+    match container::image_tags_with_prefix(&prefix) {
+        Ok(tags) => {
+            for old in tags.into_iter().filter(|t| t != keep_tag) {
+                if let Err(e) = container::image_delete(&old) {
+                    let _ = msgs.send(Msg::Warning(format!(
+                        "could not prune superseded image {old}: {e:#}"
+                    )));
+                }
+            }
+        }
+        Err(e) => {
+            let _ = msgs.send(Msg::Warning(format!(
+                "could not list images to prune under {prefix}: {e:#}"
+            )));
+        }
+    }
 }
 
 fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
@@ -998,7 +1044,7 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
         .find(|(name, _)| *name == ctx.container)
         .map(|(_, s)| *s)
         .unwrap_or(State::Absent);
-    let tag = resolve_image(ctx, uid, gid);
+    let (tag, prune_base) = resolve_image(ctx, uid, gid);
 
     // The resolved image can change after a container was created (e.g. a
     // .pall8t/Containerfile appeared). Recreate stopped containers; only
@@ -1045,7 +1091,7 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
         }
         State::Absent => {
             if !container::image_exists(&tag) {
-                build_image(ctx, msgs, uid, gid)?;
+                build_image(ctx, &tag, prune_base.as_deref(), msgs, uid, gid)?;
             }
             let _ = msgs.send(Msg::Status(format!("creating {}…", ctx.container)));
             container::run_detached(&container::RunSpec {
