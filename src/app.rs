@@ -1016,13 +1016,15 @@ fn build_image(
 }
 
 /// Deletes older builds sharing `base`'s tag prefix that belong to this
-/// `uid`/`gid` (see [`container::image_owned_by`]), keeping only
-/// `keep_tag`. Scoped to `uid`/`gid` so a `pall8t-<slug>` base shared across
-/// host users doesn't delete a different user's images. Best-effort: a
-/// failure to list or delete images is reported as a warning but never
-/// aborts the build that just succeeded. Returns a short summary (e.g.
-/// "pruned 2 superseded", "pruned 1, failed to prune 1") for the caller to
-/// surface, or `None` if there was nothing to prune.
+/// `uid`/`gid` and are not `keep_tag` (see [`container::should_prune`]).
+/// Scoped to `uid`/`gid` so a `pall8t-<slug>` base shared across host users
+/// doesn't delete a different user's images. The keep-exclusion is
+/// qualification-aware (not a raw `!=`), since `image_tags_with_prefix` can
+/// return registry-qualified references for the same tag we just built.
+/// Best-effort: a failure to list or delete images is reported as a
+/// warning but never aborts the build that just succeeded. Returns a short
+/// summary (e.g. "pruned 2 superseded", "pruned 1, failed to prune 1") for
+/// the caller to surface, or `None` if there was nothing to prune.
 fn prune_superseded_images(
     base: &str,
     keep_tag: &str,
@@ -1036,7 +1038,7 @@ fn prune_superseded_images(
             let (mut pruned, mut failed) = (0u32, 0u32);
             for old in tags
                 .into_iter()
-                .filter(|t| t != keep_tag && container::image_owned_by(t, base, uid, gid))
+                .filter(|t| container::should_prune(t, keep_tag, base, uid, gid))
             {
                 match container::image_delete(&old) {
                     Ok(()) => pruned += 1,

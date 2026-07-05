@@ -160,6 +160,18 @@ pub(crate) fn image_owned_by(s: &str, base: &str, uid: u32, gid: u32) -> bool {
     ref_matches(s, &unsuffixed) || ref_has_prefix(s, &hash_prefix)
 }
 
+/// True if `s` is a superseded-build candidate that pruning should delete:
+/// it belongs to `base`/`uid`/`gid` (see [`image_owned_by`]) and it is not
+/// `keep_tag`. The keep-exclusion uses [`ref_matches`], not `!=`, because
+/// `s` can be registry-qualified (per [`image_owned_by`]/[`ref_matches`])
+/// while `keep_tag` — the tag just passed to `container build -t` — never
+/// is; a raw string inequality would then treat the qualified form of the
+/// image just built as "not `keep_tag`" and delete it out from under the
+/// caller.
+pub(crate) fn should_prune(s: &str, keep_tag: &str, base: &str, uid: u32, gid: u32) -> bool {
+    !ref_matches(s, keep_tag) && image_owned_by(s, base, uid, gid)
+}
+
 pub fn image_exists(tag: &str) -> bool {
     // Verbatim `base:tag` and registry-qualified `.../base:tag` references
     // are both accepted (see `ref_matches`); substring matching stays
@@ -400,6 +412,44 @@ mod tests {
         assert!(
             !image_owned_by("pall8t-x:501-20", base, 501, 2),
             "501-2 must not match a 501-20 image"
+        );
+    }
+
+    #[test]
+    fn should_prune_table() {
+        let base = "pall8t-x";
+        let keep_tag = "pall8t-x:501-20-newhash123456";
+        assert!(
+            !should_prune(keep_tag, keep_tag, base, 501, 20),
+            "verbatim keep_tag must not be pruned"
+        );
+        assert!(
+            !should_prune(&format!("localhost/{keep_tag}"), keep_tag, base, 501, 20),
+            "registry-qualified form of keep_tag must not be pruned"
+        );
+        assert!(
+            should_prune(
+                "pall8t-x:501-20-oldhash654321",
+                keep_tag,
+                base,
+                501,
+                20
+            ),
+            "a differently-hashed sibling must be pruned"
+        );
+        assert!(
+            should_prune(
+                "localhost/pall8t-x:501-20-oldhash654321",
+                keep_tag,
+                base,
+                501,
+                20
+            ),
+            "a registry-qualified differently-hashed sibling must be pruned"
+        );
+        assert!(
+            !should_prune("pall8t-x:501-2-oldhash654321", keep_tag, base, 501, 20),
+            "a different gid's image must not be pruned even if not keep_tag"
         );
     }
 
