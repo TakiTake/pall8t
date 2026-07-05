@@ -129,35 +129,69 @@ pub fn list_all() -> Result<Vec<(String, State)>> {
     Ok(items)
 }
 
+/// True if `s` (a reference string from `container image list`) refers to
+/// `tag`, either verbatim (`base:tag`) or registry/repo-qualified
+/// (`.../base:tag`). Deliberately not a substring match: with hash-suffixed
+/// tags, the unsuffixed form (e.g. `pall8t-x:501-20`) is a substring of a
+/// differently-hashed sibling (`pall8t-x:501-20-abc123456789`), so substring
+/// matching would report a tag as existing when only that sibling does.
+pub(crate) fn ref_matches(s: &str, tag: &str) -> bool {
+    s == tag || s.ends_with(&format!("/{tag}"))
+}
+
+/// True if `s` starts with `prefix`, either verbatim or after a
+/// registry/repo qualification (`.../prefix...`). Same acceptance rule as
+/// [`ref_matches`], for prefix rather than exact matching.
+pub(crate) fn ref_has_prefix(s: &str, prefix: &str) -> bool {
+    s.starts_with(prefix) || s.contains(&format!("/{prefix}"))
+}
+
+/// True if `s` is an image reference for `base` scoped to `uid`-`gid`:
+/// either the unsuffixed fallback tag (`base:uid-gid`) or a hash-suffixed
+/// variant (`base:uid-gid-<hash>`), matched verbatim or registry-qualified.
+/// Used to scope pruning so a `pall8t-<slug>` base shared across host users
+/// doesn't delete a different uid/gid's images. The trailing `-` on the
+/// hash-suffix prefix also disambiguates e.g. gid `2` from gid `20`:
+/// `base:uid-2-` is not a prefix of `base:uid-20-...`, since the character
+/// right after `2` differs (`-` vs `0`).
+pub(crate) fn image_owned_by(s: &str, base: &str, uid: u32, gid: u32) -> bool {
+    let unsuffixed = image_tag(base, uid, gid);
+    let hash_prefix = format!("{unsuffixed}-");
+    ref_matches(s, &unsuffixed) || ref_has_prefix(s, &hash_prefix)
+}
+
 pub fn image_exists(tag: &str) -> bool {
-    // Exact match, not `contains`: with hash-suffixed tags, the unsuffixed
-    // form (e.g. `pall8t-x:501-20`) is a substring of the suffixed one
-    // (`pall8t-x:501-20-abc123456789`), so a substring match would report
-    // a tag as existing when only a differently-hashed sibling does.
-    fn any_str_equals(v: &Value, needle: &str) -> bool {
+    // Verbatim `base:tag` and registry-qualified `.../base:tag` references
+    // are both accepted (see `ref_matches`); substring matching stays
+    // banned, since it would conflate an unsuffixed tag with a
+    // differently-hashed suffixed sibling.
+    fn any_ref_matches(v: &Value, needle: &str) -> bool {
         match v {
-            Value::String(s) => s == needle,
-            Value::Array(a) => a.iter().any(|x| any_str_equals(x, needle)),
-            Value::Object(m) => m.values().any(|x| any_str_equals(x, needle)),
+            Value::String(s) => ref_matches(s, needle),
+            Value::Array(a) => a.iter().any(|x| any_ref_matches(x, needle)),
+            Value::Object(m) => m.values().any(|x| any_ref_matches(x, needle)),
             _ => false,
         }
     }
     run_ok(["image", "list", "--format", "json"])
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
-        .map(|v| any_str_equals(&v, tag))
+        .map(|v| any_ref_matches(&v, tag))
         .unwrap_or(false)
 }
 
 /// Image reference strings from `container image list` that start with
-/// `prefix`, matched the same defensive way as [`image_exists`] (schema is
-/// pre-1.0, see ADR-0001). Used to find superseded project image builds to
-/// prune after a successful rebuild.
+/// `prefix`, verbatim or registry-qualified (see [`ref_has_prefix`]),
+/// matched the same defensive way as [`image_exists`] (schema is pre-1.0,
+/// see ADR-0001). Used to find superseded project image builds to prune
+/// after a successful rebuild. Returns the full reference string as listed
+/// (registry qualification included), since that's what must be passed to
+/// `image_delete`.
 pub fn image_tags_with_prefix(prefix: &str) -> Result<Vec<String>> {
     fn collect(v: &Value, prefix: &str, out: &mut Vec<String>) {
         match v {
             Value::String(s) => {
-                if s.starts_with(prefix) {
+                if ref_has_prefix(s, prefix) {
                     out.push(s.clone());
                 }
             }
@@ -315,6 +349,59 @@ pub fn default_containerfile_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn ref_matches_table() {
+        let tag = "pall8t-x:501-20";
+        assert!(ref_matches(tag, tag), "exact match");
+        assert!(
+            ref_matches("localhost/pall8t-x:501-20", tag),
+            "registry-qualified match"
+        );
+        assert!(
+            !ref_matches("pall8t-x:501-20-abc123456789", tag),
+            "hash-suffixed sibling must not match the unsuffixed tag"
+        );
+        assert!(
+            !ref_matches("pall8t-x:501-2", "pall8t-x:501-20"),
+            "501-2 must not match 501-20"
+        );
+    }
+
+    #[test]
+    fn ref_has_prefix_table() {
+        let prefix = "pall8t-x:501-20-";
+        assert!(ref_has_prefix("pall8t-x:501-20-abc123456789", prefix));
+        assert!(ref_has_prefix(
+            "localhost/pall8t-x:501-20-abc123456789",
+            prefix
+        ));
+        assert!(
+            !ref_has_prefix("pall8t-x:501-2-abc123456789", prefix),
+            "501-2- must not match the 501-20- prefix"
+        );
+    }
+
+    #[test]
+    fn image_owned_by_table() {
+        let base = "pall8t-x";
+        assert!(
+            image_owned_by("pall8t-x:501-20", base, 501, 20),
+            "unsuffixed exact match"
+        );
+        assert!(
+            image_owned_by("localhost/pall8t-x:501-20-abc123456789", base, 501, 20),
+            "registry-qualified hash-suffixed match"
+        );
+        assert!(
+            !image_owned_by("pall8t-x:501-20-abc123456789", base, 501, 2),
+            "hash-suffixed image for a different gid must not match"
+        );
+        assert!(
+            !image_owned_by("pall8t-x:501-20", base, 501, 2),
+            "501-2 must not match a 501-20 image"
+        );
+    }
 
     #[test]
     fn containerfile_content_hash_is_stable_and_12_chars() {

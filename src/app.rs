@@ -916,8 +916,9 @@ fn handle_job(job: Job, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
         }
         Job::Build(ctx) => {
             let (tag, prune_base) = resolve_image(&ctx, uid, gid);
-            build_image(&ctx, &tag, prune_base.as_deref(), msgs, uid, gid)?;
-            let _ = msgs.send(Msg::Done(format!("image built: {tag}")));
+            let pruned = build_image(&ctx, &tag, prune_base.as_deref(), msgs, uid, gid)?;
+            let suffix = pruned.map(|p| format!(" ({p})")).unwrap_or_default();
+            let _ = msgs.send(Msg::Done(format!("image built: {tag}{suffix}")));
         }
         Job::Logs(name) => {
             let text = container::logs(&name)?;
@@ -986,7 +987,11 @@ fn resolve_image(ctx: &Ctx, uid: u32, gid: u32) -> (String, Option<String>) {
 /// Builds `tag` (already resolved by the caller — see [`resolve_image`] —
 /// so build and run always agree on the tag even if the Containerfile
 /// changes in between). When `prune_base` is set, superseded builds under
-/// that base are deleted afterwards on a best-effort basis.
+/// that base are deleted afterwards on a best-effort basis. Returns a short
+/// summary of the prune outcome (if any pruning was attempted), for the
+/// caller to fold into a status message — callers that don't care (e.g. the
+/// `ensure_running` path, which moves on to "creating …" regardless) can
+/// simply ignore it.
 fn build_image(
     ctx: &Ctx,
     tag: &str,
@@ -994,7 +999,7 @@ fn build_image(
     msgs: &Sender<Msg>,
     uid: u32,
     gid: u32,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let containerfile = match project_containerfile(ctx) {
         Some(cf) => cf,
         None => container::default_containerfile_path()?,
@@ -1007,31 +1012,54 @@ fn build_image(
         "building {tag} (this can take a few minutes)…"
     )));
     container::build_image(&containerfile, &ctx_dir, tag, uid, gid)?;
-    if let Some(base) = prune_base {
-        prune_superseded_images(base, tag, msgs);
-    }
-    Ok(())
+    Ok(prune_base.and_then(|base| prune_superseded_images(base, tag, uid, gid, msgs)))
 }
 
-/// Deletes older builds sharing `base`'s tag prefix, keeping only
-/// `keep_tag`. Best-effort: a failure to list or delete images is reported
-/// as a warning but never aborts the build that just succeeded.
-fn prune_superseded_images(base: &str, keep_tag: &str, msgs: &Sender<Msg>) {
+/// Deletes older builds sharing `base`'s tag prefix that belong to this
+/// `uid`/`gid` (see [`container::image_owned_by`]), keeping only
+/// `keep_tag`. Scoped to `uid`/`gid` so a `pall8t-<slug>` base shared across
+/// host users doesn't delete a different user's images. Best-effort: a
+/// failure to list or delete images is reported as a warning but never
+/// aborts the build that just succeeded. Returns a short summary (e.g.
+/// "pruned 2 superseded", "pruned 1, failed to prune 1") for the caller to
+/// surface, or `None` if there was nothing to prune.
+fn prune_superseded_images(
+    base: &str,
+    keep_tag: &str,
+    uid: u32,
+    gid: u32,
+    msgs: &Sender<Msg>,
+) -> Option<String> {
     let prefix = format!("{base}:");
     match container::image_tags_with_prefix(&prefix) {
         Ok(tags) => {
-            for old in tags.into_iter().filter(|t| t != keep_tag) {
-                if let Err(e) = container::image_delete(&old) {
-                    let _ = msgs.send(Msg::Warning(format!(
-                        "could not prune superseded image {old}: {e:#}"
-                    )));
+            let (mut pruned, mut failed) = (0u32, 0u32);
+            for old in tags
+                .into_iter()
+                .filter(|t| t != keep_tag && container::image_owned_by(t, base, uid, gid))
+            {
+                match container::image_delete(&old) {
+                    Ok(()) => pruned += 1,
+                    Err(e) => {
+                        failed += 1;
+                        let _ = msgs.send(Msg::Warning(format!(
+                            "could not prune superseded image {old}: {e:#}"
+                        )));
+                    }
                 }
+            }
+            match (pruned, failed) {
+                (0, 0) => None,
+                (p, 0) => Some(format!("pruned {p} superseded")),
+                (0, f) => Some(format!("failed to prune {f}")),
+                (p, f) => Some(format!("pruned {p}, failed to prune {f}")),
             }
         }
         Err(e) => {
             let _ = msgs.send(Msg::Warning(format!(
                 "could not list images to prune under {prefix}: {e:#}"
             )));
+            None
         }
     }
 }
