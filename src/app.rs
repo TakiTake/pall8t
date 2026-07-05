@@ -5,7 +5,7 @@ use crate::mux::{self, Tab};
 use crate::proto;
 use crate::registry::{self, TabEntry};
 use crate::workspace;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 use std::io::Write;
 use std::path::PathBuf;
@@ -915,8 +915,15 @@ fn handle_job(job: Job, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<()> {
             let _ = msgs.send(Msg::Done(format!("stopped {} (idle)", ctx.container)));
         }
         Job::Build(ctx) => {
-            let (tag, prune_base) = resolve_image(&ctx, uid, gid);
-            let pruned = build_image(&ctx, &tag, prune_base.as_deref(), msgs, uid, gid)?;
+            // An explicit `image` is never built — see `resolve_image`.
+            if let Some(img) = &ctx.entry.image {
+                let _ = msgs.send(Msg::Done(format!(
+                    "project uses explicit image {img} — nothing to build"
+                )));
+                return Ok(());
+            }
+            let resolved = resolve_image(&ctx, uid, gid);
+            let (tag, pruned) = build_image(&ctx, &resolved, msgs, uid, gid)?;
             let suffix = pruned.map(|p| format!(" ({p})")).unwrap_or_default();
             let _ = msgs.send(Msg::Done(format!("image built: {tag}{suffix}")));
         }
@@ -956,14 +963,46 @@ fn project_containerfile(ctx: &Ctx) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Resolves the image tag for a project. When it's a hash-suffixed project
-/// tag (built from a `.pall8t/Containerfile`), also returns the bare
-/// `pall8t-<slug>` base that superseded builds share, so a successful
-/// build can prune them; `None` for the explicit-`image` and default-image
-/// cases, which are never pruned.
-fn resolve_image(ctx: &Ctx, uid: u32, gid: u32) -> (String, Option<String>) {
+/// What a project resolves to for building/running: the tag, plus (for a
+/// hash-suffixed project build) the exact Containerfile and content hash
+/// that produced it. Threading `containerfile`/`hash` through explicitly —
+/// rather than having [`build_image`] re-derive them via
+/// [`project_containerfile`]/[`container::containerfile_content_hash`] —
+/// closes a TOCTOU window: the file on disk could otherwise change between
+/// resolution and the build actually running, so the built image's content
+/// might not match what was hashed into its tag.
+struct ResolvedImage {
+    tag: String,
+    /// Bare `pall8t-<slug>` base whose superseded builds may be pruned
+    /// after a successful build; `None` for the explicit-`image` and
+    /// default-image cases, which are never pruned.
+    prune_base: Option<String>,
+    /// Containerfile to build against; `None` means the embedded default
+    /// (explicit-`image` and no-project-Containerfile cases).
+    containerfile: Option<PathBuf>,
+    /// Content hash embedded in `tag`. `Some` only when `containerfile` is
+    /// `Some` and its content was readable at resolve time; `None` (with
+    /// `containerfile` still `Some`) means the file exists but couldn't be
+    /// hashed (e.g. a transient read failure), and `tag` fell back to the
+    /// unsuffixed form.
+    hash: Option<String>,
+}
+
+/// Resolves the image for a project. Priority: explicit config `image`
+/// (never built — see `Job::Build` and `ensure_running`, which run it
+/// as-is and let the CLI pull or fail) > a project Containerfile
+/// (explicit `containerfile` config or auto-detected
+/// `<repo>/.pall8t/Containerfile`), tagged with a hash of its current
+/// content when readable, else an unsuffixed fallback tag > the embedded
+/// default Containerfile.
+fn resolve_image(ctx: &Ctx, uid: u32, gid: u32) -> ResolvedImage {
     if let Some(img) = &ctx.entry.image {
-        return (img.clone(), None);
+        return ResolvedImage {
+            tag: img.clone(),
+            prune_base: None,
+            containerfile: None,
+            hash: None,
+        };
     }
     if let Some(cf) = project_containerfile(ctx) {
         // Project-specific tag so the shared pall8t-base is not overwritten.
@@ -974,34 +1013,54 @@ fn resolve_image(ctx: &Ctx, uid: u32, gid: u32) -> (String, Option<String>) {
         // tag, so tag and image content always correspond. Falls back to
         // the unsuffixed tag when the file can't be read.
         return match container::containerfile_content_hash(&cf) {
-            Some(hash) => (
-                container::image_tag_hashed(&base, uid, gid, &hash),
-                Some(base),
-            ),
-            None => (container::image_tag(&base, uid, gid), None),
+            Some(hash) => ResolvedImage {
+                tag: container::image_tag_hashed(&base, uid, gid, &hash),
+                prune_base: Some(base),
+                containerfile: Some(cf),
+                hash: Some(hash),
+            },
+            None => ResolvedImage {
+                tag: container::image_tag(&base, uid, gid),
+                prune_base: None,
+                containerfile: Some(cf),
+                hash: None,
+            },
         };
     }
-    (container::image_tag(&ctx.image_base, uid, gid), None)
+    ResolvedImage {
+        tag: container::image_tag(&ctx.image_base, uid, gid),
+        prune_base: None,
+        containerfile: None,
+        hash: None,
+    }
 }
 
-/// Builds `tag` (already resolved by the caller — see [`resolve_image`] —
-/// so build and run always agree on the tag even if the Containerfile
-/// changes in between). When `prune_base` is set, superseded builds under
-/// that base are deleted afterwards on a best-effort basis. Returns a short
-/// summary of the prune outcome (if any pruning was attempted), for the
-/// caller to fold into a status message — callers that don't care (e.g. the
-/// `ensure_running` path, which moves on to "creating …" regardless) can
-/// simply ignore it.
-fn build_image(
+/// Outcome of one [`try_build`] attempt.
+enum BuildAttempt {
+    Done(Option<String>),
+    /// The Containerfile's content no longer matches what was hashed into
+    /// `resolved.tag` — the just-built image was deleted rather than kept
+    /// under a misleading tag. See [`build_image`] for the retry.
+    Poisoned,
+}
+
+/// Runs `container build` for `resolved.tag` against `resolved`'s exact
+/// Containerfile (the embedded default when `None`) — never re-derived,
+/// see [`ResolvedImage`]. For a hash-suffixed tag, re-hashes that same
+/// path afterwards to confirm nothing changed mid-build; a mismatch is
+/// reported as [`BuildAttempt::Poisoned`] after deleting the mistagged
+/// image. Otherwise, best-effort prunes superseded builds under
+/// `resolved.prune_base`, excluding whatever image `ctx`'s container
+/// currently runs (if any) — see [`prune_superseded_images`].
+fn try_build(
     ctx: &Ctx,
-    tag: &str,
-    prune_base: Option<&str>,
+    resolved: &ResolvedImage,
     msgs: &Sender<Msg>,
     uid: u32,
     gid: u32,
-) -> Result<Option<String>> {
-    let containerfile = match project_containerfile(ctx) {
-        Some(cf) => cf,
+) -> Result<BuildAttempt> {
+    let containerfile = match &resolved.containerfile {
+        Some(cf) => cf.clone(),
         None => container::default_containerfile_path()?,
     };
     let ctx_dir = containerfile
@@ -1009,37 +1068,89 @@ fn build_image(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     let _ = msgs.send(Msg::Status(format!(
-        "building {tag} (this can take a few minutes)…"
+        "building {} (this can take a few minutes)…",
+        resolved.tag
     )));
-    container::build_image(&containerfile, &ctx_dir, tag, uid, gid)?;
-    Ok(prune_base.and_then(|base| prune_superseded_images(base, tag, uid, gid, msgs)))
+    container::build_image(&containerfile, &ctx_dir, &resolved.tag, uid, gid)?;
+
+    if let Some(hash) = &resolved.hash {
+        match container::containerfile_content_hash(&containerfile) {
+            Some(fresh) if fresh != *hash => {
+                if let Err(e) = container::image_delete(&resolved.tag) {
+                    let _ = msgs.send(Msg::Warning(format!(
+                        "could not delete poisoned tag {}: {e:#}",
+                        resolved.tag
+                    )));
+                }
+                return Ok(BuildAttempt::Poisoned);
+            }
+            Some(_) => {}
+            None => {
+                let _ = msgs.send(Msg::Warning(format!(
+                    "could not re-read {} after building {} to confirm its tag — continuing",
+                    containerfile.display(),
+                    resolved.tag
+                )));
+            }
+        }
+    }
+
+    let in_use = container::image_ref(&ctx.container);
+    let pruned = resolved.prune_base.as_deref().and_then(|base| {
+        prune_superseded_images(base, &resolved.tag, uid, gid, in_use.as_deref(), msgs)
+    });
+    Ok(BuildAttempt::Done(pruned))
 }
 
-/// Deletes older builds sharing `base`'s tag prefix that belong to this
-/// `uid`/`gid` and are not `keep_tag` (see [`container::should_prune`]).
-/// Scoped to `uid`/`gid` so a `pall8t-<slug>` base shared across host users
-/// doesn't delete a different user's images. The keep-exclusion is
-/// qualification-aware (not a raw `!=`), since `image_tags_with_prefix` can
-/// return registry-qualified references for the same tag we just built.
-/// Best-effort: a failure to list or delete images is reported as a
-/// warning but never aborts the build that just succeeded. Returns a short
-/// summary (e.g. "pruned 2 superseded", "pruned 1, failed to prune 1") for
-/// the caller to surface, or `None` if there was nothing to prune.
+/// Builds the image for `resolved` (see [`resolve_image`]), retrying ONCE
+/// against freshly re-resolved content if the Containerfile changed
+/// during the first attempt (see [`try_build`]'s `Poisoned` case) — a
+/// bounded retry, so a Containerfile edited faster than it can be built
+/// fails loudly instead of looping forever. Returns the tag actually
+/// built (which can differ from `resolved.tag` after a retry) and the
+/// prune summary, if any.
+fn build_image(
+    ctx: &Ctx,
+    resolved: &ResolvedImage,
+    msgs: &Sender<Msg>,
+    uid: u32,
+    gid: u32,
+) -> Result<(String, Option<String>)> {
+    if let BuildAttempt::Done(pruned) = try_build(ctx, resolved, msgs, uid, gid)? {
+        return Ok((resolved.tag.clone(), pruned));
+    }
+    let retry = resolve_image(ctx, uid, gid);
+    match try_build(ctx, &retry, msgs, uid, gid)? {
+        BuildAttempt::Done(pruned) => Ok((retry.tag, pruned)),
+        BuildAttempt::Poisoned => Err(anyhow!(
+            "Containerfile for {} keeps changing during build — wait for it to settle and try again",
+            ctx.entry.name
+        )),
+    }
+}
+
+/// Deletes superseded builds under `base` for this `uid`/`gid`, keeping
+/// `keep_tag` and skipping `in_use` (the image `ctx`'s container currently
+/// runs, if any — deleting it out from under a live/stopped container
+/// would break it; a later build will prune it once the container is
+/// recreated against the new tag). See [`container::prunable_images`] for
+/// the matching/dedup rules. Best-effort: a failure to list or delete
+/// images is reported as a warning but never aborts the build that just
+/// succeeded. Returns a short summary (e.g. "pruned 2 superseded", "pruned
+/// 1, failed to prune 1") for the caller to surface, or `None` if there
+/// was nothing to prune.
 fn prune_superseded_images(
     base: &str,
     keep_tag: &str,
     uid: u32,
     gid: u32,
+    in_use: Option<&str>,
     msgs: &Sender<Msg>,
 ) -> Option<String> {
-    let prefix = format!("{base}:");
-    match container::image_tags_with_prefix(&prefix) {
+    match container::prunable_images(base, keep_tag, uid, gid, in_use) {
         Ok(tags) => {
             let (mut pruned, mut failed) = (0u32, 0u32);
-            for old in tags
-                .into_iter()
-                .filter(|t| container::should_prune(t, keep_tag, base, uid, gid))
-            {
+            for old in tags {
                 match container::image_delete(&old) {
                     Ok(()) => pruned += 1,
                     Err(e) => {
@@ -1059,7 +1170,7 @@ fn prune_superseded_images(
         }
         Err(e) => {
             let _ = msgs.send(Msg::Warning(format!(
-                "could not list images to prune under {prefix}: {e:#}"
+                "could not list images to prune under {base}: {e:#}"
             )));
             None
         }
@@ -1074,23 +1185,36 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
         .find(|(name, _)| *name == ctx.container)
         .map(|(_, s)| *s)
         .unwrap_or(State::Absent);
-    let (tag, prune_base) = resolve_image(ctx, uid, gid);
+    let resolved = resolve_image(ctx, uid, gid);
+
+    // A project Containerfile that exists but is transiently unreadable
+    // (e.g. an editor's atomic-save window) makes `resolved` fall back to
+    // an unsuffixed tag (see `resolve_image`). Treating that fallback as a
+    // real image change would recreate a perfectly good stopped container
+    // and kick off a rebuild for nothing, so skip the staleness check in
+    // that case and leave the container as-is. A Containerfile
+    // disappearing entirely (`containerfile.is_none()`) is a legitimate
+    // switch back to the default image and must still recreate.
+    let transient_read_failure = resolved.containerfile.is_some() && resolved.hash.is_none();
 
     // The resolved image can change after a container was created (e.g. a
     // .pall8t/Containerfile appeared). Recreate stopped containers; only
-    // warn for running ones (they may have live exec sessions).
-    if state != State::Absent {
+    // warn for running ones (they may have live exec sessions). The
+    // comparison is qualification/digest-aware (see `container::ref_matches`),
+    // since `current` (from `container inspect`) can be registry- or
+    // digest-qualified even when `resolved.tag` never is.
+    if state != State::Absent && !transient_read_failure {
         if let Some(current) = container::image_ref(&ctx.container) {
-            if current != tag {
+            if !container::ref_matches(&current, &resolved.tag) {
                 if state == State::Running {
                     let _ = msgs.send(Msg::Warning(format!(
-                        "{} runs outdated image {current} (want {tag}) — close its tabs, then reopen to recreate",
-                        ctx.container
+                        "{} runs outdated image {current} (want {}) — close its tabs, then reopen to recreate",
+                        ctx.container, resolved.tag
                     )));
                 } else {
                     let _ = msgs.send(Msg::Status(format!(
-                        "image changed ({current} → {tag}) — recreating {}…",
-                        ctx.container
+                        "image changed ({current} → {}) — recreating {}…",
+                        resolved.tag, ctx.container
                     )));
                     // A just-stopped container can still be shutting down
                     // ("stopping" reads as non-running); stop is a no-op if
@@ -1120,14 +1244,22 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
             container::start(&ctx.container)?;
         }
         State::Absent => {
-            if !container::image_exists(&tag) {
-                build_image(ctx, &tag, prune_base.as_deref(), msgs, uid, gid)?;
-            }
+            // An explicit `image` is never built (see `resolve_image`) —
+            // hand it straight to `run_detached`, which lets the CLI pull
+            // it or fail with a clear error, rather than silently building
+            // and running the wrong (pall8t Containerfile) image under
+            // the user's chosen reference.
+            let run_tag = if ctx.entry.image.is_some() || container::image_exists(&resolved.tag) {
+                resolved.tag.clone()
+            } else {
+                let (tag, _pruned) = build_image(ctx, &resolved, msgs, uid, gid)?;
+                tag
+            };
             let _ = msgs.send(Msg::Status(format!("creating {}…", ctx.container)));
             container::run_detached(&container::RunSpec {
                 name: ctx.container.clone(),
                 workspace: ctx.workspace.clone(),
-                image: tag,
+                image: run_tag,
                 cpus: ctx.cpus,
                 memory: ctx.memory.clone(),
                 uid,

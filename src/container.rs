@@ -129,31 +129,50 @@ pub fn list_all() -> Result<Vec<(String, State)>> {
     Ok(items)
 }
 
-/// True if `s` (a reference string from `container image list`) refers to
-/// `tag`, either verbatim (`base:tag`) or registry/repo-qualified
-/// (`.../base:tag`). Deliberately not a substring match: with hash-suffixed
-/// tags, the unsuffixed form (e.g. `pall8t-x:501-20`) is a substring of a
-/// differently-hashed sibling (`pall8t-x:501-20-abc123456789`), so substring
-/// matching would report a tag as existing when only that sibling does.
-pub(crate) fn ref_matches(s: &str, tag: &str) -> bool {
-    s == tag || s.ends_with(&format!("/{tag}"))
+/// Normalizes an image reference string as it can appear from `container
+/// image list`/`inspect` down to bare `base:tag` form, so references can
+/// be compared regardless of registry/repo qualification
+/// (`registry:5000/ns/base:tag`) or a `@sha256:...` digest suffix
+/// (`base:tag@sha256:...`). There is a single normalization point so
+/// qualification/digest handling can't drift between call sites (previously
+/// `ref_matches` and `ref_has_prefix` disagreed on digests, which let a
+/// freshly built, digest-qualified image be classified as prunable and
+/// self-delete). Strips the digest first — it's always the last
+/// `@`-delimited component — then strips everything up to and including
+/// the last `/`: registry/namespace qualification never itself contains a
+/// `:tag`, so the last `/` is always the boundary between qualification
+/// and `name:tag` (a `registry:port/...` prefix's colon doesn't interfere,
+/// since it's before that last `/`).
+fn normalize_ref(s: &str) -> &str {
+    let without_digest = s.split('@').next().unwrap_or(s);
+    without_digest.rsplit('/').next().unwrap_or(without_digest)
 }
 
-/// True if `s` starts with `prefix`, either verbatim or after a
-/// registry/repo qualification (`.../prefix...`). Same acceptance rule as
-/// [`ref_matches`], for prefix rather than exact matching.
+/// True if `s` (a reference string from `container image list`/`inspect`)
+/// refers to `tag` once normalized (see [`normalize_ref`]). Deliberately
+/// not a substring match: with hash-suffixed tags, the unsuffixed form
+/// (e.g. `pall8t-x:501-20`) is a substring of a differently-hashed sibling
+/// (`pall8t-x:501-20-abc123456789`), so substring matching would report a
+/// tag as existing when only that sibling does.
+pub(crate) fn ref_matches(s: &str, tag: &str) -> bool {
+    normalize_ref(s) == tag
+}
+
+/// True if `s` starts with `prefix` once normalized (see [`normalize_ref`]).
+/// Same acceptance rule as [`ref_matches`], for prefix rather than exact
+/// matching.
 pub(crate) fn ref_has_prefix(s: &str, prefix: &str) -> bool {
-    s.starts_with(prefix) || s.contains(&format!("/{prefix}"))
+    normalize_ref(s).starts_with(prefix)
 }
 
 /// True if `s` is an image reference for `base` scoped to `uid`-`gid`:
 /// either the unsuffixed fallback tag (`base:uid-gid`) or a hash-suffixed
-/// variant (`base:uid-gid-<hash>`), matched verbatim or registry-qualified.
-/// Used to scope pruning so a `pall8t-<slug>` base shared across host users
-/// doesn't delete a different uid/gid's images. The trailing `-` on the
-/// hash-suffix prefix also disambiguates e.g. gid `2` from gid `20`:
-/// `base:uid-2-` is not a prefix of `base:uid-20-...`, since the character
-/// right after `2` differs (`-` vs `0`).
+/// variant (`base:uid-gid-<hash>`), matched per [`ref_matches`]/
+/// [`ref_has_prefix`]. Used to scope pruning so a `pall8t-<slug>` base
+/// shared across host users doesn't delete a different uid/gid's images.
+/// The trailing `-` on the hash-suffix prefix also disambiguates e.g. gid
+/// `2` from gid `20`: `base:uid-2-` is not a prefix of `base:uid-20-...`,
+/// since the character right after `2` differs (`-` vs `0`).
 pub(crate) fn image_owned_by(s: &str, base: &str, uid: u32, gid: u32) -> bool {
     let unsuffixed = image_tag(base, uid, gid);
     let hash_prefix = format!("{unsuffixed}-");
@@ -163,55 +182,88 @@ pub(crate) fn image_owned_by(s: &str, base: &str, uid: u32, gid: u32) -> bool {
 /// True if `s` is a superseded-build candidate that pruning should delete:
 /// it belongs to `base`/`uid`/`gid` (see [`image_owned_by`]) and it is not
 /// `keep_tag`. The keep-exclusion uses [`ref_matches`], not `!=`, because
-/// `s` can be registry-qualified (per [`image_owned_by`]/[`ref_matches`])
-/// while `keep_tag` — the tag just passed to `container build -t` — never
-/// is; a raw string inequality would then treat the qualified form of the
-/// image just built as "not `keep_tag`" and delete it out from under the
-/// caller.
+/// `s` can be registry/digest-qualified (per [`image_owned_by`]) while
+/// `keep_tag` — the tag just passed to `container build -t` — never is; a
+/// raw string inequality would then treat the qualified form of the image
+/// just built as "not `keep_tag`" and delete it out from under the caller.
 pub(crate) fn should_prune(s: &str, keep_tag: &str, base: &str, uid: u32, gid: u32) -> bool {
     !ref_matches(s, keep_tag) && image_owned_by(s, base, uid, gid)
 }
 
-pub fn image_exists(tag: &str) -> bool {
-    // Verbatim `base:tag` and registry-qualified `.../base:tag` references
-    // are both accepted (see `ref_matches`); substring matching stays
-    // banned, since it would conflate an unsuffixed tag with a
-    // differently-hashed suffixed sibling.
-    fn any_ref_matches(v: &Value, needle: &str) -> bool {
-        match v {
-            Value::String(s) => ref_matches(s, needle),
-            Value::Array(a) => a.iter().any(|x| any_ref_matches(x, needle)),
-            Value::Object(m) => m.values().any(|x| any_ref_matches(x, needle)),
-            _ => false,
-        }
+/// Walks a `container image list`/`inspect` JSON value (schema is pre-1.0,
+/// see ADR-0001, hence the defensive walk rather than a fixed pointer path)
+/// and calls `f` with every string found. Shared by every function that
+/// scans image references, so there's one place that knows how the JSON is
+/// shaped.
+fn for_each_string(v: &Value, f: &mut impl FnMut(&str)) {
+    match v {
+        Value::String(s) => f(s),
+        Value::Array(a) => a.iter().for_each(|x| for_each_string(x, f)),
+        Value::Object(m) => m.values().for_each(|x| for_each_string(x, f)),
+        _ => {}
     }
-    run_ok(["image", "list", "--format", "json"])
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
-        .map(|v| any_ref_matches(&v, tag))
-        .unwrap_or(false)
 }
 
-/// Image reference strings from `container image list` that start with
-/// `prefix`, verbatim or registry-qualified (see [`ref_has_prefix`]),
-/// matched the same defensive way as [`image_exists`] (schema is pre-1.0,
-/// see ADR-0001). Used to find superseded project image builds to prune
-/// after a successful rebuild. Returns the full reference string as listed
-/// (registry qualification included), since that's what must be passed to
-/// `image_delete`.
-pub fn image_tags_with_prefix(prefix: &str) -> Result<Vec<String>> {
-    fn collect(v: &Value, prefix: &str, out: &mut Vec<String>) {
-        match v {
-            Value::String(s) => {
-                if ref_has_prefix(s, prefix) {
-                    out.push(s.clone());
-                }
+pub fn image_exists(tag: &str) -> bool {
+    let Some(v) = run_ok(["image", "list", "--format", "json"])
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
+    else {
+        return false;
+    };
+    let mut found = false;
+    for_each_string(&v, &mut |s| found = found || ref_matches(s, tag));
+    found
+}
+
+/// Pure filter+dedup core of [`prunable_images`], factored out for
+/// testability. From a flat list of reference strings, returns the ones
+/// that pruning should delete: owned by `base`/`uid`/`gid`, not `keep_tag`
+/// (the tag just built), and not `in_use` (typically the image `ctx`'s
+/// container currently runs, if any — deleting it out from under a
+/// live/stopped container would break it) — see [`should_prune`]. All
+/// comparisons are qualification/digest-aware (see [`normalize_ref`]).
+/// Deduped by normalized form: the CLI can expose the same image under
+/// multiple qualified spellings (e.g. `x:t` and `localhost/x:t`), and
+/// calling `image_delete` on the same image twice under different
+/// spellings would report a spurious failure on the second attempt.
+fn filter_prunable<'a>(
+    refs: impl Iterator<Item = &'a str>,
+    base: &str,
+    keep_tag: &str,
+    uid: u32,
+    gid: u32,
+    in_use: Option<&str>,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for s in refs {
+        if !should_prune(s, keep_tag, base, uid, gid) {
+            continue;
+        }
+        if let Some(in_use) = in_use {
+            if normalize_ref(s) == normalize_ref(in_use) {
+                continue;
             }
-            Value::Array(a) => a.iter().for_each(|x| collect(x, prefix, out)),
-            Value::Object(m) => m.values().for_each(|x| collect(x, prefix, out)),
-            _ => {}
+        }
+        if seen.insert(normalize_ref(s).to_string()) {
+            out.push(s.to_string());
         }
     }
+    out.sort();
+    out
+}
+
+/// Reference strings from `container image list` that pruning after a
+/// successful build should delete. See [`filter_prunable`] for the
+/// matching/dedup rules.
+pub fn prunable_images(
+    base: &str,
+    keep_tag: &str,
+    uid: u32,
+    gid: u32,
+    in_use: Option<&str>,
+) -> Result<Vec<String>> {
     let stdout = run_ok(["image", "list", "--format", "json"])?;
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -219,11 +271,16 @@ pub fn image_tags_with_prefix(prefix: &str) -> Result<Vec<String>> {
     }
     let v: Value =
         serde_json::from_str(trimmed).context("unexpected `container image list` JSON")?;
-    let mut out = Vec::new();
-    collect(&v, prefix, &mut out);
-    out.sort();
-    out.dedup();
-    Ok(out)
+    let mut refs = Vec::new();
+    for_each_string(&v, &mut |s| refs.push(s.to_string()));
+    Ok(filter_prunable(
+        refs.iter().map(String::as_str),
+        base,
+        keep_tag,
+        uid,
+        gid,
+        in_use,
+    ))
 }
 
 /// Delete an image by tag/reference.
@@ -363,12 +420,41 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn normalize_ref_table() {
+        assert_eq!(normalize_ref("pall8t-x:501-20"), "pall8t-x:501-20");
+        assert_eq!(
+            normalize_ref("localhost/pall8t-x:501-20"),
+            "pall8t-x:501-20"
+        );
+        assert_eq!(
+            normalize_ref("registry:5000/ns/pall8t-x:501-20"),
+            "pall8t-x:501-20"
+        );
+        assert_eq!(
+            normalize_ref("pall8t-x:501-20@sha256:deadbeef"),
+            "pall8t-x:501-20"
+        );
+        assert_eq!(
+            normalize_ref("localhost/pall8t-x:501-20@sha256:deadbeef"),
+            "pall8t-x:501-20"
+        );
+    }
+
+    #[test]
     fn ref_matches_table() {
         let tag = "pall8t-x:501-20";
         assert!(ref_matches(tag, tag), "exact match");
         assert!(
             ref_matches("localhost/pall8t-x:501-20", tag),
             "registry-qualified match"
+        );
+        assert!(
+            ref_matches("pall8t-x:501-20@sha256:deadbeef", tag),
+            "digest-qualified match"
+        );
+        assert!(
+            ref_matches("localhost/pall8t-x:501-20@sha256:deadbeef", tag),
+            "registry- and digest-qualified match"
         );
         assert!(
             !ref_matches("pall8t-x:501-20-abc123456789", tag),
@@ -386,6 +472,10 @@ mod tests {
         assert!(ref_has_prefix("pall8t-x:501-20-abc123456789", prefix));
         assert!(ref_has_prefix(
             "localhost/pall8t-x:501-20-abc123456789",
+            prefix
+        ));
+        assert!(ref_has_prefix(
+            "pall8t-x:501-20-abc123456789@sha256:deadbeef",
             prefix
         ));
         assert!(
@@ -450,6 +540,53 @@ mod tests {
         assert!(
             !should_prune("pall8t-x:501-2-oldhash654321", keep_tag, base, 501, 20),
             "a different gid's image must not be pruned even if not keep_tag"
+        );
+        assert!(
+            !should_prune(
+                &format!("{keep_tag}@sha256:deadbeef"),
+                keep_tag,
+                base,
+                501,
+                20
+            ),
+            "digest-qualified form of keep_tag must not be pruned"
+        );
+        assert!(
+            should_prune(
+                "pall8t-x:501-20-oldhash654321@sha256:deadbeef",
+                keep_tag,
+                base,
+                501,
+                20
+            ),
+            "a digest-qualified differently-hashed sibling must be pruned"
+        );
+    }
+
+    #[test]
+    fn filter_prunable_table() {
+        let base = "pall8t-x";
+        let keep_tag = "pall8t-x:501-20-newhash123456";
+        let old = "pall8t-x:501-20-oldhash654321";
+        let refs = [
+            keep_tag,
+            &format!("localhost/{keep_tag}"), // keep_tag under another spelling
+            old,
+            &format!("localhost/{old}"), // same superseded image, listed twice
+            "pall8t-x:501-2-oldhash654321", // different gid — not ours to prune
+        ];
+
+        let pruned = filter_prunable(refs.iter().copied(), base, keep_tag, 501, 20, None);
+        assert_eq!(
+            pruned,
+            vec![old.to_string()],
+            "keeps keep_tag and the other gid's image, dedupes the qualified duplicate"
+        );
+
+        let none_in_use = filter_prunable(refs.iter().copied(), base, keep_tag, 501, 20, Some(old));
+        assert!(
+            none_in_use.is_empty(),
+            "an in_use image must not be pruned even if it's a superseded sibling"
         );
     }
 
