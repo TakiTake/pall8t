@@ -45,7 +45,7 @@ Press the prefix (`ctrl+b` by default), release, then:
 | `?` | Help |
 | `q` | Detach: quit the TUI, agents and containers keep running; relaunch `pall8t` to reattach |
 
-All other keys go straight to the active tab's terminal.
+All other keys go straight to the active tab's terminal. The mouse wheel scrolls the active tab's history (any key returns to live; apps that use the mouse themselves, like vim, get the wheel forwarded instead). Set `mouse = false` in config to keep terminal-native text selection.
 
 ## Config
 

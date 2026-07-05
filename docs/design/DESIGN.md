@@ -131,7 +131,7 @@ pall8t (TUI/attacher, iterates freely)
 - **Tab lifecycle:** `x` kills the holder (and its child). Child exit → `Done` (tab visible until closed). Closing a project's last tab stops its container **only if the registry shows zero live tabs for that project across all instances**; same lock guards recreate-on-image-change.
 - **Failure isolation:** a TUI crash detaches (agents unaffected). A holder crash kills only its own tab. Stale registry entries (dead pid / connrefused socket) are pruned on TUI startup under the lock.
 - **Config consistency:** the TUI re-reads `config.toml`/registry on mtime change, so a project added in one instance appears in the others.
-- **Scrollback:** vt100's built-in scrollback, view-only (prefix `[` planned). No copy-mode yet.
+- **Scrollback:** mouse wheel scrolls the active tab's history (vt100 scrollback, 2000 rows, view-only). Any key snaps back to live; the header shows an indicator while scrolled. If the app inside enabled mouse reporting (vim etc.), wheel events are forwarded to it (SGR encoding) instead. Mouse capture is on by default (`mouse = false` to disable — note it takes over terminal-native text selection, the usual mux trade-off). Detection (§6) always reads the live screen, never the scrolled view. No copy-mode yet.
 
 ## 6. Agent status detection
 
@@ -183,6 +183,7 @@ cpus = 4
 memory = "4G"
 prefix = "ctrl+b"
 notify = "bell"                  # off | bell | banner (macOS notification)
+mouse = true                     # wheel = scrollback (false: leave mouse to the terminal)
 agent_command = "claude"         # what `prefix a` runs
 workspace_root = "~/.pall8t/workspaces"
 

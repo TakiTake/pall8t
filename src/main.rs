@@ -1,7 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -27,19 +30,31 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    let mouse = app.config.mouse;
+    if mouse {
+        execute!(io::stdout(), EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
         original_hook(info);
     }));
 
     let result = run(&mut terminal, &mut app);
 
     disable_raw_mode()?;
+    if mouse {
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -75,6 +90,7 @@ fn handle_event(app: &mut app::App, ev: Event) {
             app.on_key(key.code, key.modifiers);
         }
         Event::Paste(text) => app.on_paste(&text),
+        Event::Mouse(me) => app.on_mouse(me),
         _ => {}
     }
 }
