@@ -27,7 +27,10 @@ pub struct Tab {
     eof: Arc<AtomicBool>,
     exited_marker: PathBuf,
     size: (u16, u16),
+    scroll_offset: usize,
 }
+
+const MAX_SCROLLBACK: usize = 2000;
 
 /// Spawn a detached pall8t-tab holder (new process group, no stdio, no
 /// controlling terminal dependency); returns its pid.
@@ -127,6 +130,7 @@ pub fn attach(
         eof,
         exited_marker: proto::exited_marker(socket),
         size: (0, 0),
+        scroll_offset: 0,
     };
     // Nudge: full-screen apps repaint on resize, restoring the screen after
     // a replay-based reattach.
@@ -153,9 +157,49 @@ fn connect_retry(socket: &Path) -> Result<UnixStream> {
 }
 
 impl Tab {
+    /// User input: snap back to the live view, then forward to the holder.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
+        self.scroll_to_live();
         let mut w = &self.stream;
         let _ = proto::write_input(&mut w, bytes);
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    /// Scroll the view by `delta` rows (positive = further into history).
+    pub fn scroll(&mut self, delta: i32) {
+        let new = if delta >= 0 {
+            self.scroll_offset.saturating_add(delta as usize)
+        } else {
+            self.scroll_offset.saturating_sub(delta.unsigned_abs() as usize)
+        }
+        .min(MAX_SCROLLBACK);
+        if new != self.scroll_offset {
+            self.scroll_offset = new;
+            if let Ok(mut p) = self.parser.lock() {
+                p.set_scrollback(new);
+            }
+        }
+    }
+
+    pub fn scroll_to_live(&mut self) {
+        if self.scroll_offset != 0 {
+            self.scroll_offset = 0;
+            if let Ok(mut p) = self.parser.lock() {
+                p.set_scrollback(0);
+            }
+        }
+    }
+
+    /// True if the app inside enabled mouse reporting (vim etc.) — wheel
+    /// events should then be forwarded instead of scrolling our history.
+    pub fn wants_mouse(&self) -> bool {
+        self.parser
+            .lock()
+            .map(|p| p.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+            .unwrap_or(false)
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -187,10 +231,20 @@ impl Tab {
             .unwrap_or_default()
     }
 
-    /// Last `n` non-empty rows of the screen, joined by newlines.
+    /// Last `n` non-empty rows of the LIVE screen (detection must not read
+    /// the scrolled-back view), joined by newlines.
     pub fn bottom_text(&self, n: usize) -> String {
         let contents = match self.parser.lock() {
-            Ok(p) => p.screen().contents(),
+            Ok(mut p) => {
+                if self.scroll_offset != 0 {
+                    p.set_scrollback(0);
+                }
+                let c = p.screen().contents();
+                if self.scroll_offset != 0 {
+                    p.set_scrollback(self.scroll_offset);
+                }
+                c
+            }
             Err(_) => return String::new(),
         };
         let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();

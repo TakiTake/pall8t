@@ -17,6 +17,8 @@ pub struct Config {
     pub prefix: String,
     #[serde(default = "default_notify")]
     pub notify: String,
+    #[serde(default = "default_mouse")]
+    pub mouse: bool,
     #[serde(default = "default_agent_command")]
     pub agent_command: String,
     #[serde(default)]
@@ -34,6 +36,7 @@ impl Default for Config {
             workspace_root: default_workspace_root(),
             prefix: default_prefix(),
             notify: default_notify(),
+            mouse: default_mouse(),
             agent_command: default_agent_command(),
             projects: Vec::new(),
             agents: HashMap::new(),
@@ -58,6 +61,9 @@ fn default_prefix() -> String {
 }
 fn default_notify() -> String {
     "bell".to_string()
+}
+fn default_mouse() -> bool {
+    true
 }
 fn default_agent_command() -> String {
     "claude".to_string()

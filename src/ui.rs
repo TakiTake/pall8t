@@ -36,7 +36,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         (None, outer[1])
     };
 
-    app.set_term_size(term_area.height, term_area.width);
+    app.set_term_area(
+        term_area.x,
+        term_area.y,
+        term_area.height,
+        term_area.width,
+    );
 
     draw_header(f, app, outer[0]);
     if let Some(area) = sidebar_area {
@@ -77,14 +82,21 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 .get(tab.project)
                 .map(|r| r.container.clone())
                 .unwrap_or_default();
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!(" {project} / {} ", tab.title),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(tab.state.label(), Style::default().fg(state_color(tab.state))),
                 Span::styled(format!("  ({container})"), Style::default().fg(DIM)),
-            ])
+            ];
+            if tab.scroll_offset() > 0 {
+                spans.push(Span::styled(
+                    format!("  ⇡ history −{} rows (scroll down / any key → live)", tab.scroll_offset()),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            Line::from(spans)
         }
         None => Line::from(Span::styled(
             " pall8t — no tabs yet",
@@ -158,7 +170,7 @@ fn draw_terminal(f: &mut Frame, app: &App, area: Rect) {
                     (screen.cursor_position(), screen.hide_cursor())
                 })
             };
-            if matches!(app.mode, Mode::Normal) {
+            if matches!(app.mode, Mode::Normal) && tab.scroll_offset() == 0 {
                 if let Some(((row, col), hidden)) = cursor {
                     if !hidden && row < area.height && col < area.width {
                         f.set_cursor_position(Position::new(area.x + col, area.y + row));

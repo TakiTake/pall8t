@@ -6,7 +6,7 @@ use crate::proto;
 use crate::registry::{self, TabEntry};
 use crate::workspace;
 use anyhow::{Context, Result};
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -81,6 +81,7 @@ pub struct App {
     pub should_quit: bool,
     term_rows: u16,
     term_cols: u16,
+    term_origin: (u16, u16),
     auto_agent_tab: Option<usize>,
     config_mtime: Option<SystemTime>,
     jobs: Sender<Job>,
@@ -169,6 +170,7 @@ impl App {
             should_quit: false,
             term_rows: 24,
             term_cols: 80,
+            term_origin: (0, 0),
             auto_agent_tab,
             config_mtime: config::mtime(),
             jobs: job_tx,
@@ -258,8 +260,10 @@ impl App {
         })
     }
 
-    /// Inner terminal-widget size, pushed down to every holder.
-    pub fn set_term_size(&mut self, rows: u16, cols: u16) {
+    /// Inner terminal-widget geometry: size is pushed down to every holder,
+    /// the origin is kept for mouse hit-testing.
+    pub fn set_term_area(&mut self, x: u16, y: u16, rows: u16, cols: u16) {
+        self.term_origin = (x, y);
         if (rows, cols) == (self.term_rows, self.term_cols) {
             return;
         }
@@ -267,6 +271,40 @@ impl App {
         self.term_cols = cols;
         for tab in &mut self.tabs {
             tab.resize(rows, cols);
+        }
+    }
+
+    /// Mouse wheel in the terminal area: scroll our history, unless the app
+    /// inside enabled mouse reporting — then forward the wheel (SGR).
+    pub fn on_mouse(&mut self, ev: MouseEvent) {
+        if !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        let up = match ev.kind {
+            MouseEventKind::ScrollUp => true,
+            MouseEventKind::ScrollDown => false,
+            _ => return,
+        };
+        let (ox, oy) = self.term_origin;
+        let inside = ev.column >= ox
+            && ev.column < ox.saturating_add(self.term_cols)
+            && ev.row >= oy
+            && ev.row < oy.saturating_add(self.term_rows);
+        if !inside {
+            return;
+        }
+        let Some(i) = self.active_tab else { return };
+        let tab = &mut self.tabs[i];
+        if tab.wants_mouse() {
+            let col = ev.column - ox + 1;
+            let row = ev.row - oy + 1;
+            let button = if up { 64 } else { 65 };
+            let seq = format!("\x1b[<{button};{col};{row}M");
+            tab.write_bytes(seq.as_bytes());
+        } else if up {
+            tab.scroll(3);
+        } else {
+            tab.scroll(-3);
         }
     }
 
