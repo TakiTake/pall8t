@@ -138,6 +138,14 @@ pub fn list_all() -> Result<Vec<(String, State)>> {
     Ok(items)
 }
 
+/// Strips the digest suffix from a reference: a reference contains at most
+/// one `@` (introducing the digest), so everything from the first `@`
+/// onward is the digest, and stripping it is a no-op for a reference that
+/// has none.
+fn strip_digest(s: &str) -> &str {
+    s.split('@').next().unwrap_or(s)
+}
+
 /// Normalizes an image reference string as it can appear from `container
 /// image list`/`inspect` down to bare `base:tag` form, so references can
 /// be compared regardless of registry/repo qualification
@@ -146,33 +154,55 @@ pub fn list_all() -> Result<Vec<(String, State)>> {
 /// qualification/digest handling can't drift between call sites (previously
 /// `ref_matches` and `ref_has_prefix` disagreed on digests, which let a
 /// freshly built, digest-qualified image be classified as prunable and
-/// self-delete). Strips the digest first — a reference contains at most
-/// one `@` (introducing the digest), so everything from the first `@`
-/// onward is the digest and gets stripped — then strips everything up to
-/// and including the last `/`: registry/namespace qualification never
-/// itself contains a `:tag`, so the last `/` is always the boundary
-/// between qualification and `name:tag` (a `registry:port/...` prefix's
-/// colon doesn't interfere, since it's before that last `/`).
+/// self-delete). Strips the digest first (see [`strip_digest`]), then
+/// strips everything up to and including the last `/`: registry/namespace
+/// qualification never itself contains a `:tag`, so the last `/` is always
+/// the boundary between qualification and `name:tag` (a `registry:port/...`
+/// prefix's colon doesn't interfere, since it's before that last `/`).
+/// Used by [`ref_has_prefix`] and the dedup/in-use matching that only ever
+/// deals with references this crate itself builds — never with a
+/// caller-supplied, possibly cross-registry `tag` (see [`ref_matches`],
+/// which needs a subtler comparison for that case).
 fn normalize_ref(s: &str) -> &str {
-    let without_digest = s.split('@').next().unwrap_or(s);
+    let without_digest = strip_digest(s);
     without_digest.rsplit('/').next().unwrap_or(without_digest)
 }
 
 /// True if `s` (a reference string from `container image list`/`inspect`)
-/// refers to `tag` once BOTH sides are normalized (see [`normalize_ref`]).
-/// `tag` is normalized too because it isn't always bare: an explicit
-/// `image = "ghcr.io/org/tool:1"` config carries its qualification straight
-/// into `resolved.tag` (see `resolve_image`/`ensure_running`), and without
-/// normalizing `tag` that would never match `s`'s normalized form —
-/// permanently misreading the container as stale and recreating it on
-/// every check. For the tags this crate builds (unsuffixed, hash-suffixed),
-/// `tag` is already bare, so normalizing it is a no-op. Deliberately not a
-/// substring match: with hash-suffixed tags, the unsuffixed form (e.g.
-/// `pall8t-x:501-20`) is a substring of a differently-hashed sibling
-/// (`pall8t-x:501-20-abc123456789`), so substring matching would report a
-/// tag as existing when only that sibling does.
+/// refers to `tag`. Both are digest-stripped (see [`strip_digest`]) and
+/// then compared for equality OR a `/`-bounded suffix match in either
+/// direction — NOT via [`normalize_ref`], which would strip qualification
+/// down to bare `name:tag` on both sides and so treat any two images
+/// sharing a bare name as the same image regardless of registry (e.g.
+/// `ghcr.io/org/tool:1` and `docker.io/other/tool:1` would wrongly match).
+/// The suffix check instead only accepts one side being an unqualified
+/// tail of the other at a `/` boundary — e.g. a bare `postgres:16` matches
+/// `docker.io/library/postgres:16`, since that's how `container inspect`
+/// can report a reference that was configured or built bare — while still
+/// rejecting a differently-registried qualification. `tag` needs this
+/// treatment (not just `s`) because it isn't always bare: an explicit
+/// `image = "ghcr.io/org/tool:1"` config carries its qualification
+/// straight into `resolved.tag` (see `resolve_image`/`ensure_running`).
+/// The boundary requirement also keeps hash-suffixed tags safe: with
+/// `pall8t-x:501-20` vs. a differently-hashed sibling
+/// `pall8t-x:501-20-abc123456789`, the shorter is a plain substring but
+/// not a `/`-bounded suffix of the longer, so they correctly don't match
+/// (equally, `xpostgres:16` doesn't match `postgres:16`: `x` precedes the
+/// shared suffix, not `/`).
 pub(crate) fn ref_matches(s: &str, tag: &str) -> bool {
-    normalize_ref(s) == normalize_ref(tag)
+    let a = strip_digest(s);
+    let b = strip_digest(tag);
+    a == b || is_slash_suffix(a, b) || is_slash_suffix(b, a)
+}
+
+/// True if `longer` ends with `shorter` immediately preceded by a `/`,
+/// i.e. `shorter` is `longer`'s unqualified `name:tag` suffix. The `/`
+/// boundary check is what stops a plain-substring false positive like
+/// `xpostgres:16` "ending with" `postgres:16`.
+fn is_slash_suffix(longer: &str, shorter: &str) -> bool {
+    longer.len() > shorter.len()
+        && longer.ends_with(shorter)
+        && longer.as_bytes()[longer.len() - shorter.len() - 1] == b'/'
 }
 
 /// True if `s` starts with `prefix` once normalized (see [`normalize_ref`]).
@@ -239,9 +269,10 @@ pub fn image_exists(tag: &str) -> bool {
 /// (the tag just built), and not `in_use` (typically the image `ctx`'s
 /// container currently runs, if any — deleting it out from under a
 /// live/stopped container would break it) — see [`should_prune`]. All
-/// comparisons are qualification/digest-aware (see [`normalize_ref`]).
-/// Deduped by normalized form: the CLI can expose the same image under
-/// multiple qualified spellings (e.g. `x:t` and `localhost/x:t`), and
+/// comparisons are qualification/digest-aware (see [`ref_matches`] and
+/// [`normalize_ref`]). Deduped by normalized form: the CLI can expose
+/// the same image under multiple qualified spellings (e.g. `x:t` and
+/// `localhost/x:t`), and
 /// calling `image_delete` on the same image twice under different
 /// spellings would report a spurious failure on the second attempt.
 fn filter_prunable<'a>(
@@ -484,7 +515,7 @@ mod tests {
 
         // `tag` itself can be qualified — e.g. an explicit `image =
         // "ghcr.io/org/tool:1"` config carries its qualification straight
-        // into `resolved.tag` — so both sides must normalize.
+        // into `resolved.tag`.
         let qualified_tag = "ghcr.io/org/tool:1";
         assert!(
             ref_matches("ghcr.io/org/tool:1", qualified_tag),
@@ -497,6 +528,29 @@ mod tests {
         assert!(
             !ref_matches("ghcr.io/org/other:1", qualified_tag),
             "different qualified image must not match"
+        );
+
+        // A bare `tag` matches a qualified inspect ref of the same image...
+        assert!(
+            ref_matches("docker.io/library/postgres:16", "postgres:16"),
+            "bare tag matches its registry-qualified inspect ref"
+        );
+        assert!(
+            ref_matches("docker.io/library/postgres:16@sha256:deadbeef", "postgres:16"),
+            "bare tag matches its registry- and digest-qualified inspect ref"
+        );
+        // ...but two DIFFERENT registries/namespaces for the same bare
+        // name:tag must not collapse into a match, or switching an
+        // explicit `image` config between registries would go undetected.
+        assert!(
+            !ref_matches("ghcr.io/myorg/postgres:16", "docker.io/library/postgres:16"),
+            "different registries for the same name:tag must not match"
+        );
+        // The `/`-boundary requirement, not a plain substring/suffix
+        // check, is what makes that rejection correct in general.
+        assert!(
+            !ref_matches("xpostgres:16", "postgres:16"),
+            "a same-suffix-but-no-slash-boundary string must not match"
         );
     }
 

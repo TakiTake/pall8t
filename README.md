@@ -60,7 +60,17 @@ stateDiagram-v2
     [*] --> ResolveTag
 
     ResolveTag --> Reuse : image exists &\ncontainer's tag matches
-    ResolveTag --> Build : tag mismatch on an\nexisting container,\nor image absent
+    ResolveTag --> Build : project Containerfile or\ndefault image,\ntag mismatch or image absent
+    ResolveTag --> RecreateContainer : explicit `image` config,\ntag mismatch on an\nexisting container
+
+    note right of RecreateContainer
+        An explicit `image` is never built
+        or pruned: a mismatch skips straight
+        to recreation, and a totally absent
+        container skips straight to creation
+        (below) -- the CLI pulls the
+        reference itself, or fails.
+    end note
 
     note right of Build
         Built BEFORE touching a mismatched,
@@ -71,7 +81,7 @@ stateDiagram-v2
     end note
 
     Build --> VerifyHash : hash-suffixed tag\n(project Containerfile)
-    Build --> Prune : unsuffixed tag\n(default image / explicit `image`)
+    Build --> Prune : unsuffixed tag\n(default image / no\nproject Containerfile)
 
     VerifyHash --> Prune : re-hash matches
     VerifyHash --> Poisoned : re-hash differs\n(Containerfile edited mid-build)
@@ -88,9 +98,18 @@ stateDiagram-v2
     end note
 
     Prune --> RecreateContainer : an existing container\nneeds the new tag
+
+    note left of Prune
+        The old container, if any, is still
+        running its old image at this point,
+        which excludes that image from
+        pruning until the container itself
+        is stopped/deleted below.
+    end note
+
     Prune --> Reuse : no existing container\nto replace
 
-    RecreateContainer --> Reuse : stop + delete the old\ncontainer, run the new image
+    RecreateContainer --> Reuse : stop + delete the old\ncontainer (if any),\nrun the new image
     Reuse --> [*]
     Failed --> [*]
 ```

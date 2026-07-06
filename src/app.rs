@@ -1229,6 +1229,16 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
     // disappearing entirely (`containerfile.is_none()`) is a legitimate
     // switch back to the default image and must still recreate.
     let transient_read_failure = resolved.containerfile.is_some() && resolved.hash.is_none();
+
+    // Set by the stopped-mismatch branch below when it pre-builds a
+    // replacement image, so the `State::Absent` arm can reuse the tag it
+    // actually built instead of re-deriving one from `resolved.tag` — a
+    // Containerfile that changed mid-build (see `try_build`'s `Poisoned`
+    // case) can make the build's retry land on a different tag, and
+    // re-deriving would otherwise trigger a redundant (and possibly
+    // failing, if the Containerfile keeps churning) second build.
+    let mut prebuilt: Option<String> = None;
+
     if transient_read_failure && state != State::Absent {
         let _ = msgs.send(Msg::Warning(format!(
             "could not read {} — skipping image staleness check",
@@ -1243,6 +1253,10 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
     // `container::ref_matches`): `current` (from `container inspect`) can
     // be registry- or digest-qualified, and so can `resolved.tag` itself
     // when it comes straight from an explicit, qualified `image` config.
+    // `resolved.tag` is the only tag this codebase passes to `ref_matches`
+    // that can be qualified this way — every other caller passes a bare,
+    // crate-built tag — which is the invariant `ref_matches`'s
+    // cross-registry rejection relies on.
     if state != State::Absent && !transient_read_failure {
         if let Some(current) = container::image_ref(&ctx.container) {
             if !container::ref_matches(&current, &resolved.tag) {
@@ -1269,6 +1283,7 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
                         let (tag, pruned) = build_image(ctx, &resolved, msgs, uid, gid)?;
                         let suffix = pruned.map(|p| format!(" ({p})")).unwrap_or_default();
                         let _ = msgs.send(Msg::Status(format!("built {tag}{suffix}")));
+                        prebuilt = Some(tag);
                     }
                     // A just-stopped container can still be shutting down
                     // ("stopping" reads as non-running); stop is a no-op if
@@ -1311,7 +1326,9 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
             // it or fail with a clear error, rather than silently building
             // and running the wrong (pall8t Containerfile) image under
             // the user's chosen reference.
-            let run_tag = if ctx.entry.image.is_some() || container::image_exists(&resolved.tag) {
+            let run_tag = if let Some(tag) = prebuilt {
+                tag
+            } else if ctx.entry.image.is_some() || container::image_exists(&resolved.tag) {
                 resolved.tag.clone()
             } else {
                 let (tag, pruned) = build_image(ctx, &resolved, msgs, uid, gid)?;
