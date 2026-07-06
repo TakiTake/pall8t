@@ -51,7 +51,68 @@ All other keys go straight to the active tab's terminal. The mouse wheel scrolls
 
 `~/.config/pall8t/config.toml` — see [docs/design/DESIGN.md](docs/design/DESIGN.md) for the full design and [docs/adr/](docs/adr/) for architecture decisions.
 
-If a repo contains `.pall8t/Containerfile`, pall8t builds that project's image from it automatically (this repo ships one with a Rust toolchain, so agents can develop pall8t inside pall8t). Toolchains in custom Containerfiles must live outside `/home/dev` — the persistent home mount shadows it.
+If a repo contains `.pall8t/Containerfile`, pall8t builds that project's image from it automatically (this repo ships one with a Rust toolchain, so agents can develop pall8t inside pall8t). Toolchains in custom Containerfiles must live outside `/home/dev` — the persistent home mount shadows it. The built image is tagged with a hash of the Containerfile's contents, so any edit — no commit required — triggers a rebuild the next time the project's image is needed; superseded images for the same project are deleted automatically after a successful rebuild. This only hashes the Containerfile itself, not files it `COPY`s in from the build context, so editing one of those without touching the Containerfile won't trigger a rebuild.
+
+Image lifecycle, end to end:
+
+```mermaid
+stateDiagram-v2
+    [*] --> ResolveTag
+
+    ResolveTag --> Reuse : image exists &\ncontainer's tag matches
+    ResolveTag --> Build : project Containerfile or\ndefault image,\ntag mismatch or image absent
+    ResolveTag --> RecreateContainer : explicit `image` config,\ntag mismatch on an\nexisting container
+
+    note right of RecreateContainer
+        An explicit `image` is never built
+        or pruned: a mismatch skips straight
+        to recreation, and a totally absent
+        container skips straight to creation
+        (below) -- the CLI pulls the
+        reference itself, or fails.
+    end note
+
+    note right of Build
+        Built BEFORE touching a mismatched,
+        existing container: a build failure
+        errors out and leaves that container
+        running, untouched, rather than
+        destroying it with no replacement.
+    end note
+
+    Build --> VerifyHash : hash-suffixed tag\n(project Containerfile)
+    Build --> Prune : unsuffixed tag\n(default image / no\nproject Containerfile)
+
+    VerifyHash --> Prune : re-hash matches
+    VerifyHash --> Poisoned : re-hash differs\n(Containerfile edited mid-build)
+
+    Poisoned --> Build : retry once,\nre-resolved against\ncurrent content
+    Poisoned --> Failed : second attempt\nalso poisoned
+
+    note right of Poisoned
+        Mistagged image deleted --
+        unless the container currently
+        runs that exact tag, in which
+        case it's left in place (warned)
+        and superseded on the next build.
+    end note
+
+    Prune --> RecreateContainer : an existing container\nneeds the new tag
+
+    note left of Prune
+        The old container, if any, is still
+        running its old image at this point,
+        which excludes that image from
+        pruning until the container itself
+        is stopped/deleted below.
+    end note
+
+    Prune --> Reuse : no existing container\nto replace
+
+    RecreateContainer --> Reuse : stop + delete the old\ncontainer (if any),\nrun the new image
+    Reuse --> [*]
+    Failed --> [*]
+```
 
 ## Claude Code agent teams (split panes)
 

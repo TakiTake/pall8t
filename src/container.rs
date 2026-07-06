@@ -31,16 +31,45 @@ fn read_id(flag: &str) -> Option<u32> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+/// First `n` bytes of `bytes`'s sha256 digest, as lowercase hex (`2*n`
+/// characters). Shared by every call site that needs a short, stable
+/// content fingerprint, so the digest/truncation logic can't drift
+/// between them.
+pub(crate) fn sha256_hex_prefix(bytes: &[u8], n: usize) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .take(n)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// pall8t-<slug(project)>-<sha256(workspace path)[..8]>
 pub fn container_name(project_name: &str, workspace: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
-    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    let hex = sha256_hex_prefix(workspace.to_string_lossy().as_bytes(), 4);
     format!("pall8t-{}-{}", crate::workspace::slug(project_name), hex)
 }
 
 pub fn image_tag(base: &str, uid: u32, gid: u32) -> String {
     format!("{base}:{uid}-{gid}")
+}
+
+/// Like [`image_tag`], but suffixed with a Containerfile content hash (see
+/// [`containerfile_content_hash`]) so a change to its contents resolves to
+/// a new tag.
+pub fn image_tag_hashed(base: &str, uid: u32, gid: u32, hash: &str) -> String {
+    format!("{base}:{uid}-{gid}-{hash}")
+}
+
+/// First 12 hex chars of the sha256 of `containerfile`'s current bytes.
+/// Hashing the working-tree contents (rather than, say, the last commit
+/// that touched the file) means uncommitted edits are detected too, and a
+/// rebuild can never poison a tag: the same content always resolves to the
+/// same tag, so the tag always corresponds to the image built from it.
+/// `None` if the file can't be read.
+pub fn containerfile_content_hash(containerfile: &Path) -> Option<String> {
+    let bytes = std::fs::read(containerfile).ok()?;
+    Some(sha256_hex_prefix(&bytes, 6))
 }
 
 fn run_ok<I, S>(args: I) -> Result<String>
@@ -109,20 +138,211 @@ pub fn list_all() -> Result<Vec<(String, State)>> {
     Ok(items)
 }
 
-pub fn image_exists(tag: &str) -> bool {
-    fn any_str_contains(v: &Value, needle: &str) -> bool {
-        match v {
-            Value::String(s) => s.contains(needle),
-            Value::Array(a) => a.iter().any(|x| any_str_contains(x, needle)),
-            Value::Object(m) => m.values().any(|x| any_str_contains(x, needle)),
-            _ => false,
-        }
+/// Strips the digest suffix from a reference: a reference contains at most
+/// one `@` (introducing the digest), so everything from the first `@`
+/// onward is the digest, and stripping it is a no-op for a reference that
+/// has none.
+fn strip_digest(s: &str) -> &str {
+    s.split('@').next().unwrap_or(s)
+}
+
+/// Normalizes an image reference string as it can appear from `container
+/// image list`/`inspect` down to bare `base:tag` form, so references can
+/// be compared regardless of registry/repo qualification
+/// (`registry:5000/ns/base:tag`) or a `@sha256:...` digest suffix
+/// (`base:tag@sha256:...`). There is a single normalization point so
+/// qualification/digest handling can't drift between call sites (previously
+/// `ref_matches` and `ref_has_prefix` disagreed on digests, which let a
+/// freshly built, digest-qualified image be classified as prunable and
+/// self-delete). Strips the digest first (see [`strip_digest`]), then
+/// strips everything up to and including the last `/`: registry/namespace
+/// qualification never itself contains a `:tag`, so the last `/` is always
+/// the boundary between qualification and `name:tag` (a `registry:port/...`
+/// prefix's colon doesn't interfere, since it's before that last `/`).
+/// Used by [`ref_has_prefix`] and the dedup/in-use matching that only ever
+/// deals with references this crate itself builds — never with a
+/// caller-supplied, possibly cross-registry `tag` (see [`ref_matches`],
+/// which needs a subtler comparison for that case).
+fn normalize_ref(s: &str) -> &str {
+    let without_digest = strip_digest(s);
+    without_digest.rsplit('/').next().unwrap_or(without_digest)
+}
+
+/// True if `s` (a reference string from `container image list`/`inspect`)
+/// refers to `tag`. Both are digest-stripped (see [`strip_digest`]) and
+/// then compared for equality OR a `/`-bounded suffix match in either
+/// direction — NOT via [`normalize_ref`], which would strip qualification
+/// down to bare `name:tag` on both sides and so treat any two images
+/// sharing a bare name as the same image regardless of registry (e.g.
+/// `ghcr.io/org/tool:1` and `docker.io/other/tool:1` would wrongly match).
+/// The suffix check instead only accepts one side being an unqualified
+/// tail of the other at a `/` boundary — e.g. a bare `postgres:16` matches
+/// `docker.io/library/postgres:16`, since that's how `container inspect`
+/// can report a reference that was configured or built bare — while still
+/// rejecting a differently-registried qualification. `tag` needs this
+/// treatment (not just `s`) because it isn't always bare: an explicit
+/// `image = "ghcr.io/org/tool:1"` config carries its qualification
+/// straight into `resolved.tag` (see `resolve_image`/`ensure_running`).
+/// The boundary requirement also keeps hash-suffixed tags safe: with
+/// `pall8t-x:501-20` vs. a differently-hashed sibling
+/// `pall8t-x:501-20-abc123456789`, the shorter is a plain substring but
+/// not a `/`-bounded suffix of the longer, so they correctly don't match
+/// (equally, `xpostgres:16` doesn't match `postgres:16`: `x` precedes the
+/// shared suffix, not `/`).
+///
+/// Inherent limitation, accepted: if `container inspect` currently reports
+/// a BARE ref (e.g. `postgres:16`) and the config then switches to a
+/// DIFFERENT registry's qualification of the same `name:tag` (e.g.
+/// `ghcr.io/myorg/postgres:16`), that change goes undetected — a bare ref
+/// is a legitimate `/`-suffix of any qualification, so it can't be
+/// rejected without also breaking the bare↔qualified acceptance this
+/// function exists for.
+pub(crate) fn ref_matches(s: &str, tag: &str) -> bool {
+    let a = strip_digest(s);
+    let b = strip_digest(tag);
+    a == b || is_slash_suffix(a, b) || is_slash_suffix(b, a)
+}
+
+/// True if `longer` ends with `shorter` immediately preceded by a `/`,
+/// i.e. `shorter` is `longer`'s unqualified `name:tag` suffix. The `/`
+/// boundary check is what stops a plain-substring false positive like
+/// `xpostgres:16` "ending with" `postgres:16`.
+fn is_slash_suffix(longer: &str, shorter: &str) -> bool {
+    longer.len() > shorter.len()
+        && longer.ends_with(shorter)
+        && longer.as_bytes()[longer.len() - shorter.len() - 1] == b'/'
+}
+
+/// True if `s` starts with `prefix` once normalized (see [`normalize_ref`]).
+/// Same acceptance rule as [`ref_matches`], for prefix rather than exact
+/// matching.
+pub(crate) fn ref_has_prefix(s: &str, prefix: &str) -> bool {
+    normalize_ref(s).starts_with(prefix)
+}
+
+/// True if `s` is an image reference for `base` scoped to `uid`-`gid`:
+/// either the unsuffixed fallback tag (`base:uid-gid`) or a hash-suffixed
+/// variant (`base:uid-gid-<hash>`), matched per [`ref_matches`]/
+/// [`ref_has_prefix`]. Used to scope pruning so a `pall8t-<slug>` base
+/// shared across host users doesn't delete a different uid/gid's images.
+/// The trailing `-` on the hash-suffix prefix also disambiguates e.g. gid
+/// `2` from gid `20`: `base:uid-2-` is not a prefix of `base:uid-20-...`,
+/// since the character right after `2` differs (`-` vs `0`).
+pub(crate) fn image_owned_by(s: &str, base: &str, uid: u32, gid: u32) -> bool {
+    let unsuffixed = image_tag(base, uid, gid);
+    let hash_prefix = format!("{unsuffixed}-");
+    ref_matches(s, &unsuffixed) || ref_has_prefix(s, &hash_prefix)
+}
+
+/// True if `s` is a superseded-build candidate that pruning should delete:
+/// it belongs to `base`/`uid`/`gid` (see [`image_owned_by`]) and it is not
+/// `keep_tag`. The keep-exclusion uses [`ref_matches`], not `!=`, because
+/// `s` can be registry/digest-qualified (per [`image_owned_by`]) while
+/// `keep_tag` — the tag just passed to `container build -t` — never is; a
+/// raw string inequality would then treat the qualified form of the image
+/// just built as "not `keep_tag`" and delete it out from under the caller.
+pub(crate) fn should_prune(s: &str, keep_tag: &str, base: &str, uid: u32, gid: u32) -> bool {
+    !ref_matches(s, keep_tag) && image_owned_by(s, base, uid, gid)
+}
+
+/// Walks a `container image list`/`inspect` JSON value (schema is pre-1.0,
+/// see ADR-0001, hence the defensive walk rather than a fixed pointer path)
+/// and calls `f` with every string found. Shared by every function that
+/// scans image references, so there's one place that knows how the JSON is
+/// shaped.
+fn for_each_string(v: &Value, f: &mut impl FnMut(&str)) {
+    match v {
+        Value::String(s) => f(s),
+        Value::Array(a) => a.iter().for_each(|x| for_each_string(x, f)),
+        Value::Object(m) => m.values().for_each(|x| for_each_string(x, f)),
+        _ => {}
     }
-    run_ok(["image", "list", "--format", "json"])
+}
+
+pub fn image_exists(tag: &str) -> bool {
+    let Some(v) = run_ok(["image", "list", "--format", "json"])
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
-        .map(|v| any_str_contains(&v, tag))
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    let mut found = false;
+    for_each_string(&v, &mut |s| found = found || ref_matches(s, tag));
+    found
+}
+
+/// Pure filter+dedup core of [`prunable_images`], factored out for
+/// testability. From a flat list of reference strings, returns the ones
+/// that pruning should delete: owned by `base`/`uid`/`gid`, not `keep_tag`
+/// (the tag just built), and not `in_use` (typically the image `ctx`'s
+/// container currently runs, if any — deleting it out from under a
+/// live/stopped container would break it) — see [`should_prune`]. All
+/// comparisons are qualification/digest-aware (see [`ref_matches`] and
+/// [`normalize_ref`]). Deduped by normalized form: the CLI can expose
+/// the same image under multiple qualified spellings (e.g. `x:t` and
+/// `localhost/x:t`), and
+/// calling `image_delete` on the same image twice under different
+/// spellings would report a spurious failure on the second attempt.
+fn filter_prunable<'a>(
+    refs: impl Iterator<Item = &'a str>,
+    base: &str,
+    keep_tag: &str,
+    uid: u32,
+    gid: u32,
+    in_use: Option<&str>,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for s in refs {
+        if !should_prune(s, keep_tag, base, uid, gid) {
+            continue;
+        }
+        if let Some(in_use) = in_use {
+            if normalize_ref(s) == normalize_ref(in_use) {
+                continue;
+            }
+        }
+        if seen.insert(normalize_ref(s).to_string()) {
+            out.push(s.to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Reference strings from `container image list` that pruning after a
+/// successful build should delete. See [`filter_prunable`] for the
+/// matching/dedup rules.
+pub fn prunable_images(
+    base: &str,
+    keep_tag: &str,
+    uid: u32,
+    gid: u32,
+    in_use: Option<&str>,
+) -> Result<Vec<String>> {
+    let stdout = run_ok(["image", "list", "--format", "json"])?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let v: Value =
+        serde_json::from_str(trimmed).context("unexpected `container image list` JSON")?;
+    let mut refs = Vec::new();
+    for_each_string(&v, &mut |s| refs.push(s.to_string()));
+    Ok(filter_prunable(
+        refs.iter().map(String::as_str),
+        base,
+        keep_tag,
+        uid,
+        gid,
+        in_use,
+    ))
+}
+
+/// Delete an image by tag/reference.
+pub fn image_delete(tag: &str) -> Result<()> {
+    run_ok(["image", "delete", tag])?;
+    Ok(())
 }
 
 pub fn build_image(containerfile: &Path, ctx_dir: &Path, tag: &str, uid: u32, gid: u32) -> Result<()> {
@@ -248,4 +468,278 @@ pub fn default_containerfile_path() -> Result<PathBuf> {
     let path = dir.join("Containerfile");
     std::fs::write(&path, DEFAULT_CONTAINERFILE)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn normalize_ref_table() {
+        assert_eq!(normalize_ref("pall8t-x:501-20"), "pall8t-x:501-20");
+        assert_eq!(
+            normalize_ref("localhost/pall8t-x:501-20"),
+            "pall8t-x:501-20"
+        );
+        assert_eq!(
+            normalize_ref("registry:5000/ns/pall8t-x:501-20"),
+            "pall8t-x:501-20"
+        );
+        assert_eq!(
+            normalize_ref("pall8t-x:501-20@sha256:deadbeef"),
+            "pall8t-x:501-20"
+        );
+        assert_eq!(
+            normalize_ref("localhost/pall8t-x:501-20@sha256:deadbeef"),
+            "pall8t-x:501-20"
+        );
+    }
+
+    #[test]
+    fn ref_matches_table() {
+        let tag = "pall8t-x:501-20";
+        assert!(ref_matches(tag, tag), "exact match");
+        assert!(
+            ref_matches("localhost/pall8t-x:501-20", tag),
+            "registry-qualified match"
+        );
+        assert!(
+            ref_matches("pall8t-x:501-20@sha256:deadbeef", tag),
+            "digest-qualified match"
+        );
+        assert!(
+            ref_matches("localhost/pall8t-x:501-20@sha256:deadbeef", tag),
+            "registry- and digest-qualified match"
+        );
+        assert!(
+            !ref_matches("pall8t-x:501-20-abc123456789", tag),
+            "hash-suffixed sibling must not match the unsuffixed tag"
+        );
+        assert!(
+            !ref_matches("pall8t-x:501-2", "pall8t-x:501-20"),
+            "501-2 must not match 501-20"
+        );
+
+        // `tag` itself can be qualified — e.g. an explicit `image =
+        // "ghcr.io/org/tool:1"` config carries its qualification straight
+        // into `resolved.tag`.
+        let qualified_tag = "ghcr.io/org/tool:1";
+        assert!(
+            ref_matches("ghcr.io/org/tool:1", qualified_tag),
+            "exact qualified tag matches itself"
+        );
+        assert!(
+            ref_matches("ghcr.io/org/tool:1@sha256:deadbeef", qualified_tag),
+            "digest-pinned inspect ref matches its own qualified tag"
+        );
+        assert!(
+            !ref_matches("ghcr.io/org/other:1", qualified_tag),
+            "different qualified image must not match"
+        );
+
+        // A bare `tag` matches a qualified inspect ref of the same image...
+        assert!(
+            ref_matches("docker.io/library/postgres:16", "postgres:16"),
+            "bare tag matches its registry-qualified inspect ref"
+        );
+        assert!(
+            ref_matches(
+                "docker.io/library/postgres:16@sha256:deadbeef",
+                "postgres:16"
+            ),
+            "bare tag matches its registry- and digest-qualified inspect ref"
+        );
+        // ...but two DIFFERENT registries/namespaces for the same bare
+        // name:tag must not collapse into a match, or switching an
+        // explicit `image` config between registries would go undetected.
+        assert!(
+            !ref_matches("ghcr.io/myorg/postgres:16", "docker.io/library/postgres:16"),
+            "different registries for the same name:tag must not match"
+        );
+        // The `/`-boundary requirement, not a plain substring/suffix
+        // check, is what makes that rejection correct in general.
+        assert!(
+            !ref_matches("xpostgres:16", "postgres:16"),
+            "a same-suffix-but-no-slash-boundary string must not match"
+        );
+
+        // Pins the inherent limitation documented on `ref_matches`: a bare
+        // ref is a legitimate `/`-suffix of ANY qualification of the same
+        // name:tag, so switching the config to a different registry while
+        // `container inspect` still reports the old, bare ref goes
+        // undetected. Accepted, not fixable without breaking the
+        // bare-tag-matches-its-own-qualification case above.
+        assert!(
+            ref_matches("postgres:16", "ghcr.io/myorg/postgres:16"),
+            "inherent limitation: a bare ref matches any qualification of the same name:tag"
+        );
+    }
+
+    #[test]
+    fn ref_has_prefix_table() {
+        let prefix = "pall8t-x:501-20-";
+        assert!(ref_has_prefix("pall8t-x:501-20-abc123456789", prefix));
+        assert!(ref_has_prefix(
+            "localhost/pall8t-x:501-20-abc123456789",
+            prefix
+        ));
+        assert!(ref_has_prefix(
+            "pall8t-x:501-20-abc123456789@sha256:deadbeef",
+            prefix
+        ));
+        assert!(
+            !ref_has_prefix("pall8t-x:501-2-abc123456789", prefix),
+            "501-2- must not match the 501-20- prefix"
+        );
+    }
+
+    #[test]
+    fn image_owned_by_table() {
+        let base = "pall8t-x";
+        assert!(
+            image_owned_by("pall8t-x:501-20", base, 501, 20),
+            "unsuffixed exact match"
+        );
+        assert!(
+            image_owned_by("localhost/pall8t-x:501-20-abc123456789", base, 501, 20),
+            "registry-qualified hash-suffixed match"
+        );
+        assert!(
+            !image_owned_by("pall8t-x:501-20-abc123456789", base, 501, 2),
+            "hash-suffixed image for a different gid must not match"
+        );
+        assert!(
+            !image_owned_by("pall8t-x:501-20", base, 501, 2),
+            "501-2 must not match a 501-20 image"
+        );
+    }
+
+    #[test]
+    fn should_prune_table() {
+        let base = "pall8t-x";
+        let keep_tag = "pall8t-x:501-20-newhash123456";
+        assert!(
+            !should_prune(keep_tag, keep_tag, base, 501, 20),
+            "verbatim keep_tag must not be pruned"
+        );
+        assert!(
+            !should_prune(&format!("localhost/{keep_tag}"), keep_tag, base, 501, 20),
+            "registry-qualified form of keep_tag must not be pruned"
+        );
+        assert!(
+            should_prune(
+                "pall8t-x:501-20-oldhash654321",
+                keep_tag,
+                base,
+                501,
+                20
+            ),
+            "a differently-hashed sibling must be pruned"
+        );
+        assert!(
+            should_prune(
+                "localhost/pall8t-x:501-20-oldhash654321",
+                keep_tag,
+                base,
+                501,
+                20
+            ),
+            "a registry-qualified differently-hashed sibling must be pruned"
+        );
+        assert!(
+            !should_prune("pall8t-x:501-2-oldhash654321", keep_tag, base, 501, 20),
+            "a different gid's image must not be pruned even if not keep_tag"
+        );
+        assert!(
+            !should_prune(
+                &format!("{keep_tag}@sha256:deadbeef"),
+                keep_tag,
+                base,
+                501,
+                20
+            ),
+            "digest-qualified form of keep_tag must not be pruned"
+        );
+        assert!(
+            should_prune(
+                "pall8t-x:501-20-oldhash654321@sha256:deadbeef",
+                keep_tag,
+                base,
+                501,
+                20
+            ),
+            "a digest-qualified differently-hashed sibling must be pruned"
+        );
+    }
+
+    #[test]
+    fn filter_prunable_table() {
+        let base = "pall8t-x";
+        let keep_tag = "pall8t-x:501-20-newhash123456";
+        let old = "pall8t-x:501-20-oldhash654321";
+        let refs = [
+            keep_tag,
+            &format!("localhost/{keep_tag}"), // keep_tag under another spelling
+            old,
+            &format!("localhost/{old}"), // same superseded image, listed twice
+            "pall8t-x:501-2-oldhash654321", // different gid — not ours to prune
+        ];
+
+        let pruned = filter_prunable(refs.iter().copied(), base, keep_tag, 501, 20, None);
+        assert_eq!(
+            pruned,
+            vec![old.to_string()],
+            "keeps keep_tag and the other gid's image, dedupes the qualified duplicate"
+        );
+
+        let none_in_use = filter_prunable(refs.iter().copied(), base, keep_tag, 501, 20, Some(old));
+        assert!(
+            none_in_use.is_empty(),
+            "an in_use image must not be pruned even if it's a superseded sibling"
+        );
+    }
+
+    #[test]
+    fn containerfile_content_hash_is_stable_and_12_chars() {
+        let dir = std::env::temp_dir().join(format!("pall8t-test-hash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Containerfile");
+        fs::write(&file, "FROM scratch\n").unwrap();
+
+        let first = containerfile_content_hash(&file).expect("hash");
+        let second = containerfile_content_hash(&file).expect("hash");
+        assert_eq!(first.len(), 12);
+        assert_eq!(first, second);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn containerfile_content_hash_changes_with_content() {
+        let dir =
+            std::env::temp_dir().join(format!("pall8t-test-hash-diff-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Containerfile");
+
+        fs::write(&file, "FROM scratch\n").unwrap();
+        let a = containerfile_content_hash(&file).unwrap();
+        fs::write(&file, "FROM scratch\nRUN true\n").unwrap();
+        let b = containerfile_content_hash(&file).unwrap();
+
+        assert_ne!(a, b);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn containerfile_content_hash_none_when_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("pall8t-test-hash-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let file = dir.join("Containerfile");
+
+        assert_eq!(containerfile_content_hash(&file), None);
+    }
 }

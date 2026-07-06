@@ -27,9 +27,7 @@ pub fn slug(name: &str) -> String {
 }
 
 fn hash8(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(input.as_bytes());
-    digest.iter().take(4).map(|b| format!("{b:02x}")).collect()
+    crate::container::sha256_hex_prefix(input.as_bytes(), 4)
 }
 
 /// <workspace_root>/<slug(name)>-<sha256(name)[..8]>
