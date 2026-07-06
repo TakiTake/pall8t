@@ -137,12 +137,13 @@ pub fn list_all() -> Result<Vec<(String, State)>> {
 /// qualification/digest handling can't drift between call sites (previously
 /// `ref_matches` and `ref_has_prefix` disagreed on digests, which let a
 /// freshly built, digest-qualified image be classified as prunable and
-/// self-delete). Strips the digest first — it's always the last
-/// `@`-delimited component — then strips everything up to and including
-/// the last `/`: registry/namespace qualification never itself contains a
-/// `:tag`, so the last `/` is always the boundary between qualification
-/// and `name:tag` (a `registry:port/...` prefix's colon doesn't interfere,
-/// since it's before that last `/`).
+/// self-delete). Strips the digest first — a reference contains at most
+/// one `@` (introducing the digest), so everything from the first `@`
+/// onward is the digest and gets stripped — then strips everything up to
+/// and including the last `/`: registry/namespace qualification never
+/// itself contains a `:tag`, so the last `/` is always the boundary
+/// between qualification and `name:tag` (a `registry:port/...` prefix's
+/// colon doesn't interfere, since it's before that last `/`).
 fn normalize_ref(s: &str) -> &str {
     let without_digest = s.split('@').next().unwrap_or(s);
     without_digest.rsplit('/').next().unwrap_or(without_digest)

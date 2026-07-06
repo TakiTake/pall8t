@@ -53,6 +53,40 @@ All other keys go straight to the active tab's terminal. The mouse wheel scrolls
 
 If a repo contains `.pall8t/Containerfile`, pall8t builds that project's image from it automatically (this repo ships one with a Rust toolchain, so agents can develop pall8t inside pall8t). Toolchains in custom Containerfiles must live outside `/home/dev` — the persistent home mount shadows it. The built image is tagged with a hash of the Containerfile's contents, so any edit — no commit required — triggers a rebuild the next time the project's image is needed; superseded images for the same project are deleted automatically after a successful rebuild. This only hashes the Containerfile itself, not files it `COPY`s in from the build context, so editing one of those without touching the Containerfile won't trigger a rebuild.
 
+Image lifecycle, end to end:
+
+```mermaid
+stateDiagram-v2
+    [*] --> ResolveTag
+
+    ResolveTag --> Reuse : image exists &\ncontainer's tag matches
+    ResolveTag --> RecreateContainer : container exists,\ntag mismatch
+    ResolveTag --> Build : image absent
+
+    RecreateContainer --> Build : stop + delete container
+
+    Build --> VerifyHash : hash-suffixed tag\n(project Containerfile)
+    Build --> Prune : unsuffixed tag\n(default image / explicit `image`)
+
+    VerifyHash --> Prune : re-hash matches
+    VerifyHash --> Poisoned : re-hash differs\n(Containerfile edited mid-build)
+
+    Poisoned --> Build : retry once,\nre-resolved against\ncurrent content
+    Poisoned --> Failed : second attempt\nalso poisoned
+
+    note right of Poisoned
+        Mistagged image deleted --
+        unless the container currently
+        runs that exact tag, in which
+        case it's left in place (warned)
+        and superseded on the next build.
+    end note
+
+    Prune --> Reuse : delete superseded tags\nfor this project,\nexcluding the in-use image
+    Reuse --> [*]
+    Failed --> [*]
+```
+
 ## Claude Code agent teams (split panes)
 
 Claude Code can show teammate agents as tmux split panes (`teammateMode: "auto"` / `"tmux"`), but it only creates panes if it's already running inside a tmux session — pall8t's image ships tmux for exactly this.

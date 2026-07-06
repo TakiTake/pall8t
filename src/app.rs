@@ -1049,9 +1049,12 @@ enum BuildAttempt {
 /// see [`ResolvedImage`]. For a hash-suffixed tag, re-hashes that same
 /// path afterwards to confirm nothing changed mid-build; a mismatch is
 /// reported as [`BuildAttempt::Poisoned`] after deleting the mistagged
-/// image. Otherwise, best-effort prunes superseded builds under
-/// `resolved.prune_base`, excluding whatever image `ctx`'s container
-/// currently runs (if any) — see [`prune_superseded_images`].
+/// image, unless `ctx`'s container currently runs that exact tag (the
+/// manual rebuild path can poison a tag that didn't change), in which
+/// case the delete is skipped and a warning sent instead. Otherwise,
+/// best-effort prunes superseded builds under `resolved.prune_base`,
+/// excluding whatever image `ctx`'s container currently runs (if any) —
+/// see [`prune_superseded_images`].
 fn try_build(
     ctx: &Ctx,
     resolved: &ResolvedImage,
@@ -1073,10 +1076,21 @@ fn try_build(
     )));
     container::build_image(&containerfile, &ctx_dir, &resolved.tag, uid, gid)?;
 
+    let in_use = container::image_ref(&ctx.container);
+
     if let Some(hash) = &resolved.hash {
         match container::containerfile_content_hash(&containerfile) {
             Some(fresh) if fresh != *hash => {
-                if let Err(e) = container::image_delete(&resolved.tag) {
+                if in_use
+                    .as_deref()
+                    .is_some_and(|u| container::ref_matches(u, &resolved.tag))
+                {
+                    let _ = msgs.send(Msg::Warning(format!(
+                        "mistagged image {} left in place — container {} currently uses it \
+                         (it will be superseded on the next build)",
+                        resolved.tag, ctx.container
+                    )));
+                } else if let Err(e) = container::image_delete(&resolved.tag) {
                     let _ = msgs.send(Msg::Warning(format!(
                         "could not delete poisoned tag {}: {e:#}",
                         resolved.tag
@@ -1095,7 +1109,6 @@ fn try_build(
         }
     }
 
-    let in_use = container::image_ref(&ctx.container);
     let pruned = resolved.prune_base.as_deref().and_then(|base| {
         prune_superseded_images(base, &resolved.tag, uid, gid, in_use.as_deref(), msgs)
     });
@@ -1252,7 +1265,10 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
             let run_tag = if ctx.entry.image.is_some() || container::image_exists(&resolved.tag) {
                 resolved.tag.clone()
             } else {
-                let (tag, _pruned) = build_image(ctx, &resolved, msgs, uid, gid)?;
+                let (tag, pruned) = build_image(ctx, &resolved, msgs, uid, gid)?;
+                if let Some(p) = pruned {
+                    let _ = msgs.send(Msg::Status(format!("built {tag} ({p})")));
+                }
                 tag
             };
             let _ = msgs.send(Msg::Status(format!("creating {}…", ctx.container)));
