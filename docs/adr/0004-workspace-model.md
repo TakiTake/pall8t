@@ -1,6 +1,6 @@
 # ADR-0004: Multi-repo project workspaces with identity-path mounts
 
-- Status: Accepted
+- Status: Amended by ADR-0006 (project-workspace model dropped; hardlink-clone protection retained)
 - Date: 2026-07-04
 
 ## Context

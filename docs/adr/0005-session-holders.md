@@ -1,6 +1,6 @@
 # ADR-0005: Per-tab session holders instead of a central daemon
 
-- Status: Accepted
+- Status: Superseded by ADR-0006
 - Date: 2026-07-05
 - Prompted by: [#2 Server/client architecture: central state daemon + detach/reattach](https://github.com/TakiTake/pall8t/issues/2)
 - Amends: ADR-0003 (its "detach is out of scope" consequence is withdrawn)

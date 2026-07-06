@@ -1,6 +1,6 @@
 # ADR-0003: Pivot to an embedded agent multiplexer (drop the filer)
 
-- Status: Accepted
+- Status: Superseded by ADR-0006
 - Date: 2026-07-04
 - Supersedes: the "no embedded terminal emulation" non-goal of DESIGN v1
 

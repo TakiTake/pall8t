@@ -1,5 +1,7 @@
 # pall8t — Claude in an apple/container
 
+> **⚠️ DEPRECATED (2026-07-06).** This document describes the TUI architecture abandoned by ADR-0006. pall8t is now a headless CLI; see [docs/requirements.md](../requirements.md). Kept for historical reference.
+
 > Formerly named "cabin" (see ADR-0002). This is **DESIGN v3**: v2 replaced the filer + external terminal tabs with an embedded multiplexer (ADR-0003); v3 re-architects state into per-tab session holders so agents survive TUI exit and multiple pall8t instances stay consistent (ADR-0005, prompted by [#2](https://github.com/TakiTake/pall8t/issues/2)).
 
 A Rust + ratatui TUI that runs AI coding agents (and shells) inside per-project sandboxed dev containers on macOS using [apple/container](https://github.com/apple/container) — with correct host↔container file ownership — and multiplexes them as tabs, herdr-style: you always see which agent is working, which is waiting for your approval, and which is done.
