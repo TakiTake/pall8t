@@ -60,10 +60,15 @@ stateDiagram-v2
     [*] --> ResolveTag
 
     ResolveTag --> Reuse : image exists &\ncontainer's tag matches
-    ResolveTag --> RecreateContainer : container exists,\ntag mismatch
-    ResolveTag --> Build : image absent
+    ResolveTag --> Build : tag mismatch on an\nexisting container,\nor image absent
 
-    RecreateContainer --> Build : stop + delete container
+    note right of Build
+        Built BEFORE touching a mismatched,
+        existing container: a build failure
+        errors out and leaves that container
+        running, untouched, rather than
+        destroying it with no replacement.
+    end note
 
     Build --> VerifyHash : hash-suffixed tag\n(project Containerfile)
     Build --> Prune : unsuffixed tag\n(default image / explicit `image`)
@@ -82,7 +87,10 @@ stateDiagram-v2
         and superseded on the next build.
     end note
 
-    Prune --> Reuse : delete superseded tags\nfor this project,\nexcluding the in-use image
+    Prune --> RecreateContainer : an existing container\nneeds the new tag
+    Prune --> Reuse : no existing container\nto replace
+
+    RecreateContainer --> Reuse : stop + delete the old\ncontainer, run the new image
     Reuse --> [*]
     Failed --> [*]
 ```

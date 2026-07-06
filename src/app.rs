@@ -1054,7 +1054,10 @@ enum BuildAttempt {
 /// case the delete is skipped and a warning sent instead. Otherwise,
 /// best-effort prunes superseded builds under `resolved.prune_base`,
 /// excluding whatever image `ctx`'s container currently runs (if any) —
-/// see [`prune_superseded_images`].
+/// see [`prune_superseded_images`]. If `ctx.container` exists but its
+/// image couldn't be determined (a transient `container inspect`
+/// failure, as opposed to the container simply not existing), pruning is
+/// skipped entirely rather than risk deleting that container's own image.
 fn try_build(
     ctx: &Ctx,
     resolved: &ResolvedImage,
@@ -1109,7 +1112,24 @@ fn try_build(
         }
     }
 
+    // `image_ref` returns `None` both when `ctx.container` doesn't exist
+    // (fine — nothing to exclude, prune freely) and when `container
+    // inspect` on an existing container transiently fails (dangerous — the
+    // in-use exclusion would silently vanish and the running container's
+    // own image could get pruned out from under it). Distinguish the two
+    // via `list_all`, treating a failure to list as "exists" to stay
+    // conservative.
+    let container_exists = container::list_all()
+        .map(|l| l.iter().any(|(n, _)| n == &ctx.container))
+        .unwrap_or(true);
     let pruned = resolved.prune_base.as_deref().and_then(|base| {
+        if in_use.is_none() && container_exists {
+            let _ = msgs.send(Msg::Warning(format!(
+                "could not determine which image {} uses — skipping prune of superseded images",
+                ctx.container
+            )));
+            return None;
+        }
         prune_superseded_images(base, &resolved.tag, uid, gid, in_use.as_deref(), msgs)
     });
     Ok(BuildAttempt::Done(pruned))
@@ -1209,13 +1229,20 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
     // disappearing entirely (`containerfile.is_none()`) is a legitimate
     // switch back to the default image and must still recreate.
     let transient_read_failure = resolved.containerfile.is_some() && resolved.hash.is_none();
+    if transient_read_failure && state != State::Absent {
+        let _ = msgs.send(Msg::Warning(format!(
+            "could not read {} — skipping image staleness check",
+            resolved.containerfile.as_deref().unwrap().display()
+        )));
+    }
 
     // The resolved image can change after a container was created (e.g. a
     // .pall8t/Containerfile appeared). Recreate stopped containers; only
     // warn for running ones (they may have live exec sessions). The
-    // comparison is qualification/digest-aware (see `container::ref_matches`),
-    // since `current` (from `container inspect`) can be registry- or
-    // digest-qualified even when `resolved.tag` never is.
+    // comparison is qualification/digest-aware on both sides (see
+    // `container::ref_matches`): `current` (from `container inspect`) can
+    // be registry- or digest-qualified, and so can `resolved.tag` itself
+    // when it comes straight from an explicit, qualified `image` config.
     if state != State::Absent && !transient_read_failure {
         if let Some(current) = container::image_ref(&ctx.container) {
             if !container::ref_matches(&current, &resolved.tag) {
@@ -1229,6 +1256,20 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
                         "image changed ({current} → {}) — recreating {}…",
                         resolved.tag, ctx.container
                     )));
+                    // Build the replacement image BEFORE touching the
+                    // existing container: if the build fails (e.g. a
+                    // broken Containerfile edit), a `?` below returns
+                    // early and the old, working container is left intact
+                    // rather than destroyed with nothing to replace it.
+                    // The old container still exists at this point, so its
+                    // image is excluded from pruning (see `try_build`).
+                    // `resolved.tag` may already exist from a previous,
+                    // interrupted attempt — skip rebuilding it then.
+                    if ctx.entry.image.is_none() && !container::image_exists(&resolved.tag) {
+                        let (tag, pruned) = build_image(ctx, &resolved, msgs, uid, gid)?;
+                        let suffix = pruned.map(|p| format!(" ({p})")).unwrap_or_default();
+                        let _ = msgs.send(Msg::Status(format!("built {tag}{suffix}")));
+                    }
                     // A just-stopped container can still be shutting down
                     // ("stopping" reads as non-running); stop is a no-op if
                     // already down, and delete gets a few retries.
@@ -1257,6 +1298,14 @@ fn ensure_running(ctx: &Ctx, msgs: &Sender<Msg>, uid: u32, gid: u32) -> Result<(
             container::start(&ctx.container)?;
         }
         State::Absent => {
+            if transient_read_failure {
+                let _ = msgs.send(Msg::Warning(format!(
+                    "could not read {} — using/building the unsuffixed fallback image {} \
+                     (content freshness unverified)",
+                    resolved.containerfile.as_deref().unwrap().display(),
+                    resolved.tag
+                )));
+            }
             // An explicit `image` is never built (see `resolve_image`) —
             // hand it straight to `run_detached`, which lets the CLI pull
             // it or fail with a clear error, rather than silently building

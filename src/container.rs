@@ -31,11 +31,22 @@ fn read_id(flag: &str) -> Option<u32> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+/// First `n` bytes of `bytes`'s sha256 digest, as lowercase hex (`2*n`
+/// characters). Shared by every call site that needs a short, stable
+/// content fingerprint, so the digest/truncation logic can't drift
+/// between them.
+pub(crate) fn sha256_hex_prefix(bytes: &[u8], n: usize) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .take(n)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// pall8t-<slug(project)>-<sha256(workspace path)[..8]>
 pub fn container_name(project_name: &str, workspace: &Path) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
-    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    let hex = sha256_hex_prefix(workspace.to_string_lossy().as_bytes(), 4);
     format!("pall8t-{}-{}", crate::workspace::slug(project_name), hex)
 }
 
@@ -57,10 +68,8 @@ pub fn image_tag_hashed(base: &str, uid: u32, gid: u32, hash: &str) -> String {
 /// same tag, so the tag always corresponds to the image built from it.
 /// `None` if the file can't be read.
 pub fn containerfile_content_hash(containerfile: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
     let bytes = std::fs::read(containerfile).ok()?;
-    let digest = Sha256::digest(&bytes);
-    Some(digest.iter().take(6).map(|b| format!("{b:02x}")).collect())
+    Some(sha256_hex_prefix(&bytes, 6))
 }
 
 fn run_ok<I, S>(args: I) -> Result<String>
@@ -150,13 +159,20 @@ fn normalize_ref(s: &str) -> &str {
 }
 
 /// True if `s` (a reference string from `container image list`/`inspect`)
-/// refers to `tag` once normalized (see [`normalize_ref`]). Deliberately
-/// not a substring match: with hash-suffixed tags, the unsuffixed form
-/// (e.g. `pall8t-x:501-20`) is a substring of a differently-hashed sibling
+/// refers to `tag` once BOTH sides are normalized (see [`normalize_ref`]).
+/// `tag` is normalized too because it isn't always bare: an explicit
+/// `image = "ghcr.io/org/tool:1"` config carries its qualification straight
+/// into `resolved.tag` (see `resolve_image`/`ensure_running`), and without
+/// normalizing `tag` that would never match `s`'s normalized form —
+/// permanently misreading the container as stale and recreating it on
+/// every check. For the tags this crate builds (unsuffixed, hash-suffixed),
+/// `tag` is already bare, so normalizing it is a no-op. Deliberately not a
+/// substring match: with hash-suffixed tags, the unsuffixed form (e.g.
+/// `pall8t-x:501-20`) is a substring of a differently-hashed sibling
 /// (`pall8t-x:501-20-abc123456789`), so substring matching would report a
 /// tag as existing when only that sibling does.
 pub(crate) fn ref_matches(s: &str, tag: &str) -> bool {
-    normalize_ref(s) == tag
+    normalize_ref(s) == normalize_ref(tag)
 }
 
 /// True if `s` starts with `prefix` once normalized (see [`normalize_ref`]).
@@ -464,6 +480,23 @@ mod tests {
         assert!(
             !ref_matches("pall8t-x:501-2", "pall8t-x:501-20"),
             "501-2 must not match 501-20"
+        );
+
+        // `tag` itself can be qualified — e.g. an explicit `image =
+        // "ghcr.io/org/tool:1"` config carries its qualification straight
+        // into `resolved.tag` — so both sides must normalize.
+        let qualified_tag = "ghcr.io/org/tool:1";
+        assert!(
+            ref_matches("ghcr.io/org/tool:1", qualified_tag),
+            "exact qualified tag matches itself"
+        );
+        assert!(
+            ref_matches("ghcr.io/org/tool:1@sha256:deadbeef", qualified_tag),
+            "digest-pinned inspect ref matches its own qualified tag"
+        );
+        assert!(
+            !ref_matches("ghcr.io/org/other:1", qualified_tag),
+            "different qualified image must not match"
         );
     }
 
