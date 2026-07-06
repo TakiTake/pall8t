@@ -189,6 +189,14 @@ fn normalize_ref(s: &str) -> &str {
 /// not a `/`-bounded suffix of the longer, so they correctly don't match
 /// (equally, `xpostgres:16` doesn't match `postgres:16`: `x` precedes the
 /// shared suffix, not `/`).
+///
+/// Inherent limitation, accepted: if `container inspect` currently reports
+/// a BARE ref (e.g. `postgres:16`) and the config then switches to a
+/// DIFFERENT registry's qualification of the same `name:tag` (e.g.
+/// `ghcr.io/myorg/postgres:16`), that change goes undetected — a bare ref
+/// is a legitimate `/`-suffix of any qualification, so it can't be
+/// rejected without also breaking the bare↔qualified acceptance this
+/// function exists for.
 pub(crate) fn ref_matches(s: &str, tag: &str) -> bool {
     let a = strip_digest(s);
     let b = strip_digest(tag);
@@ -536,7 +544,10 @@ mod tests {
             "bare tag matches its registry-qualified inspect ref"
         );
         assert!(
-            ref_matches("docker.io/library/postgres:16@sha256:deadbeef", "postgres:16"),
+            ref_matches(
+                "docker.io/library/postgres:16@sha256:deadbeef",
+                "postgres:16"
+            ),
             "bare tag matches its registry- and digest-qualified inspect ref"
         );
         // ...but two DIFFERENT registries/namespaces for the same bare
@@ -551,6 +562,17 @@ mod tests {
         assert!(
             !ref_matches("xpostgres:16", "postgres:16"),
             "a same-suffix-but-no-slash-boundary string must not match"
+        );
+
+        // Pins the inherent limitation documented on `ref_matches`: a bare
+        // ref is a legitimate `/`-suffix of ANY qualification of the same
+        // name:tag, so switching the config to a different registry while
+        // `container inspect` still reports the old, bare ref goes
+        // undetected. Accepted, not fixable without breaking the
+        // bare-tag-matches-its-own-qualification case above.
+        assert!(
+            ref_matches("postgres:16", "ghcr.io/myorg/postgres:16"),
+            "inherent limitation: a bare ref matches any qualification of the same name:tag"
         );
     }
 
