@@ -1,9 +1,10 @@
 # Evaluation: home-compositor candidates vs. the spec
 
-Status: 2026-07-07. Companion to [home-compositor.md](home-compositor.md); executes its
+Status: 2026-07-08. Companion to [home-compositor.md](home-compositor.md); executes its
 "next step". Three evaluations, one comparison table each: (A) off-the-shelf tools
 against the spec's requirements, (B) fork mechanics for FR-1, (C) versioning/merge
-engine for FR-4/FR-7 — plus (D) the ideas worth borrowing from tools we don't adopt.
+engine for FR-4/FR-7 — plus (D) the ideas worth borrowing from tools we don't adopt and
+(E) a considered-and-rejected architecture kept on record.
 
 ## A. Off-the-shelf tools vs. spec requirements
 
@@ -73,9 +74,50 @@ for what gets snapshotted, diffed, and merged.
 | home-manager | numbered generations with rollback | FR-7 revision model |
 | bit | AI-assisted merge — as a *local* resolver only | FR-4 pluggable resolver hook (local Claude) |
 
+## E. Considered alternative: VCS-server container (branch-per-run)
+
+Proposal (2026-07-08): run a long-lived VCS container that mounts `~/.pall8t/home`
+directly; each instance `git clone`s from it at start and pushes its modifications as
+branch `run-<name>`; promote = merge to main.
+
+**The insight worth keeping:** branch-per-run maps 1:1 onto the inbox model — a branch
+*is* a changeset, promote = merge, drop = delete-branch — and FR-4's
+fork-point-ancestor merge, FR-6's serialization (server-side ref updates), and FR-7's
+log/diff/rollback all come free from git.
+
+**Why it's rejected as proposed** — it collides with four spec points:
+
+| # | Collision | Spec point |
+|---|---|---|
+| 1 | Secrets transit the container network and enter git objects, replicated into the server repo and every instance's `.git`, surviving branch deletion until gc. Gitignoring them means secrets need a separate delivery channel to instances anyway — reintroducing the copy mechanism the VCS was meant to replace | secrets NFR |
+| 2 | Every instance home is a clone: a `.git` visible to the agent, plus a remote pointing at the real base — nothing stops an agent from `git push origin main`, bypassing promote. Preventing that means auth/ACLs inside the VCS container | table C `.git`-in-`$HOME` rejection; FR-4 explicit promote |
+| 3 | Push-on-exit needs an entrypoint trap in the guest; `kill -9` / VM teardown (`--rm`) skips it and unpushed work is lost. Avoiding that puts the instance on host-visible storage — where host-side clonefile + lazy diff is already strictly better | FR-3 lossless, FR-8 lazy harvest |
+| 4 | A long-lived VCS container is a daemon to babysit, whose writes to the mounted base race host-side token write-back | FR-11 no-daemon; FR-6 serialized base writes |
+
+**Salvageable middle variant, on record:** a **bare repo on the host, outside `$HOME`,
+no daemon** — harvest commits each run's *policy-filtered* diff (secret/ephemeral never
+enter it) onto its fork-point ancestor as branch `run-<name>`; instances stay plain
+clonefile dirs with no `.git`. This keeps the branch-per-run semantics while avoiding
+all four collisions. Its residual weakness vs. snapshots+manifest (table C) is git's
+immutability: one policy mistake puts a secret in the object store for good, whereas a
+snapshot dir can simply delete a file.
+
+**Secret management reference: [age](https://github.com/FiloSottile/age).** If
+secret-class data ever needs to be *stored* rather than excluded — e.g. to harden the
+bare-repo variant against policy mistakes, or to back up the base — the reference tool
+is age: small explicit X25519 keys, no config, and a maintained Rust implementation
+([rage](https://github.com/str4d/rage), `age` crate) so pall8t could encrypt in-process
+without a new binary dependency. The identity key would live host-side outside every
+store, instances receive plaintext only at fork, and stores only ever see ciphertext
+(this is also exactly how chezmoi handles secrets-in-state, table D). Note age addresses
+*secrets at rest* only — collisions 2–4 above stand regardless — so the baseline design
+remains exclude-by-policy, with age as the upgrade path if storing encrypted secrets
+ever becomes a requirement.
+
 ## Sources
 
 - [Overlay Filesystem — kernel docs](https://docs.kernel.org/filesystems/overlayfs.html) (upper-layer xattr/whiteout requirements)
 - [OverlayFS over virtio-fs upper layer since Linux 5.7 — Phoronix](https://www.phoronix.com/news/OverlayFS-Linux-5.7)
 - [kata-dev: virtio-fs as overlayfs upper layer](https://lists.katacontainers.io/archives/list/kata-dev@lists.katacontainers.io/thread/XTN3SQQ3SDKUPCPINIZAA3YGJ7ST6AAN/) (xattr/CAP_SYS_ADMIN limitations in practice)
 - [rust-lang/libc: macOS clonefile bindings](https://github.com/rust-lang/libc)
+- [age — simple, modern file encryption](https://github.com/FiloSottile/age); [rage — Rust implementation with the `age` library crate](https://github.com/str4d/rage)
