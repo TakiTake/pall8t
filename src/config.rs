@@ -53,11 +53,17 @@ struct RawRun {
     command: Option<Vec<String>>,
 }
 
-pub fn global_path() -> Result<PathBuf> {
+/// `~/.pall8t` — the root under which everything pall8t owns lives
+/// (config, container home, default Containerfile, reference-repo
+/// clones). The single place that knows the app-dir location.
+pub(crate) fn pall8t_root() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("cannot determine home directory")?
-        .join(".pall8t")
-        .join("config.toml"))
+        .join(".pall8t"))
+}
+
+pub fn global_path() -> Result<PathBuf> {
+    Ok(pall8t_root()?.join("config.toml"))
 }
 
 fn read_raw(path: &Path) -> Result<Option<Raw>> {

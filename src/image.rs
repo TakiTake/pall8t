@@ -65,25 +65,19 @@ pub fn resolve(cwd: &Path, cfg: &Config, uid: u32, gid: u32) -> Result<ResolvedI
 /// which the path transiently has nothing readable behind it — a run
 /// racing that window should wait it out, not hard-fail.
 fn hash_with_retry(containerfile: &Path) -> Option<String> {
-    for _ in 0..4 {
+    for attempt in 0..5 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         if let Some(h) = container::containerfile_content_hash(containerfile) {
             return Some(h);
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    container::containerfile_content_hash(containerfile)
+    None
 }
 
 fn project_base(cwd: &Path) -> String {
-    let name = cwd
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "workspace".to_string());
-    format!(
-        "pall8t-{}-{}",
-        repos::slug(&name),
-        container::sha256_hex_prefix(cwd.to_string_lossy().as_bytes(), 4)
-    )
+    format!("pall8t-{}", repos::path_key(cwd))
 }
 
 /// Resolves and, if no image for the current Containerfile content exists,
@@ -136,17 +130,13 @@ enum BuildAttempt {
 /// images any existing container currently runs (parallel `pall8t run`s
 /// may still be on an older tag).
 fn try_build(resolved: &ResolvedImage, uid: u32, gid: u32) -> Result<BuildAttempt> {
-    let ctx_dir = resolved
-        .containerfile
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let ctx_dir = resolved.containerfile.parent().unwrap_or(Path::new("."));
     eprintln!(
         "pall8t: building {} from {} (this can take a few minutes)…",
         resolved.tag,
         resolved.containerfile.display()
     );
-    container::build_image(&resolved.containerfile, &ctx_dir, &resolved.tag, uid, gid)?;
+    container::build_image(&resolved.containerfile, ctx_dir, &resolved.tag, uid, gid)?;
 
     match container::containerfile_content_hash(&resolved.containerfile) {
         Some(fresh) if fresh != resolved.hash => {
@@ -176,7 +166,7 @@ fn try_build(resolved: &ResolvedImage, uid: u32, gid: u32) -> Result<BuildAttemp
 /// the instruction to rebuild once the container is gone.
 fn delete_poisoned(tag: &str) {
     let in_use = match in_use_refs() {
-        Some(refs) => refs.iter().any(|r| container::ref_matches(r, tag)),
+        Some(refs) => container::in_use_contains(&refs, tag),
         None => true, // indeterminate — same safe posture as pruning
     };
     if in_use {
@@ -192,15 +182,16 @@ fn delete_poisoned(tag: &str) {
     }
 }
 
-/// Image references every existing container currently runs. `None` when
-/// they can't all be determined (a transient list/inspect failure) — the
-/// caller must then skip pruning rather than risk deleting an image out
-/// from under a live container.
+/// Image references every existing container currently runs, from one
+/// `container list`. `None` when they can't all be determined (the list
+/// failed, or an entry carried no reference) — the caller must then skip
+/// pruning rather than risk deleting an image out from under a live
+/// container.
 fn in_use_refs() -> Option<Vec<String>> {
-    let containers = container::list_all().ok()?;
-    containers
+    container::list_all()
+        .ok()?
         .into_iter()
-        .map(|(name, _)| container::image_ref(&name))
+        .map(|c| c.image)
         .collect()
 }
 

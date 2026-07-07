@@ -13,26 +13,17 @@ pub fn main_git_dir(dir: &Path) -> Option<PathBuf> {
         return None;
     }
     // Pointer file format: `gitdir: <path>` where <path> is the worktree's
-    // private dir, `<main>/.git/worktrees/<name>`.
+    // private dir, `<main>/.git/worktrees/<name>`. Both paths here can be
+    // absolute or relative — `Path::join` handles both, replacing rather
+    // than appending when the operand is absolute.
     let text = std::fs::read_to_string(&dotgit).ok()?;
-    let gitdir = text.strip_prefix("gitdir:")?.trim();
-    let gitdir = resolve(dir, Path::new(gitdir));
+    let gitdir = dir.join(text.strip_prefix("gitdir:")?.trim());
     // That dir's `commondir` file points (usually relatively, `../..`) at
     // the main repository's common `.git`. Reading it, rather than
     // string-stripping `worktrees/<name>`, matches how git itself resolves
     // the common dir.
     let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
-    resolve(&gitdir, Path::new(common.trim()))
-        .canonicalize()
-        .ok()
-}
-
-fn resolve(base: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    }
+    gitdir.join(common.trim()).canonicalize().ok()
 }
 
 #[cfg(test)]

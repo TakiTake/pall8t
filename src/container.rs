@@ -21,12 +21,8 @@ impl State {
 }
 
 pub fn host_ids() -> (u32, u32) {
-    (read_id("-u").unwrap_or(501), read_id("-g").unwrap_or(20))
-}
-
-fn read_id(flag: &str) -> Option<u32> {
-    let out = Command::new("id").arg(flag).output().ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    // SAFETY: getuid/getgid cannot fail and have no preconditions.
+    unsafe { (libc::getuid(), libc::getgid()) }
 }
 
 /// First `n` bytes of `bytes`'s sha256 digest, as lowercase hex (`2*n`
@@ -42,19 +38,13 @@ pub(crate) fn sha256_hex_prefix(bytes: &[u8], n: usize) -> String {
         .collect()
 }
 
-/// pall8t-<slug(cwd basename)>-<sha256(cwd)[..8]>-<pid>. The cwd hash keys
-/// the name to the workspace; the pid keeps parallel runs from the same
-/// directory from colliding on `--name`.
+/// pall8t-<path key of cwd>-<pid> (see [`crate::repos::path_key`]). The
+/// pid keeps parallel runs from the same directory from colliding on
+/// `--name`.
 pub fn run_name(workspace: &Path) -> String {
-    let base = workspace
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "workspace".to_string());
-    let hex = sha256_hex_prefix(workspace.to_string_lossy().as_bytes(), 4);
     format!(
-        "pall8t-{}-{}-{}",
-        crate::repos::slug(&base),
-        hex,
+        "pall8t-{}-{}",
+        crate::repos::path_key(workspace),
         std::process::id()
     )
 }
@@ -87,30 +77,27 @@ where
     S: Into<String>,
 {
     let argv: Vec<String> = args.into_iter().map(Into::into).collect();
-    let out = Command::new("container")
-        .args(&argv)
-        .output()
-        .with_context(|| format!("failed to run: container {}", argv.join(" ")))?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "`container {}` failed: {}",
-            argv.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    crate::util::run_ok("container", &argv)
 }
 
-pub fn cli_available() -> bool {
-    Command::new("container").arg("--version").output().is_ok()
+pub enum SystemStatus {
+    Running,
+    Stopped,
+    /// The `container` CLI itself couldn't be spawned.
+    CliMissing,
 }
 
-pub fn system_running() -> bool {
-    Command::new("container")
+/// One `container system status` probe. A spawn failure doubles as the
+/// missing-CLI check, so the happy path costs a single subprocess.
+pub fn system_status() -> SystemStatus {
+    match Command::new("container")
         .args(["system", "status"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    {
+        Ok(out) if out.status.success() => SystemStatus::Running,
+        Ok(_) => SystemStatus::Stopped,
+        Err(_) => SystemStatus::CliMissing,
+    }
 }
 
 /// Starts the apple/container system service (`container system start`),
@@ -126,9 +113,18 @@ pub fn system_start() -> Result<()> {
     Ok(())
 }
 
+/// One row of `container list --all`.
+pub struct ContainerInfo {
+    pub name: String,
+    pub state: State,
+    /// Image reference the container was created from, when the listing
+    /// carries it.
+    pub image: Option<String>,
+}
+
 /// All containers: `container list --all --format json`.
 /// Parsed defensively (schema is pre-1.0, see ADR-0001).
-pub fn list_all() -> Result<Vec<(String, State)>> {
+pub fn list_all() -> Result<Vec<ContainerInfo>> {
     let stdout = run_ok(["list", "--all", "--format", "json"])?;
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -147,13 +143,21 @@ pub fn list_all() -> Result<Vec<(String, State)>> {
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let image = item
+                .pointer("/configuration/image/reference")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             if let Some(name) = name {
                 let state = if status.eq_ignore_ascii_case("running") {
                     State::Running
                 } else {
                     State::Stopped
                 };
-                items.push((name.to_string(), state));
+                items.push(ContainerInfo {
+                    name: name.to_string(),
+                    state,
+                    image,
+                });
             }
         }
     }
@@ -162,10 +166,10 @@ pub fn list_all() -> Result<Vec<(String, State)>> {
 
 /// Containers started by pall8t (names carry the `pall8t-` prefix, see
 /// [`run_name`]).
-pub fn list_pall8t() -> Result<Vec<(String, State)>> {
+pub fn list_pall8t() -> Result<Vec<ContainerInfo>> {
     Ok(list_all()?
         .into_iter()
-        .filter(|(name, _)| name.starts_with("pall8t-"))
+        .filter(|c| c.name.starts_with("pall8t-"))
         .collect())
 }
 
@@ -248,6 +252,18 @@ pub(crate) fn ref_has_prefix(s: &str, prefix: &str) -> bool {
     normalize_ref(s).starts_with(prefix)
 }
 
+/// True if `candidate` refers to the same image as any entry of `in_use`.
+/// Normalized comparison (see [`normalize_ref`]) — sound here because both
+/// sides only ever come from this crate's own builds and listings, never a
+/// caller-supplied cross-registry reference. The one in-use predicate,
+/// shared by pruning and poisoned-tag deletion so their matching can't
+/// drift.
+pub(crate) fn in_use_contains(in_use: &[String], candidate: &str) -> bool {
+    in_use
+        .iter()
+        .any(|u| normalize_ref(candidate) == normalize_ref(u))
+}
+
 /// True if `s` is an image reference for `base` scoped to `uid`-`gid`:
 /// either the unsuffixed fallback tag (`base:uid-gid`) or a hash-suffixed
 /// variant (`base:uid-gid-<hash>`), matched per [`ref_matches`]/
@@ -324,7 +340,7 @@ fn filter_prunable<'a>(
         if !should_prune(s, keep_tag, base, uid, gid) {
             continue;
         }
-        if in_use.iter().any(|u| normalize_ref(s) == normalize_ref(u)) {
+        if in_use_contains(in_use, s) {
             continue;
         }
         if seen.insert(normalize_ref(s).to_string()) {
@@ -490,11 +506,6 @@ fn inspect_str(name: &str, pointer: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Image reference a container was created from (via `container inspect`).
-pub fn image_ref(name: &str) -> Option<String> {
-    inspect_str(name, "/0/configuration/image/reference")
-}
-
 /// Initial working directory a container was created with (via `container
 /// inspect`) — for `pall8t run` containers, the workspace it mounted.
 pub fn workdir(name: &str) -> Option<String> {
@@ -503,20 +514,14 @@ pub fn workdir(name: &str) -> Option<String> {
 
 /// Persistent container-side $HOME (claude auth, shell history, dotfiles).
 pub fn home_mount() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .context("cannot determine home directory")?
-        .join(".pall8t")
-        .join("home");
+    let home = crate::config::pall8t_root()?.join("home");
     std::fs::create_dir_all(&home)?;
     Ok(home)
 }
 
 /// Where the default Containerfile lives: ~/.pall8t/Containerfile.
 pub fn default_containerfile_location() -> Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .context("cannot determine home directory")?
-        .join(".pall8t")
-        .join("Containerfile"))
+    Ok(crate::config::pall8t_root()?.join("Containerfile"))
 }
 
 /// Materializes the embedded default Containerfile at
@@ -526,12 +531,7 @@ pub fn default_containerfile_location() -> Result<PathBuf> {
 /// re-materialize the current default).
 pub fn default_containerfile_path() -> Result<PathBuf> {
     let path = default_containerfile_location()?;
-    if !path.exists() {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&path, DEFAULT_CONTAINERFILE)?;
-    }
+    crate::util::ensure_file(&path, DEFAULT_CONTAINERFILE)?;
     Ok(path)
 }
 

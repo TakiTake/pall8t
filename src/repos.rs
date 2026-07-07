@@ -1,7 +1,6 @@
 use crate::config::RepoEntry;
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub fn expand_tilde(path: &Path) -> PathBuf {
     if let Ok(rest) = path.strip_prefix("~") {
@@ -26,19 +25,25 @@ pub fn slug(name: &str) -> String {
     }
 }
 
+/// Stable short key for a path: `<slug(basename)>-<sha256(path)[..8hex]>`.
+/// The hash keeps two paths sharing a basename distinct; the slug keeps
+/// the key readable. Shared by container names, image tag bases, and
+/// reference-repo clone dirs so the derivation can't drift between them.
+pub(crate) fn path_key(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".to_string());
+    format!(
+        "{}-{}",
+        slug(&name),
+        crate::container::sha256_hex_prefix(path.to_string_lossy().as_bytes(), 4)
+    )
+}
+
 fn git(args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run: git {}", args.join(" ")))?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "`git {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    crate::util::run_ok("git", &argv)
 }
 
 /// A prepared reference repository: `clone` (under `~/.pall8t/repos`) is
@@ -53,10 +58,7 @@ pub struct RepoMount {
 
 /// Root under which reference-repo clones live.
 fn clones_root() -> Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .context("cannot determine home directory")?
-        .join(".pall8t")
-        .join("repos"))
+    Ok(crate::config::pall8t_root()?.join("repos"))
 }
 
 /// True if one path is the other or an ancestor of it — i.e. a mount at
@@ -101,17 +103,10 @@ pub fn prepare(entries: &[RepoEntry], protected: &[PathBuf]) -> Result<Vec<RepoM
         if !source.join(".git").exists() {
             return Err(anyhow!("not a git repo: {}", source.display()));
         }
-        let name = source
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .ok_or_else(|| anyhow!("bad repo path: {}", source.display()))?;
-        // Keyed by the source path, so distinct sources sharing a basename
-        // get distinct clones and the mapping is stable across runs.
-        let clone = root.join(format!(
-            "{}-{}",
-            slug(&name),
-            crate::container::sha256_hex_prefix(source.to_string_lossy().as_bytes(), 4)
-        ));
+        // Keyed by the source path (see [`path_key`]), so distinct sources
+        // sharing a basename get distinct clones and the mapping is stable
+        // across runs.
+        let clone = root.join(path_key(&source));
         if !clone.exists() {
             // Clone into a temp dir and rename into place only once fully
             // configured: a failure/kill mid-setup must not leave a clone
