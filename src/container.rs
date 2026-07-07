@@ -7,17 +7,15 @@ pub const DEFAULT_CONTAINERFILE: &str = include_str!("../Containerfile");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    Absent,
     Stopped,
     Running,
 }
 
 impl State {
-    pub fn label(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
-            State::Running => "●",
-            State::Stopped => "○",
-            State::Absent => "·",
+            State::Running => "running",
+            State::Stopped => "stopped",
         }
     }
 }
@@ -44,10 +42,21 @@ pub(crate) fn sha256_hex_prefix(bytes: &[u8], n: usize) -> String {
         .collect()
 }
 
-/// pall8t-<slug(project)>-<sha256(workspace path)[..8]>
-pub fn container_name(project_name: &str, workspace: &Path) -> String {
+/// pall8t-<slug(cwd basename)>-<sha256(cwd)[..8]>-<pid>. The cwd hash keys
+/// the name to the workspace; the pid keeps parallel runs from the same
+/// directory from colliding on `--name`.
+pub fn run_name(workspace: &Path) -> String {
+    let base = workspace
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".to_string());
     let hex = sha256_hex_prefix(workspace.to_string_lossy().as_bytes(), 4);
-    format!("pall8t-{}-{}", crate::workspace::slug(project_name), hex)
+    format!(
+        "pall8t-{}-{}-{}",
+        crate::repos::slug(&base),
+        hex,
+        std::process::id()
+    )
 }
 
 pub fn image_tag(base: &str, uid: u32, gid: u32) -> String {
@@ -104,7 +113,20 @@ pub fn system_running() -> bool {
         .unwrap_or(false)
 }
 
-/// Reconcile source of truth: `container list --all --format json`.
+/// Starts the apple/container system service (`container system start`),
+/// inheriting stdio so its progress is visible.
+pub fn system_start() -> Result<()> {
+    let status = Command::new("container")
+        .args(["system", "start"])
+        .status()
+        .context("failed to run: container system start")?;
+    if !status.success() {
+        return Err(anyhow!("`container system start` failed"));
+    }
+    Ok(())
+}
+
+/// All containers: `container list --all --format json`.
 /// Parsed defensively (schema is pre-1.0, see ADR-0001).
 pub fn list_all() -> Result<Vec<(String, State)>> {
     let stdout = run_ok(["list", "--all", "--format", "json"])?;
@@ -136,6 +158,15 @@ pub fn list_all() -> Result<Vec<(String, State)>> {
         }
     }
     Ok(items)
+}
+
+/// Containers started by pall8t (names carry the `pall8t-` prefix, see
+/// [`run_name`]).
+pub fn list_pall8t() -> Result<Vec<(String, State)>> {
+    Ok(list_all()?
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("pall8t-"))
+        .collect())
 }
 
 /// Strips the digest suffix from a reference: a reference contains at most
@@ -179,11 +210,8 @@ fn normalize_ref(s: &str) -> &str {
 /// tail of the other at a `/` boundary — e.g. a bare `postgres:16` matches
 /// `docker.io/library/postgres:16`, since that's how `container inspect`
 /// can report a reference that was configured or built bare — while still
-/// rejecting a differently-registried qualification. `tag` needs this
-/// treatment (not just `s`) because it isn't always bare: an explicit
-/// `image = "ghcr.io/org/tool:1"` config carries its qualification
-/// straight into `resolved.tag` (see `resolve_image`/`ensure_running`).
-/// The boundary requirement also keeps hash-suffixed tags safe: with
+/// rejecting a differently-registried qualification. The boundary
+/// requirement also keeps hash-suffixed tags safe: with
 /// `pall8t-x:501-20` vs. a differently-hashed sibling
 /// `pall8t-x:501-20-abc123456789`, the shorter is a plain substring but
 /// not a `/`-bounded suffix of the longer, so they correctly don't match
@@ -274,13 +302,12 @@ pub fn image_exists(tag: &str) -> bool {
 /// Pure filter+dedup core of [`prunable_images`], factored out for
 /// testability. From a flat list of reference strings, returns the ones
 /// that pruning should delete: owned by `base`/`uid`/`gid`, not `keep_tag`
-/// (the tag just built), and not `in_use` (typically the image `ctx`'s
-/// container currently runs, if any — deleting it out from under a
-/// live/stopped container would break it) — see [`should_prune`]. All
-/// comparisons are qualification/digest-aware (see [`ref_matches`] and
-/// [`normalize_ref`]). Deduped by normalized form: the CLI can expose
-/// the same image under multiple qualified spellings (e.g. `x:t` and
-/// `localhost/x:t`), and
+/// (the tag just built), and not in `in_use` (the images existing
+/// containers currently run — deleting one out from under a live/stopped
+/// container would break it) — see [`should_prune`]. All comparisons are
+/// qualification/digest-aware (see [`ref_matches`] and [`normalize_ref`]).
+/// Deduped by normalized form: the CLI can expose the same image under
+/// multiple qualified spellings (e.g. `x:t` and `localhost/x:t`), and
 /// calling `image_delete` on the same image twice under different
 /// spellings would report a spurious failure on the second attempt.
 fn filter_prunable<'a>(
@@ -289,7 +316,7 @@ fn filter_prunable<'a>(
     keep_tag: &str,
     uid: u32,
     gid: u32,
-    in_use: Option<&str>,
+    in_use: &[String],
 ) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -297,10 +324,8 @@ fn filter_prunable<'a>(
         if !should_prune(s, keep_tag, base, uid, gid) {
             continue;
         }
-        if let Some(in_use) = in_use {
-            if normalize_ref(s) == normalize_ref(in_use) {
-                continue;
-            }
+        if in_use.iter().any(|u| normalize_ref(s) == normalize_ref(u)) {
+            continue;
         }
         if seen.insert(normalize_ref(s).to_string()) {
             out.push(s.to_string());
@@ -318,7 +343,7 @@ pub fn prunable_images(
     keep_tag: &str,
     uid: u32,
     gid: u32,
-    in_use: Option<&str>,
+    in_use: &[String],
 ) -> Result<Vec<String>> {
     let stdout = run_ok(["image", "list", "--format", "json"])?;
     let trimmed = stdout.trim();
@@ -345,7 +370,13 @@ pub fn image_delete(tag: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn build_image(containerfile: &Path, ctx_dir: &Path, tag: &str, uid: u32, gid: u32) -> Result<()> {
+pub fn build_image(
+    containerfile: &Path,
+    ctx_dir: &Path,
+    tag: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
     run_ok([
         "build".to_string(),
         "-f".to_string(),
@@ -361,52 +392,88 @@ pub fn build_image(containerfile: &Path, ctx_dir: &Path, tag: &str, uid: u32, gi
     Ok(())
 }
 
+/// One `-v host:dest` bind mount of a [`RunSpec`].
+pub struct Mount {
+    pub host: PathBuf,
+    pub dest: PathBuf,
+}
+
+impl Mount {
+    /// Identity-path mount: `host` is visible at the same absolute path
+    /// inside the container, so git metadata and path references stay
+    /// valid on both sides (ADR-0004's insight, retained by ADR-0006).
+    pub fn identity(path: PathBuf) -> Self {
+        Mount {
+            host: path.clone(),
+            dest: path,
+        }
+    }
+}
+
 pub struct RunSpec {
     pub name: String,
-    pub workspace: PathBuf,
     pub image: String,
+    pub workdir: PathBuf,
+    pub mounts: Vec<Mount>,
     pub cpus: u32,
     pub memory: String,
     pub uid: u32,
     pub gid: u32,
+    /// Allocate a TTY (`-t`). Callers pass whether their stdin is a
+    /// terminal: apple/container 1.0.0 fails outright when `-t` is
+    /// requested without one, which would break scripted callers.
+    pub tty: bool,
+    pub command: Vec<String>,
 }
 
-/// Identity-path mount: the workspace is visible at the same absolute path
-/// inside the container (ADR-0004).
-pub fn run_detached(spec: &RunSpec) -> Result<()> {
-    let home = home_mount()?;
-    let ws = spec.workspace.to_string_lossy().into_owned();
-    run_ok([
-        "run".to_string(),
-        "-d".to_string(),
-        "--name".to_string(),
-        spec.name.clone(),
-        "-v".to_string(),
-        format!("{ws}:{ws}"),
-        "-v".to_string(),
-        format!("{}:/home/dev", home.display()),
-        "-w".to_string(),
-        ws.clone(),
-        "--user".to_string(),
-        "dev".to_string(),
-        "--uid".to_string(),
+/// argv (after `container`) for the foreground run: interactive (TTY when
+/// the caller has one, see [`RunSpec::tty`]), removed on exit — session
+/// lifetime equals process lifetime (ADR-0006).
+pub fn run_argv(spec: &RunSpec) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["run".into(), "-i".into()];
+    if spec.tty {
+        argv.push("-t".into());
+    }
+    argv.extend(["--rm".into(), "--name".into(), spec.name.clone()]);
+    for m in &spec.mounts {
+        argv.push("-v".into());
+        argv.push(format!("{}:{}", m.host.display(), m.dest.display()));
+    }
+    argv.extend([
+        "-w".into(),
+        spec.workdir.to_string_lossy().into_owned(),
+        "--user".into(),
+        "dev".into(),
+        "--uid".into(),
         spec.uid.to_string(),
-        "--gid".to_string(),
+        "--gid".into(),
         spec.gid.to_string(),
-        "--cpus".to_string(),
+        "--cpus".into(),
         spec.cpus.to_string(),
-        "--memory".to_string(),
+        "--memory".into(),
         spec.memory.clone(),
         spec.image.clone(),
-        "sleep".to_string(),
-        "infinity".to_string(),
-    ])?;
-    Ok(())
+    ]);
+    argv.extend(spec.command.iter().cloned());
+    argv
 }
 
-pub fn start(name: &str) -> Result<()> {
-    run_ok(["start", name])?;
-    Ok(())
+/// argv (after `container`) for `pall8t exec`: a command inside a running
+/// container (all pall8t containers have the `dev` user). `tty` follows
+/// the same rule as [`RunSpec::tty`]. `workdir` — the directory the
+/// container was created with (see [`workdir`]) — anchors the command to
+/// the workspace instead of the image WORKDIR; omitted when unknown.
+pub fn exec_argv(name: &str, cmd: &[String], tty: bool, workdir: Option<&str>) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["exec".into(), "-i".into()];
+    if tty {
+        argv.push("-t".into());
+    }
+    if let Some(w) = workdir {
+        argv.extend(["-w".into(), w.to_string()]);
+    }
+    argv.extend(["--user".into(), "dev".into(), name.to_string()]);
+    argv.extend(cmd.iter().cloned());
+    argv
 }
 
 pub fn stop(name: &str) -> Result<()> {
@@ -414,39 +481,24 @@ pub fn stop(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn delete(name: &str) -> Result<()> {
-    run_ok(["delete", name])?;
-    Ok(())
-}
-
-pub fn logs(name: &str) -> Result<String> {
-    run_ok(["logs", name])
-}
-
-/// Image reference a container was created from (via `container inspect`).
-pub fn image_ref(name: &str) -> Option<String> {
+/// One string field out of `container inspect <name>` by JSON pointer.
+fn inspect_str(name: &str, pointer: &str) -> Option<String> {
     let out = run_ok(["inspect", name]).ok()?;
     let v: Value = serde_json::from_str(out.trim()).ok()?;
-    v.pointer("/0/configuration/image/reference")
+    v.pointer(pointer)
         .and_then(Value::as_str)
         .map(str::to_string)
 }
 
-/// argv for a tab's PTY child: exec into the project container at the
-/// workspace path. pall8t itself runs with a full PATH, so bare `container`
-/// resolves here (unlike v1's external tabs).
-pub fn exec_argv(name: &str, workspace: &Path, cmd: &[String]) -> Vec<String> {
-    let mut argv: Vec<String> = vec![
-        "exec".into(),
-        "-it".into(),
-        "--user".into(),
-        "dev".into(),
-        "-w".into(),
-        workspace.to_string_lossy().into_owned(),
-        name.to_string(),
-    ];
-    argv.extend(cmd.iter().cloned());
-    argv
+/// Image reference a container was created from (via `container inspect`).
+pub fn image_ref(name: &str) -> Option<String> {
+    inspect_str(name, "/0/configuration/image/reference")
+}
+
+/// Initial working directory a container was created with (via `container
+/// inspect`) — for `pall8t run` containers, the workspace it mounted.
+pub fn workdir(name: &str) -> Option<String> {
+    inspect_str(name, "/0/configuration/initProcess/workingDirectory")
 }
 
 /// Persistent container-side $HOME (claude auth, shell history, dotfiles).
@@ -459,14 +511,27 @@ pub fn home_mount() -> Result<PathBuf> {
     Ok(home)
 }
 
-/// Writes the embedded default Containerfile to ~/.pall8t/Containerfile.
-pub fn default_containerfile_path() -> Result<PathBuf> {
-    let dir = dirs::home_dir()
+/// Where the default Containerfile lives: ~/.pall8t/Containerfile.
+pub fn default_containerfile_location() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
         .context("cannot determine home directory")?
-        .join(".pall8t");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("Containerfile");
-    std::fs::write(&path, DEFAULT_CONTAINERFILE)?;
+        .join(".pall8t")
+        .join("Containerfile"))
+}
+
+/// Materializes the embedded default Containerfile at
+/// ~/.pall8t/Containerfile if it doesn't exist yet. An existing file is
+/// left untouched — it's the user's to edit (a shipped update to the
+/// embedded default therefore doesn't propagate to it; delete the file to
+/// re-materialize the current default).
+pub fn default_containerfile_path() -> Result<PathBuf> {
+    let path = default_containerfile_location()?;
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, DEFAULT_CONTAINERFILE)?;
+    }
     Ok(path)
 }
 
@@ -521,9 +586,6 @@ mod tests {
             "501-2 must not match 501-20"
         );
 
-        // `tag` itself can be qualified — e.g. an explicit `image =
-        // "ghcr.io/org/tool:1"` config carries its qualification straight
-        // into `resolved.tag`.
         let qualified_tag = "ghcr.io/org/tool:1";
         assert!(
             ref_matches("ghcr.io/org/tool:1", qualified_tag),
@@ -551,25 +613,17 @@ mod tests {
             "bare tag matches its registry- and digest-qualified inspect ref"
         );
         // ...but two DIFFERENT registries/namespaces for the same bare
-        // name:tag must not collapse into a match, or switching an
-        // explicit `image` config between registries would go undetected.
+        // name:tag must not collapse into a match.
         assert!(
             !ref_matches("ghcr.io/myorg/postgres:16", "docker.io/library/postgres:16"),
             "different registries for the same name:tag must not match"
         );
-        // The `/`-boundary requirement, not a plain substring/suffix
-        // check, is what makes that rejection correct in general.
         assert!(
             !ref_matches("xpostgres:16", "postgres:16"),
             "a same-suffix-but-no-slash-boundary string must not match"
         );
 
-        // Pins the inherent limitation documented on `ref_matches`: a bare
-        // ref is a legitimate `/`-suffix of ANY qualification of the same
-        // name:tag, so switching the config to a different registry while
-        // `container inspect` still reports the old, bare ref goes
-        // undetected. Accepted, not fixable without breaking the
-        // bare-tag-matches-its-own-qualification case above.
+        // Pins the inherent limitation documented on `ref_matches`.
         assert!(
             ref_matches("postgres:16", "ghcr.io/myorg/postgres:16"),
             "inherent limitation: a bare ref matches any qualification of the same name:tag"
@@ -628,13 +682,7 @@ mod tests {
             "registry-qualified form of keep_tag must not be pruned"
         );
         assert!(
-            should_prune(
-                "pall8t-x:501-20-oldhash654321",
-                keep_tag,
-                base,
-                501,
-                20
-            ),
+            should_prune("pall8t-x:501-20-oldhash654321", keep_tag, base, 501, 20),
             "a differently-hashed sibling must be pruned"
         );
         assert!(
@@ -686,17 +734,113 @@ mod tests {
             "pall8t-x:501-2-oldhash654321", // different gid — not ours to prune
         ];
 
-        let pruned = filter_prunable(refs.iter().copied(), base, keep_tag, 501, 20, None);
+        let pruned = filter_prunable(refs.iter().copied(), base, keep_tag, 501, 20, &[]);
         assert_eq!(
             pruned,
             vec![old.to_string()],
             "keeps keep_tag and the other gid's image, dedupes the qualified duplicate"
         );
 
-        let none_in_use = filter_prunable(refs.iter().copied(), base, keep_tag, 501, 20, Some(old));
+        let none_in_use = filter_prunable(
+            refs.iter().copied(),
+            base,
+            keep_tag,
+            501,
+            20,
+            &[old.to_string()],
+        );
         assert!(
             none_in_use.is_empty(),
-            "an in_use image must not be pruned even if it's a superseded sibling"
+            "an in-use image must not be pruned even if it's a superseded sibling"
+        );
+
+        let qualified_in_use = filter_prunable(
+            refs.iter().copied(),
+            base,
+            keep_tag,
+            501,
+            20,
+            &[format!("localhost/{old}@sha256:deadbeef")],
+        );
+        assert!(
+            qualified_in_use.is_empty(),
+            "in-use matching must be qualification/digest-aware"
+        );
+    }
+
+    #[test]
+    fn run_argv_shape() {
+        let spec = RunSpec {
+            name: "pall8t-x-abc12345-99".into(),
+            image: "pall8t-x:501-20-abc123456789".into(),
+            workdir: PathBuf::from("/Users/me/src/x"),
+            mounts: vec![
+                Mount::identity(PathBuf::from("/Users/me/src/x")),
+                Mount {
+                    host: PathBuf::from("/Users/me/.pall8t/home"),
+                    dest: PathBuf::from("/home/dev"),
+                },
+            ],
+            cpus: 4,
+            memory: "8g".into(),
+            uid: 501,
+            gid: 20,
+            tty: true,
+            command: vec!["claude".into()],
+        };
+        let argv = run_argv(&spec);
+        assert_eq!(argv[0], "run");
+        assert!(argv.contains(&"-i".to_string()));
+        assert!(argv.contains(&"-t".to_string()), "tty: true requests -t");
+        assert!(argv.contains(&"--rm".to_string()));
+        assert!(argv.contains(&"/Users/me/src/x:/Users/me/src/x".to_string()));
+        assert!(argv.contains(&"/Users/me/.pall8t/home:/home/dev".to_string()));
+        assert_eq!(
+            argv.last(),
+            Some(&"claude".to_string()),
+            "the command comes after the image"
+        );
+        let image_pos = argv
+            .iter()
+            .position(|a| a == "pall8t-x:501-20-abc123456789")
+            .unwrap();
+        assert_eq!(image_pos, argv.len() - 2);
+
+        let scripted = run_argv(&RunSpec { tty: false, ..spec });
+        assert!(
+            !scripted.contains(&"-t".to_string()),
+            "no -t without a terminal — apple/container 1.0.0 fails on -t sans TTY"
+        );
+        assert!(scripted.contains(&"-i".to_string()));
+    }
+
+    #[test]
+    fn exec_argv_shape() {
+        let cmd = vec!["git".to_string(), "status".to_string()];
+
+        let tty = exec_argv("pall8t-x-abc12345-99", &cmd, true, Some("/Users/me/src/x"));
+        assert_eq!(tty[0], "exec");
+        assert!(tty.contains(&"-i".to_string()));
+        assert!(tty.contains(&"-t".to_string()));
+        let w = tty.iter().position(|a| a == "-w").unwrap();
+        assert_eq!(tty[w + 1], "/Users/me/src/x");
+        assert_eq!(tty.last(), Some(&"status".to_string()));
+        assert_eq!(
+            tty.iter()
+                .position(|a| a == "pall8t-x-abc12345-99")
+                .unwrap(),
+            tty.len() - 3,
+            "the command follows the container name"
+        );
+
+        let scripted = exec_argv("pall8t-x-abc12345-99", &cmd, false, None);
+        assert!(
+            !scripted.contains(&"-t".to_string()),
+            "no -t without a terminal"
+        );
+        assert!(
+            !scripted.contains(&"-w".to_string()),
+            "unknown workdir is omitted"
         );
     }
 

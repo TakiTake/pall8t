@@ -1,0 +1,6 @@
+# pall8t project config for developing pall8t itself: the root
+# Containerfile is the embedded default image (no Rust); the sandbox image
+# needs the Rust toolchain from .pall8t/Containerfile.
+
+[container]
+containerfile = ".pall8t/Containerfile"

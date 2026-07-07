@@ -1,10 +1,5 @@
-pub mod app;
 pub mod config;
 pub mod container;
-pub mod detect;
-pub mod holder;
-pub mod mux;
-pub mod proto;
-pub mod registry;
-pub mod ui;
-pub mod workspace;
+pub mod image;
+pub mod repos;
+pub mod worktree;

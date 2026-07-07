@@ -1,50 +1,34 @@
 ---
 name: pall8t
-description: How to work inside a pall8t workspace — the sandboxed apple/container environment this agent session runs in. Use when working in a directory containing repos/ and wt/, when asked to create git worktrees for a task, when developing pall8t itself, or when unsure about the sandbox layout, persistence, or git workflow.
+description: How to work inside a pall8t sandbox — the apple/container environment this agent session runs in. Use when the session runs inside a container launched by pall8t, when developing pall8t itself, or when unsure about the sandbox layout, persistence, mounts, or git behavior.
 ---
 
-# Working inside a pall8t workspace
+# Working inside a pall8t sandbox
 
-You are running inside a Linux VM (apple/container) launched by **pall8t**, an agent multiplexer on macOS. Your session is one tab; the human may be running several agent tabs in parallel, one per task.
+You are running inside a Linux VM (apple/container) launched by **pall8t**, a headless sandbox runner on macOS. Your session is a plain foreground process: when it exits, the container is removed. The human may run several sandboxes in parallel (via tmux/herdr), one per task.
 
 ## Environment facts
 
-- Your cwd is the **project workspace** — a host directory mounted at the **identical absolute path** inside this container. Everything under it **persists** across container restarts and is directly readable by the human's IDE on the host at the same path.
+- Your cwd is the **workspace** — the host directory `pall8t run` was invoked in, mounted at the **identical absolute path** inside this container. Everything under it persists on the host and is directly readable by the human's IDE at the same path.
 - Files you create are owned by the host user (your UID matches theirs). `sudo` works, but grants root only inside this VM.
-- You have no access to the host beyond this workspace and your `$HOME` (`/home/dev`, also persistent — your login state survives rebuilds).
+- Your `$HOME` is `/home/dev`, backed by the host's `~/.pall8t/home` — **persistent across runs and rebuilds** (login state, shell history, dotfiles) and **shared by all pall8t sandboxes**.
+- If the workspace is a git worktree, the main repository's `.git` is also mounted, so `git status`/`commit`/`diff` work exactly as on the host.
+- **Reference repos** (from `pall8t.toml [[repos]]`) appear at their usual host paths, but you are looking at a disposable `git clone --local` copy — writes never reach the original, and your changes there may be discarded.
 - The `container` CLI does **not** exist here; you are inside the container. Do not try to run pall8t or docker/container commands.
-
-## Workspace layout
-
-```
-<workspace>/
-  repos/<repo>/   seeded clone of each source repo — treat as the worktree parent
-  wt/             one git worktree per task — DO YOUR WORK HERE
-```
-
-## Git workflow (one worktree per task)
-
-1. Update the clone: `git -C repos/<repo> fetch origin`
-2. Cut a worktree for your task:
-   `git -C repos/<repo> worktree add ../../wt/<task>-<repo> -b <task-branch> origin/main`
-3. Work, commit, and push from `wt/<task>-<repo>` (`origin` points at the real upstream; credentials live in your persistent home).
-4. Keep the checkout in `repos/<repo>` clean — never commit or switch branches there directly.
-
-Tasks may span multiple repos: cut one worktree per repo, same branch name.
 
 ## Developing pall8t itself
 
-This repo ships `.pall8t/Containerfile`, so this container already has Rust (`cargo`, `clippy`, `rustfmt` at `/usr/local/cargo/bin`). Build checks:
+The pall8t repo's `pall8t.toml` points at `.pall8t/Containerfile`, so a sandbox launched in that repo already has Rust (`cargo`, `clippy`, `rustfmt` at `/usr/local/cargo/bin`). Build checks:
 
 ```sh
 cargo check
 cargo clippy -- -D warnings && cargo fmt --check
+cargo test
 ```
 
-(`mise` is not installed in the container; run cargo directly.) Design docs: `docs/design/DESIGN.md`, decisions in `docs/adr/`. Keep both updated when you change architecture-relevant behavior.
+(`mise` is not installed in the container; run cargo directly.) Requirements: `docs/requirements.md`; decisions in `docs/adr/`. Keep both updated when you change architecture-relevant behavior.
 
-## Being a good tab citizen
+## Being a good sandbox citizen
 
-- pall8t watches your screen: when you show an approval/input prompt, the human is notified and can jump to you (`^b n`). Just ask normally — no special protocol.
-- Long-running work is fine; your tab shows "working" while you produce output.
-- If the human closes your tab, this process ends but the workspace (and your commits) persist.
+- Session lifetime equals process lifetime: if your process is killed, the container is removed but the workspace (and your commits) persist.
+- Persistence and multiplexing live **outside** the sandbox (tmux/herdr on the host) — don't build workarounds for them inside.
