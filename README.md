@@ -61,7 +61,7 @@ command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
 source = "~/src/other-lib"   # the copy is mounted at this same path
 ```
 
-Containerfile resolution: explicit `containerfile` config → `./Containerfile` if present → the built-in default image (node + claude CLI; materialized once at `~/.pall8t/Containerfile` and never overwritten — edit it to customize the shared default, delete it to restore the shipped one). Custom toolchains must live outside `/home/dev` — the persistent home mount shadows it.
+Containerfile resolution: explicit `containerfile` config → `./Containerfile` if present → the built-in default image (node + claude CLI + gh; materialized once at `~/.pall8t/Containerfile` and never overwritten — edit it to customize the shared default, delete it to restore the shipped one). Custom toolchains must live outside `/home/dev` — the persistent home mount shadows it.
 
 The image tag embeds the Containerfile's content hash, so any edit — no commit required — triggers a rebuild on the next `run`, and superseded images are pruned automatically after a successful build (images still used by a running container are kept). Only the Containerfile itself is hashed, not files it `COPY`s in; use `pall8t build` to force a rebuild the hash can't see (e.g. updated base image or packages).
 
