@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # tmux ships for Claude Code's agent-teams split-pane display (README:
 # "Claude Code agent teams (split panes)"); keep the chrome minimal by default.
 RUN printf '%s\n' \
-      '# pall8t: keep the tmux chrome minimal inside agent tabs.' \
+      '# pall8t: keep the tmux chrome minimal inside agent sessions.' \
       '# Users can override in ~/.tmux.conf (persistent home).' \
       'set -g status off' \
       > /etc/tmux.conf

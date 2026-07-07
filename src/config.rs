@@ -1,155 +1,224 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Per-project config file name, looked up in the current directory.
+pub const PROJECT_FILE: &str = "pall8t.toml";
+
+/// Merged, fully-defaulted configuration for one invocation: the global
+/// `~/.pall8t/config.toml` overlaid by the project's `pall8t.toml`
+/// (requirements §5). Merging is per-field: a field the project file sets
+/// wins, one it omits falls through to the global file, then to the
+/// built-in default. `repos` is treated as one field — a project that
+/// declares any `[[repos]]` replaces the global list rather than
+/// appending to it, so a global convenience repo can't force itself into
+/// every project.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    #[serde(default = "default_image")]
-    pub default_image: String,
-    #[serde(default = "default_cpus")]
     pub cpus: u32,
-    #[serde(default = "default_memory")]
     pub memory: String,
-    #[serde(default = "default_workspace_root")]
-    pub workspace_root: PathBuf,
-    #[serde(default = "default_prefix")]
-    pub prefix: String,
-    #[serde(default = "default_notify")]
-    pub notify: String,
-    #[serde(default = "default_mouse")]
-    pub mouse: bool,
-    #[serde(default = "default_agent_command")]
-    pub agent_command: String,
-    #[serde(default)]
-    pub projects: Vec<ProjectEntry>,
-    #[serde(default)]
-    pub agents: HashMap<String, AgentPatternsConfig>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            default_image: default_image(),
-            cpus: default_cpus(),
-            memory: default_memory(),
-            workspace_root: default_workspace_root(),
-            prefix: default_prefix(),
-            notify: default_notify(),
-            mouse: default_mouse(),
-            agent_command: default_agent_command(),
-            projects: Vec::new(),
-            agents: HashMap::new(),
-        }
-    }
-}
-
-fn default_image() -> String {
-    "pall8t-base".to_string()
-}
-fn default_cpus() -> u32 {
-    4
-}
-fn default_memory() -> String {
-    "4G".to_string()
-}
-fn default_workspace_root() -> PathBuf {
-    PathBuf::from("~/.pall8t/workspaces")
-}
-fn default_prefix() -> String {
-    "ctrl+b".to_string()
-}
-fn default_notify() -> String {
-    "bell".to_string()
-}
-fn default_mouse() -> bool {
-    true
-}
-fn default_agent_command() -> String {
-    "claude".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectEntry {
-    pub name: String,
-    #[serde(default)]
-    pub repos: Vec<PathBuf>,
-    /// Legacy v1 field; migrated into `repos` by `load()`.
-    #[serde(default, skip_serializing)]
-    pub path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Explicit Containerfile path from config, if any. Resolution to the
+    /// file actually built (including the local/default probing when this
+    /// is `None`) happens in [`crate::image::resolve`].
     pub containerfile: Option<PathBuf>,
+    pub command: Vec<String>,
+    pub repos: Vec<RepoEntry>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AgentPatternsConfig {
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct RepoEntry {
+    /// Host path of a reference repository; duplicated via
+    /// `git clone --local` and the copy mounted at this path (FR-4).
+    pub source: PathBuf,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Raw {
     #[serde(default)]
-    pub waiting_patterns: Vec<String>,
+    container: RawContainer,
     #[serde(default)]
-    pub working_patterns: Vec<String>,
+    run: RawRun,
+    repos: Option<Vec<RepoEntry>>,
 }
 
-pub fn config_path() -> Result<PathBuf> {
-    // Deliberately ~/.config (not dirs::config_dir(), which is
-    // ~/Library/Application Support on macOS) — see DESIGN.md §8.
-    let base = dirs::home_dir()
-        .map(|h| h.join(".config"))
-        .context("cannot determine home directory")?;
-    Ok(base.join("pall8t").join("config.toml"))
+#[derive(Debug, Default, Deserialize)]
+struct RawContainer {
+    cpus: Option<u32>,
+    memory: Option<String>,
+    containerfile: Option<PathBuf>,
 }
 
-pub fn load() -> Result<Config> {
-    let path = config_path()?;
+#[derive(Debug, Default, Deserialize)]
+struct RawRun {
+    command: Option<Vec<String>>,
+}
+
+/// `~/.pall8t` — the root under which everything pall8t owns lives
+/// (config, container home, default Containerfile, reference-repo
+/// clones). The single place that knows the app-dir location.
+pub(crate) fn pall8t_root() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("cannot determine home directory")?
+        .join(".pall8t"))
+}
+
+pub fn global_path() -> Result<PathBuf> {
+    Ok(pall8t_root()?.join("config.toml"))
+}
+
+fn read_raw(path: &Path) -> Result<Option<Raw>> {
     if !path.exists() {
-        return Ok(Config::default());
+        return Ok(None);
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
-    let mut cfg: Config =
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let raw =
         toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
-    // v1 → v2 migration: `path = "..."` becomes `repos = ["..."]`.
-    for entry in &mut cfg.projects {
-        if entry.repos.is_empty() {
-            if let Some(p) = entry.path.take() {
-                entry.repos.push(p);
-            }
-        }
+    Ok(Some(raw))
+}
+
+/// Loads the merged config for a project rooted at `project_dir`.
+pub fn load(project_dir: &Path) -> Result<Config> {
+    let global = read_raw(&global_path()?)?.unwrap_or_default();
+    let project = read_raw(&project_dir.join(PROJECT_FILE))?.unwrap_or_default();
+    Ok(merge(global, project))
+}
+
+fn merge(global: Raw, project: Raw) -> Config {
+    Config {
+        cpus: project
+            .container
+            .cpus
+            .or(global.container.cpus)
+            .unwrap_or(4),
+        memory: project
+            .container
+            .memory
+            .or(global.container.memory)
+            .unwrap_or_else(|| "8g".to_string()),
+        containerfile: project
+            .container
+            .containerfile
+            .or(global.container.containerfile),
+        command: project
+            .run
+            .command
+            .or(global.run.command)
+            .unwrap_or_else(|| vec!["claude".to_string()]),
+        repos: project.repos.or(global.repos).unwrap_or_default(),
     }
-    Ok(cfg)
 }
 
-/// Lock → re-read → mutate → write (same lock as the tab registry), so
-/// concurrent pall8t instances never clobber each other's config edits
-/// (ADR-0005). Returns the post-mutation config.
-pub fn locked_mutate(f: impl FnOnce(&mut Config)) -> Result<Config> {
-    let _lock = crate::registry::Lock::acquire()?;
-    let mut cfg = load()?;
-    f(&mut cfg);
-    save(&cfg)?;
-    Ok(cfg)
-}
+/// Skeleton written by `pall8t init` as `~/.pall8t/config.toml`.
+pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project pall8t.toml overrides these
+# values field by field.
 
-/// mtime of config.toml, for cheap cross-instance change detection.
-pub fn mtime() -> Option<std::time::SystemTime> {
-    config_path().ok()?.metadata().ok()?.modified().ok()
-}
+[container]
+# cpus = 4
+# memory = "8g"
+# containerfile = "/absolute/path/to/Containerfile"
 
-pub fn save(cfg: &Config) -> Result<()> {
-    let path = config_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+[run]
+# Command run by `pall8t run`. --dangerously-skip-permissions is NOT in
+# the default; add it here explicitly if you want it.
+# command = ["claude"]
+
+# Reference repositories, duplicated via `git clone --local` and mounted
+# at their own path inside the container (writes hit the copy, never the
+# original).
+# [[repos]]
+# source = "~/src/other-lib"
+"#;
+
+/// Skeleton written by `pall8t init` as `./pall8t.toml`.
+pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set here override
+# ~/.pall8t/config.toml.
+
+[container]
+# cpus = 4
+# memory = "8g"
+# Containerfile used for this project's image. Default: ./Containerfile
+# if present, else the built-in default image.
+# containerfile = "Containerfile"
+
+[run]
+# command = ["claude"]
+
+# [[repos]]
+# source = "~/src/other-lib"
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> Raw {
+        toml::from_str(s).unwrap()
     }
-    let text = toml::to_string_pretty(cfg).context("cannot serialize config")?;
-    std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
-    Ok(())
-}
 
-/// Parse a prefix spec like "ctrl+b" into (char). Only ctrl+<char> is supported.
-pub fn parse_prefix(spec: &str) -> char {
-    spec.trim()
-        .strip_prefix("ctrl+")
-        .and_then(|s| s.chars().next())
-        .unwrap_or('b')
+    #[test]
+    fn defaults_when_both_empty() {
+        let cfg = merge(Raw::default(), Raw::default());
+        assert_eq!(cfg.cpus, 4);
+        assert_eq!(cfg.memory, "8g");
+        assert_eq!(cfg.containerfile, None);
+        assert_eq!(cfg.command, vec!["claude".to_string()]);
+        assert!(cfg.repos.is_empty());
+    }
+
+    #[test]
+    fn project_overrides_global_per_field() {
+        let global = parse(
+            r#"
+            [container]
+            cpus = 8
+            memory = "16g"
+            [run]
+            command = ["codex"]
+            "#,
+        );
+        let project = parse(
+            r#"
+            [container]
+            cpus = 2
+            "#,
+        );
+        let cfg = merge(global, project);
+        assert_eq!(cfg.cpus, 2, "project field wins");
+        assert_eq!(cfg.memory, "16g", "unset project field falls through");
+        assert_eq!(cfg.command, vec!["codex".to_string()]);
+    }
+
+    #[test]
+    fn project_repos_replace_global_repos() {
+        let global = parse("[[repos]]\nsource = \"~/src/a\"\n");
+        let project = parse("[[repos]]\nsource = \"~/src/b\"\n");
+        let cfg = merge(global, project);
+        assert_eq!(
+            cfg.repos,
+            vec![RepoEntry {
+                source: "~/src/b".into()
+            }]
+        );
+
+        let global = parse("[[repos]]\nsource = \"~/src/a\"\n");
+        let cfg = merge(global, Raw::default());
+        assert_eq!(
+            cfg.repos,
+            vec![RepoEntry {
+                source: "~/src/a".into()
+            }],
+            "global repos apply when the project declares none"
+        );
+    }
+
+    #[test]
+    fn skeletons_parse_and_yield_defaults() {
+        // The commented-out skeletons must stay valid TOML that changes
+        // nothing until the user uncomments a line.
+        let g: Raw = toml::from_str(GLOBAL_SKELETON).unwrap();
+        let p: Raw = toml::from_str(PROJECT_SKELETON).unwrap();
+        let cfg = merge(g, p);
+        assert_eq!(cfg, merge(Raw::default(), Raw::default()));
+    }
 }
