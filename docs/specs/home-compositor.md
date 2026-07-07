@@ -137,11 +137,13 @@ the data always flows back, and the merge is always optional.
 - `src/config.rs`: `[home]` section (`mode`, policy overrides, inbox TTL) in the
   existing two-layer merge — per-project opt-in comes for free.
 
-## Next step
+## Mechanics (evaluated)
 
-The module-vs-standalone question is decided (module). What remains to evaluate against
-this spec is the *mechanics*: `clonefile` vs. rsync vs. overlayfs-in-guest for FR-1, and
-git vs. hand-rolled snapshots as the FR-7 versioning engine — plus a look at how jj and
-chezmoi structure three-way merges for ideas worth borrowing (as building blocks, not
-dependencies). Expectation to test: `clonefile` + policy manifest + git-backed
-versioning inside `src/home.rs` is the realistic outcome.
+See [home-compositor-evaluation.md](home-compositor-evaluation.md) for the comparison
+tables (off-the-shelf tools vs. this spec, fork mechanics, versioning/merge engine).
+Verdicts: no off-the-shelf tool covers class-aware staging plus lazy harvest; FR-1 uses
+`clonefile(2)` (via the existing `libc` dependency) with a recursive-copy fallback for
+non-APFS; FR-7 uses clonefile snapshots + a manifest with stateless `git merge-file`
+for FR-4 text merges — **no VCS repository inside or beside the base**, since a `.git`
+in `$HOME` would be visible to every agent; overlayfs-in-guest is rejected as baseline
+(virtiofs upper-layer xattr support is not guaranteed by apple/container).
