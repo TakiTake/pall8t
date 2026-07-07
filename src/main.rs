@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use pall8t::{config, container, image, repos, worktree};
+use pall8t::{config, container, home, image, repos, worktree};
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -43,6 +43,34 @@ enum Cmd {
     },
     /// Stop a container
     Stop { id: String },
+    /// Inspect and fold back changes from isolated-home runs
+    Home {
+        #[command(subcommand)]
+        cmd: HomeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum HomeCmd {
+    /// Harvest finished isolated runs into the inbox (also runs lazily on
+    /// the next `pall8t run`)
+    Harvest,
+    /// List pending changesets awaiting promotion
+    Inbox,
+    /// Show what a run changed
+    Show { run: String },
+    /// Merge a run's changes (or selected paths) into the base home
+    Promote {
+        run: String,
+        /// Limit to these `$HOME`-relative paths (default: all)
+        paths: Vec<String>,
+    },
+    /// Discard a run's changeset (or selected paths)
+    Drop {
+        run: String,
+        /// Limit to these `$HOME`-relative paths (default: the whole run)
+        paths: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -53,6 +81,7 @@ fn main() -> Result<()> {
         Cmd::Ls { json } => cmd_ls(json),
         Cmd::Exec { id, command } => cmd_exec(&id, command),
         Cmd::Stop { id } => cmd_stop(&id),
+        Cmd::Home { cmd } => cmd_home(cmd),
     }
 }
 
@@ -109,6 +138,7 @@ fn exec_container(argv: Vec<String>) -> Result<()> {
 
 fn cmd_run(cli_command: Vec<String>) -> Result<()> {
     let (cwd, cfg, uid, gid, resolved) = workspace_image(false)?;
+    let run_name = container::run_name(&cwd);
 
     let mut mounts = vec![container::Mount::identity(cwd.clone())];
     if let Some(git_dir) = worktree::main_git_dir(&cwd) {
@@ -133,7 +163,7 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
         });
     }
     mounts.push(container::Mount {
-        host: container::home_mount()?,
+        host: home_for_run(&cfg, &run_name, &cwd)?,
         dest: "/home/dev".into(),
     });
 
@@ -143,7 +173,7 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
         cli_command
     };
     let spec = container::RunSpec {
-        name: container::run_name(&cwd),
+        name: run_name,
         image: resolved.tag,
         workdir: cwd,
         mounts,
@@ -203,6 +233,90 @@ fn cmd_stop(id: &str) -> Result<()> {
     container::stop(id)?;
     println!("stopped {id}");
     Ok(())
+}
+
+/// The host path to mount at `/home/dev`. `shared` mode is byte-for-byte
+/// today's behavior: the base home, unchanged. `isolated` mode first
+/// harvests any finished runs (lazy, FR-8), then forks a private instance
+/// for this run (FR-1).
+fn home_for_run(cfg: &config::Config, run_name: &str, cwd: &Path) -> Result<std::path::PathBuf> {
+    match cfg.home.mode {
+        home::HomeMode::Shared => container::home_mount(),
+        home::HomeMode::Isolated => {
+            match home::harvest_finished(&cfg.home.policy) {
+                Ok(runs) if !runs.is_empty() => {
+                    eprintln!(
+                        "pall8t: harvested {} finished run(s) — see `pall8t home inbox`",
+                        runs.len()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("pall8t: warning: could not harvest finished runs: {e:#}"),
+            }
+            let instance = home::fork_instance(run_name, cwd)?;
+            eprintln!("pall8t: isolated home — forked a private instance for this run");
+            Ok(instance)
+        }
+    }
+}
+
+fn cmd_home(cmd: HomeCmd) -> Result<()> {
+    match cmd {
+        HomeCmd::Harvest => {
+            // Reclassification honors the cwd project's policy overrides.
+            let cwd = std::env::current_dir()?;
+            let policy = config::load(&cwd)
+                .map(|c| c.home.policy)
+                .unwrap_or_default();
+            let runs = home::harvest_finished(&policy)?;
+            if runs.is_empty() {
+                println!("no finished runs to harvest");
+            } else {
+                println!("harvested {} run(s):", runs.len());
+                for r in runs {
+                    println!("  {r}");
+                }
+            }
+            Ok(())
+        }
+        HomeCmd::Inbox => {
+            let changesets = home::list_changesets()?;
+            if changesets.is_empty() {
+                println!("inbox empty");
+            } else {
+                for c in changesets {
+                    println!("{}\t{} path(s)\t{}", c.run, c.entries, c.workspace);
+                }
+            }
+            Ok(())
+        }
+        HomeCmd::Show { run } => {
+            print!("{}", home::show(&run)?);
+            Ok(())
+        }
+        HomeCmd::Promote { run, paths } => {
+            let outcome = home::promote(&run, &paths)?;
+            for p in &outcome.promoted {
+                println!("promoted {p}");
+            }
+            if outcome.conflicts.is_empty() {
+                Ok(())
+            } else {
+                // Base left untouched for these; surface for resolution
+                // (FR-5) and exit non-zero so scripts notice.
+                Err(anyhow!(
+                    "{} path(s) conflicted and stay staged (base unchanged): {}",
+                    outcome.conflicts.len(),
+                    outcome.conflicts.join(", ")
+                ))
+            }
+        }
+        HomeCmd::Drop { run, paths } => {
+            home::drop_changeset(&run, &paths)?;
+            println!("dropped {run}");
+            Ok(())
+        }
+    }
 }
 
 /// FR-6: create `~/.pall8t/home`, config skeletons, and the default
