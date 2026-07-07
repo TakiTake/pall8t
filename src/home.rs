@@ -352,7 +352,10 @@ fn clone_tree(src: &Path, dst: &Path) -> Result<()> {
     copy_tree(src, dst)
 }
 
-/// Recursive copy preserving symlinks (as symlinks, not their targets).
+/// Recursive copy preserving symlinks (as symlinks, not their targets). Only
+/// the non-macOS `clone_tree` uses it — macOS forks via `clonefile`, so this
+/// is not compiled there (Phase 1 has no non-APFS fallback on macOS).
+#[cfg(not(target_os = "macos"))]
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     let meta =
         std::fs::symlink_metadata(src).with_context(|| format!("cannot stat {}", src.display()))?;
