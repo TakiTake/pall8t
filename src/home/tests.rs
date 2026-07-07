@@ -106,6 +106,28 @@ fn default_classification() {
 }
 
 #[test]
+fn per_project_memory_is_knowledge_not_ephemeral() {
+    // Claude Code's persistent memory lives under the per-project dir; it must
+    // beat the broad `.claude/projects/**` ephemeral rule (first match wins),
+    // while session transcripts under the same dir stay ephemeral.
+    let c = |p: &str| classify(p, &[]);
+    assert_eq!(
+        c(".claude/projects/some-project/memory/MEMORY.md").class,
+        Class::Knowledge,
+        "per-project memory must be preserved as knowledge"
+    );
+    assert_eq!(
+        c(".claude/projects/some-project/memory/facts/a-fact.md").class,
+        Class::Knowledge
+    );
+    assert_eq!(
+        c(".claude/projects/some-project/transcript.jsonl").class,
+        Class::Ephemeral,
+        "session transcripts under the project dir stay ephemeral"
+    );
+}
+
+#[test]
 fn override_beats_default_and_first_wins() {
     let overrides = vec![PolicyRule {
         glob: ".claude/skills/**".to_string(),

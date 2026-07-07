@@ -111,6 +111,12 @@ pub const DEFAULT_RULES: &[(&str, Class)] = &[
     (".npmrc", Class::Secret),
     // Durable structured state — mechanically key-path merged.
     (".claude.json", Class::State),
+    // Persistent agent memory lives UNDER the per-project dir
+    // (`.claude/projects/<slug>/memory/`), so it must be reclassified as
+    // knowledge BEFORE the broad `.claude/projects/**` ephemeral rule below —
+    // otherwise first-match-wins would discard it (the spec lists memory as
+    // knowledge).
+    (".claude/projects/*/memory/**", Class::Knowledge),
     // Ephemeral — runtime scratch, never worth harvesting.
     (".cache/**", Class::Ephemeral),
     (".npm/**", Class::Ephemeral),
