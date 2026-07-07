@@ -131,6 +131,11 @@ base) and mostly dissolved by Phase 2's registry/`gc`:
   by an unrelated long-lived process), so its changeset never harvests. Safe
   (never drains a live run) but an unbounded-disk risk on low-`pid_max` hosts;
   Phase 2 orphan detection (FR-9) closes it.
+- **A recycled pid + same cwd can block a new run**: because the run name is
+  `pall8t-<cwd-key>-<pid>`, a new run whose name collides with a lingering
+  un-promoted changeset is refused (rather than silently clobbering it). Correct
+  and safe, but surprising; inherent to pid-derived naming until Phase 2 gives
+  changesets pid-independent identity.
 - **Secret latest-wins is content-blind**: harvest order (oldest-fork-first) is
   deterministic but not token-recency based, so among same-second concurrent
   refreshes an older token can win. A robust fix compares the credential's
