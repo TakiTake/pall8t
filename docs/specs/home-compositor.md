@@ -1,6 +1,6 @@
 # Spec: agent-home state compositor (pall8t `home` module)
 
-Status: draft, 2026-07-07. Addresses [issue #9](https://github.com/TakiTake/pall8t/issues/9)
+Status: **Accepted**, 2026-07-07. Addresses [issue #9](https://github.com/TakiTake/pall8t/issues/9)
 (shared home under parallel runs — requirements §8 roadmap item 1). Background: the
 [bit-vcs/bit evaluation](https://github.com/TakiTake/pall8t/issues/9#issuecomment-4904121268)
 on that issue, whose conclusions (no third-party APIs near the home dir, selective state
@@ -147,3 +147,40 @@ non-APFS; FR-7 uses clonefile snapshots + a manifest with stateless `git merge-f
 for FR-4 text merges — **no VCS repository inside or beside the base**, since a `.git`
 in `$HOME` would be visible to every agent; overlayfs-in-guest is rejected as baseline
 (virtiofs upper-layer xattr support is not guaranteed by apple/container).
+
+## Implementation plan (accepted 2026-07-07)
+
+The custom pall8t module — the final recommendation of
+[home-compositor-evaluation.md](home-compositor-evaluation.md) — is adopted.
+Implementation proceeds in phases; **each phase is developed on its own git
+branch** and merged via its own PR.
+
+### Phase 1 — MVP: fork, harvest, inbox/promote
+
+- `[home]` config section with `mode = "shared" | "isolated"` (default
+  `shared`, current behavior unchanged) — FR-11 subset
+- FR-1 fork via `clonefile(2)` with temp-name-plus-rename atomicity (APFS
+  required in this phase; clear error on unsupported filesystems)
+- FR-2 policy manifest with the conservative default classification
+- FR-3 / FR-8 lazy, lossless harvest into inbox changesets
+- FR-4 `pall8t home inbox | show <run> | promote <run> [paths…] | drop <run>
+  [paths…]` with merge strategies: directory-union (additive knowledge trees),
+  textual 3-way via `git merge-file`, key-path JSON (state), latest-wins
+  (secrets)
+- FR-5 conflicts surface only at promote; FR-6 serialized base writes
+  (per-base lock)
+- FR-10 credential write-back (latest-wins)
+
+### Phase 2 — history & lifecycle
+
+- FR-7 versioned base: `log`, `diff`, `rollback`
+- FR-9 instance registry and lifecycle: `ls`, `rm`, `gc`, orphan detection,
+  inbox TTL with warnings (never silent expiry)
+- FR-11 polish: `--json` output and stable exit codes across the subcommand
+  family
+
+### Phase 3 — extensions
+
+- Pluggable merge resolver (may invoke local Claude; never third-party APIs)
+- Non-APFS fallback via recursive copy
+- Revisit overlayfs-in-guest if platform xattr guarantees improve
