@@ -1,4 +1,4 @@
-# Spec: agent-home state compositor (working name: `hearth`)
+# Spec: agent-home state compositor (pall8t `home` module)
 
 Status: draft, 2026-07-07. Addresses [issue #9](https://github.com/TakiTake/pall8t/issues/9)
 (shared home under parallel runs — requirements §8 roadmap item 1). Background: the
@@ -9,6 +9,18 @@ management rather than version-controlling `$HOME`) this spec bakes in.
 **One-liner:** Give each sandboxed agent run a private, instantly-forked copy of a shared
 home directory, capture everything it produced when it ends, and let the user decide what
 folds back into the shared home — even from many parallel runs.
+
+**Form:** a pall8t module (`src/home.rs`), not a standalone tool. The behavior is
+selected in the existing two-layer config, defaulting to today's shared home:
+
+```toml
+[home]
+# mode = "shared"    # default: every run mounts ~/.pall8t/home rw (v1 behavior)
+# mode = "isolated"  # per-run fork + harvest/promote, per this spec
+```
+
+Because the config merges per field with the project winning, one project can opt into
+`isolated` while everything else stays `shared` — the natural migration path.
 
 ## Core model
 
@@ -39,20 +51,21 @@ the data always flows back, and the merge is always optional.
 
 ## Functional requirements
 
-- **FR-1 Fork.** `hearth fork` creates an instance via CoW (`clonefile(2)` on APFS;
-  rsync fallback). Atomic: a crash mid-fork leaves no half-instance. Target <100 ms at
-  1 GB.
+- **FR-1 Fork.** `pall8t run` (in `isolated` mode) creates an instance via CoW
+  (`clonefile(2)` on APFS; rsync fallback). Atomic: a crash mid-fork leaves no
+  half-instance. Target <100 ms at 1 GB.
 - **FR-2 Policy manifest.** TOML, glob → class rules with defaults; changes on
   unclassified paths are surfaced in the harvest report, never silently handled.
 - **FR-3 Harvest (automatic, lossless).** On run end (lazily, per FR-8), the instance's
   non-ephemeral changes are captured into an inbox changeset — diffed against the
   fork-point ancestor, labeled with run name/workspace/time. The instance itself can then
   be disposed. Harvest never touches knowledge paths in the base.
-- **FR-4 Promote (explicit, optional).** `hearth inbox` lists pending changesets;
-  `hearth show <run>` displays what changed (optionally with a local-Claude summary —
-  "this run added a skill that does X"); `hearth promote <run> [paths…]` three-way-merges
-  all or *selected paths* of a changeset into the base (fork-point ancestor / current
-  base / changeset); `hearth drop <run> [paths…]` discards. Per-path granularity is
+- **FR-4 Promote (explicit, optional).** `pall8t home inbox` lists pending changesets;
+  `pall8t home show <run>` displays what changed (optionally with a local-Claude summary —
+  "this run added a skill that does X"); `pall8t home promote <run> [paths…]`
+  three-way-merges all or *selected paths* of a changeset into the base (fork-point
+  ancestor / current base / changeset); `pall8t home drop <run> [paths…]` discards.
+  Per-path granularity is
   required: one run may produce one keeper skill and three PoC scraps. Merge strategies
   per class: directory-union for additive trees like skills (conflict only on
   same-path-different-content), textual 3-way for prose/config, key-path JSON merge for
@@ -70,9 +83,9 @@ the data always flows back, and the merge is always optional.
   its object store.
 - **FR-8 Decoupled harvest.** Harvest must not depend on a supervising process, because
   `pall8t run` **exec(2)-replaces itself** (ADR-0006 / NFR-4) and is gone when the run
-  ends. Instances persist after exit and harvesting runs lazily — on the next
-  `hearth`/`pall8t` invocation, or an explicit `harvest` call. An optional supervisor
-  mode (spawn+wait) may harvest eagerly, but lazy harvest is the required baseline.
+  ends. Instances persist after exit and harvesting runs lazily — on the next pall8t
+  invocation, or an explicit `pall8t home harvest`. An optional supervisor mode
+  (spawn+wait) may harvest eagerly, but lazy harvest is the required baseline.
 - **FR-9 Instance & inbox lifecycle.** Registry of live instances (`ls`, `rm`, `gc`)
   with orphan detection for dead runs; bounded disk. Inbox changesets persist until
   promoted or dropped; a configurable TTL/GC *warns* rather than silently expiring —
@@ -80,15 +93,21 @@ the data always flows back, and the merge is always optional.
 - **FR-10 Credential coherence.** A token refreshed inside one run (Claude Code
   refreshes OAuth tokens) propagates to the base at harvest so later runs don't
   re-login; concurrent refreshes resolve latest-wins without corruption.
-- **FR-11 Interface.** CLI-first: stable exit codes, `--json` output, no daemon;
-  embeddable as a Rust library is a plus (pall8t is Rust).
+- **FR-11 Interface.** A `pall8t home` subcommand family (`inbox`, `show`, `promote`,
+  `drop`, `harvest`, `log`, `rollback`, `gc`): stable exit codes, `--json` where herdr
+  or scripts consume it, no daemon. Implemented in the pall8t crate (`src/home.rs`),
+  reusing the existing subprocess/`git()` and config plumbing.
 
 ## Non-functional requirements
 
 - macOS/APFS first; fork cost O(1)-ish metadata, harvest/promote cost O(changed files).
 - **Zero network, zero telemetry.** Secrets never appear in logs, diffs, or any external
   process's input.
-- Single static binary (or a pall8t module); no runtime beyond optionally git.
+- No new runtime dependencies beyond what pall8t already has (git, the `container` CLI).
+- **`shared` mode must remain byte-for-byte today's behavior** — the module adds a code
+  path, never changes the default one; switching a project back from `isolated` to
+  `shared` must always be safe (the base is a valid home at every instant, per the core
+  model).
 - An alternative materialization strategy must fit the same abstraction: since the
   *guest* is Linux, per-run **overlayfs inside the container** (shared base ro lower +
   per-run rw upper) is a legitimate fork mechanism the interface must not preclude.
@@ -111,15 +130,18 @@ the data always flows back, and the merge is always optional.
 
 ## pall8t integration sketch
 
-`pall8t run`: fork instance → bind-mount the *instance* as `/home/dev` (replacing
-today's shared `home_mount()` in `src/container.rs`) → exec as today. The next pall8t
-invocation harvests finished instances. Policy lives in the existing two-layer config
-(`~/.pall8t/config.toml` / `pall8t.toml`).
+- `src/home.rs`: mode dispatch. `shared` → today's `container::home_mount()` unchanged;
+  `isolated` → fork instance, bind-mount the *instance* as `/home/dev`, exec as today,
+  and lazily harvest finished instances on subsequent invocations.
+- `src/main.rs`: `pall8t home` subcommand family (FR-11).
+- `src/config.rs`: `[home]` section (`mode`, policy overrides, inbox TTL) in the
+  existing two-layer merge — per-project opt-in comes for free.
 
 ## Next step
 
-Use this spec as the yardstick to evaluate candidates — jj/git-based approaches,
-overlayfs-in-guest, dotfile managers (chezmoi), Nix home-manager — versus a custom
-pall8t module. Expectation to test: no off-the-shelf tool covers class-aware staging
-(FR-3/FR-4) together with lazy harvest (FR-8), which would make `clonefile` + policy
-manifest + git-backed versioning inside pall8t the realistic outcome.
+The module-vs-standalone question is decided (module). What remains to evaluate against
+this spec is the *mechanics*: `clonefile` vs. rsync vs. overlayfs-in-guest for FR-1, and
+git vs. hand-rolled snapshots as the FR-7 versioning engine — plus a look at how jj and
+chezmoi structure three-way merges for ideas worth borrowing (as building blocks, not
+dependencies). Expectation to test: `clonefile` + policy manifest + git-backed
+versioning inside `src/home.rs` is the realistic outcome.
