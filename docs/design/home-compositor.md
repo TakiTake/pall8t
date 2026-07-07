@@ -85,6 +85,18 @@ changed, `promote <run> [paths…]` merges all or selected paths into the base,
 `drop <run> [paths…]` discards them. Per-path granularity is real: one run's
 keeper skill can promote while its PoC scraps stay staged for a later drop.
 
+**Merge (FR-4/FR-11 convenience).** `pall8t home merge [<run>]` is the
+`harvest && show && promote-all` chain in one command: it harvests (all
+finished runs, or one named run), then for each pending changeset — oldest fork
+first, the order harvest applied secret/state — prints what `show` would and
+promotes all its paths. No confirmation prompt (the command is itself the
+explicit action; the printed `show` output is the record). A conflict stops
+processing at that changeset (its clean paths still land; conflicted ones and
+every later changeset stay staged — no rollback, consistent with FR-5/FR-6) and
+exits non-zero pointing at per-path `promote`/`drop`. It is a thin composition
+of the existing harvest/show/promote internals — no new merge logic — and
+tolerates a changeset a concurrent `merge` already consumed.
+
 ## Merge strategies
 
 - **Directory-union** for additive knowledge: a path the base lacks is added; a

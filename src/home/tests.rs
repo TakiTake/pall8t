@@ -541,6 +541,145 @@ fn fork_refuses_over_unpromoted_changeset() {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// merge = harvest + show + promote-all (FR-4/FR-11 convenience)
+// ---------------------------------------------------------------------------
+
+/// Forks + mutates + finishes a run WITHOUT harvesting (merge does the harvest).
+fn stage_run(root: &TempRoot, run: &str, mutate: impl FnOnce(&Path)) {
+    let inst = fork_instance_at(root.path(), run, Path::new("/ws")).unwrap();
+    mutate(&inst);
+    finish_run(root, run);
+}
+
+#[test]
+fn merge_promotes_all_pending() {
+    let root = TempRoot::new("merge-all");
+    stage_run(&root, "run-a", |inst| {
+        write(&inst.join(".claude/skills/x/SKILL.md"), "X");
+    });
+    stage_run(&root, "run-b", |inst| {
+        write(&inst.join(".claude/skills/y/SKILL.md"), "Y");
+    });
+    let report = merge_at(root.path(), None, &[]).unwrap();
+    assert_eq!(report.steps.len(), 2, "both pending runs processed");
+    assert!(report.steps.iter().all(|s| s.conflicts.is_empty()));
+    assert_eq!(report.steps[0].run, "run-a", "oldest fork first");
+    // Both skills landed and the inbox is drained.
+    assert!(root.base().join(".claude/skills/x/SKILL.md").exists());
+    assert!(root.base().join(".claude/skills/y/SKILL.md").exists());
+    assert!(list_changesets_at(root.path()).unwrap().is_empty());
+}
+
+#[test]
+fn merge_specific_run_only() {
+    let root = TempRoot::new("merge-one");
+    stage_run(&root, "run-a", |inst| {
+        write(&inst.join(".claude/skills/x/SKILL.md"), "X");
+    });
+    stage_run(&root, "run-b", |inst| {
+        write(&inst.join(".claude/skills/y/SKILL.md"), "Y");
+    });
+    let report = merge_at(root.path(), Some("run-a"), &[]).unwrap();
+    assert_eq!(report.steps.len(), 1);
+    assert_eq!(report.steps[0].run, "run-a");
+    assert!(root.base().join(".claude/skills/x/SKILL.md").exists());
+    assert!(
+        !root.base().join(".claude/skills/y/SKILL.md").exists(),
+        "run-b untouched — still forked, not merged"
+    );
+}
+
+#[test]
+fn merge_stops_at_conflict_leaving_remainder() {
+    let root = TempRoot::new("merge-conflict");
+    root.write_base("CLAUDE.md", "shared\n");
+    // run-a (older) edits CLAUDE.md; run-b (newer) adds a skill.
+    stage_run(&root, "run-a", |inst| {
+        write(&inst.join("CLAUDE.md"), "run-a version\n");
+    });
+    stage_run(&root, "run-b", |inst| {
+        write(&inst.join(".claude/skills/y/SKILL.md"), "Y");
+    });
+    // Base diverges on the same line after the forks, so run-a's promote
+    // conflicts.
+    root.write_base("CLAUDE.md", "base version\n");
+
+    let report = merge_at(root.path(), None, &[]).unwrap();
+    assert_eq!(
+        report.steps.len(),
+        1,
+        "stopped at the first (conflicting) run"
+    );
+    assert_eq!(report.steps[0].run, "run-a");
+    assert_eq!(report.steps[0].conflicts, vec!["CLAUDE.md"]);
+    assert_eq!(
+        root.read_base("CLAUDE.md").unwrap(),
+        "base version\n",
+        "conflict does not poison the base"
+    );
+    // Both the conflicting changeset and the untouched later one remain.
+    let pending: Vec<String> = list_changesets_at(root.path())
+        .unwrap()
+        .into_iter()
+        .map(|c| c.run)
+        .collect();
+    assert!(pending.contains(&"run-a".to_string()));
+    assert!(
+        pending.contains(&"run-b".to_string()),
+        "the later changeset is left staged, not merged"
+    );
+    assert!(!root.base().join(".claude/skills/y/SKILL.md").exists());
+}
+
+#[test]
+fn merge_empty_inbox_is_noop() {
+    let root = TempRoot::new("merge-empty");
+    let report = merge_at(root.path(), None, &[]).unwrap();
+    assert!(report.steps.is_empty(), "nothing pending -> no steps");
+    assert!(report.harvested.is_empty());
+}
+
+#[test]
+fn merge_specific_live_run_errors() {
+    let root = TempRoot::new("merge-live");
+    // Forked with the live test pid, not finished.
+    fork_instance_at(root.path(), "run-live", Path::new("/ws")).unwrap();
+    let err = merge_at(root.path(), Some("run-live"), &[]).unwrap_err();
+    assert!(err.to_string().contains("still running"));
+}
+
+#[test]
+fn merge_unknown_run_errors() {
+    // A typo'd run (no instance, no changeset) errors rather than silently
+    // succeeding — parity with promote/drop/show.
+    let root = TempRoot::new("merge-unknown");
+    let err = merge_at(root.path(), Some("run-typo"), &[]).unwrap_err();
+    assert!(err.to_string().contains("no run run-typo"));
+}
+
+#[test]
+fn merge_secrets_only_run_is_a_clean_noop() {
+    // A run that changed only a secret harvests (writing the base) but stages
+    // no changeset; `merge <run>` succeeds with no promote steps.
+    let root = TempRoot::new("merge-secrets");
+    root.write_base(".claude/.credentials.json", r#"{"token":"old"}"#);
+    stage_run(&root, "run-s", |inst| {
+        write(
+            &inst.join(".claude/.credentials.json"),
+            r#"{"token":"new"}"#,
+        );
+    });
+    let report = merge_at(root.path(), Some("run-s"), &[]).unwrap();
+    assert!(report.steps.is_empty(), "no knowledge to promote");
+    assert_eq!(report.harvested, vec!["run-s"], "but the run was harvested");
+    assert_eq!(
+        root.read_base(".claude/.credentials.json").unwrap(),
+        r#"{"token":"new"}"#,
+        "the secret was written back"
+    );
+}
+
 #[test]
 fn epoch_formatting() {
     assert_eq!(fmt_epoch(0), "1970-01-01 00:00:00Z");

@@ -704,8 +704,15 @@ fn prune_changeset(cs: &Path, manifest: &mut Manifest, paths: &[String]) -> Resu
     }
     manifest.entries.retain(|e| !removed.contains(&e.path));
     if manifest.entries.is_empty() {
-        std::fs::remove_dir_all(cs)
-            .with_context(|| format!("cannot remove emptied changeset {}", cs.display()))
+        // Tolerate an already-removed changeset (a concurrent merge/drop got
+        // here first) — the dir being gone is the desired end state.
+        match std::fs::remove_dir_all(cs) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                Err(anyhow!(e).context(format!("cannot remove emptied changeset {}", cs.display())))
+            }
+        }
     } else {
         write_atomic(
             &cs.join("manifest.toml"),
@@ -950,6 +957,114 @@ fn drop_changeset_at(root: &Path, run: &str, paths: &[String]) -> Result<()> {
         .map(|e| e.path)
         .collect();
     prune_changeset(&cs, &mut manifest, &dropped)
+}
+
+/// One changeset processed by [`merge`]: what `show` rendered for it, the
+/// paths promoted, and any that conflicted (non-empty ⇒ merge stopped here).
+#[derive(Debug)]
+pub struct MergeStep {
+    pub run: String,
+    pub shown: String,
+    pub promoted: Vec<String>,
+    pub conflicts: Vec<String>,
+}
+
+/// Result of a [`merge`]: the runs harvested (their secret/state already
+/// written to the base) and the changeset promote `steps`, in processing
+/// order (oldest fork first). If the last step has conflicts, processing
+/// stopped there and any later changesets were left staged.
+#[derive(Debug)]
+pub struct MergeReport {
+    pub harvested: Vec<String>,
+    pub steps: Vec<MergeStep>,
+}
+
+/// The `harvest && show && promote-all` convenience composition (FR-4/FR-11).
+/// Harvests (all finished runs, or just `run` if given), then for each
+/// resulting/pending changeset — oldest fork first, the same order harvest
+/// applies secret/state — records its `show` rendering and promotes all its
+/// paths. A conflict stops processing at that changeset (its clean paths still
+/// land; conflicted ones and every later changeset stay staged) — no rollback,
+/// consistent with FR-5/FR-6. Pure composition of the existing harvest/show/
+/// promote internals; no new merge logic.
+pub fn merge(run: Option<&str>, overrides: &[PolicyRule]) -> Result<MergeReport> {
+    merge_at(&crate::config::pall8t_root()?, run, overrides)
+}
+
+fn merge_at(root: &Path, run: Option<&str>, overrides: &[PolicyRule]) -> Result<MergeReport> {
+    let harvested = match run {
+        Some(r) => harvest_run(root, r, overrides)?,
+        None => harvest_finished_at(root, overrides)?,
+    };
+    let targets = match run {
+        Some(r) if changeset_exists(root, r) => vec![r.to_string()],
+        // A named run that harvested (secrets/state only) has nothing to
+        // promote; one that neither harvested nor has a changeset is unknown —
+        // error, matching promote/drop/show, rather than silently succeed.
+        Some(r) if harvested.is_empty() => {
+            return Err(anyhow!(
+                "no run {r} to merge — no instance or changeset by that name"
+            ));
+        }
+        Some(_) => Vec::new(),
+        None => pending_runs_oldest_first(root)?,
+    };
+
+    let mut steps = Vec::new();
+    for r in targets {
+        // A concurrent `merge` may have consumed this changeset between the
+        // listing above and here; skip it rather than error.
+        if !changeset_exists(root, &r) {
+            continue;
+        }
+        let shown = show_at(root, &r)?;
+        let outcome = promote_at(root, &r, &[])?;
+        let stop = !outcome.conflicts.is_empty();
+        steps.push(MergeStep {
+            run: r,
+            shown,
+            promoted: outcome.promoted,
+            conflicts: outcome.conflicts,
+        });
+        if stop {
+            break; // leave this changeset's conflicts and all later ones staged
+        }
+    }
+    Ok(MergeReport { harvested, steps })
+}
+
+/// Harvests a single finished run's instance for [`merge`], returning its run
+/// name if it actually harvested one. Empty if the instance is gone (already
+/// harvested, or the run only produced a changeset); errors if the run is
+/// still live.
+fn harvest_run(root: &Path, run: &str, overrides: &[PolicyRule]) -> Result<Vec<String>> {
+    let inst = instances_root(root).join(run);
+    if !inst.exists() {
+        return Ok(Vec::new());
+    }
+    let meta = read_meta(&inst)?;
+    if is_forker_alive(meta.forker_pid) {
+        return Err(anyhow!(
+            "run {run} is still running — cannot merge a live run"
+        ));
+    }
+    if harvest_instance(root, &inst, overrides)? {
+        Ok(vec![run.to_string()])
+    } else {
+        Ok(Vec::new()) // concurrently harvested by another process
+    }
+}
+
+fn changeset_exists(root: &Path, run: &str) -> bool {
+    inbox_root(root).join(run).join("manifest.toml").exists()
+}
+
+/// Pending changeset run names, oldest fork first — the order `merge` folds
+/// them in, matching harvest's oldest-first secret/state application.
+fn pending_runs_oldest_first(root: &Path) -> Result<Vec<String>> {
+    let mut cs = list_changesets_at(root)?;
+    cs.sort_by(|a, b| a.created.cmp(&b.created).then(a.run.cmp(&b.run)));
+    Ok(cs.into_iter().map(|c| c.run).collect())
 }
 
 /// Resolves the caller's `paths` (empty = all) against the changeset's

@@ -94,9 +94,11 @@ the data always flows back, and the merge is always optional.
   refreshes OAuth tokens) propagates to the base at harvest so later runs don't
   re-login; concurrent refreshes resolve latest-wins without corruption.
 - **FR-11 Interface.** A `pall8t home` subcommand family (`inbox`, `show`, `promote`,
-  `drop`, `harvest`, `log`, `rollback`, `gc`): stable exit codes, `--json` where herdr
-  or scripts consume it, no daemon. Implemented in the pall8t crate (`src/home.rs`),
-  reusing the existing subprocess/`git()` and config plumbing.
+  `drop`, `harvest`, `merge`, `log`, `rollback`, `gc`): stable exit codes, `--json` where
+  herdr or scripts consume it, no daemon. `merge [<run>]` is a convenience composition of
+  harvest + show + promote-all (fold pending runs into the base, printing what each
+  changed). Implemented in the pall8t crate (`src/home.rs`), reusing the existing
+  subprocess/`git()` and config plumbing.
 
 ## Non-functional requirements
 

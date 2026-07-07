@@ -71,6 +71,12 @@ enum HomeCmd {
         /// Limit to these `$HOME`-relative paths (default: the whole run)
         paths: Vec<String>,
     },
+    /// harvest + show + promote-all in one step: fold pending runs (or one
+    /// <run>) into the base, printing what each changed
+    Merge {
+        /// Merge just this run (default: every pending run)
+        run: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -260,15 +266,21 @@ fn home_for_run(cfg: &config::Config, run_name: &str, cwd: &Path) -> Result<std:
     }
 }
 
+/// The cwd project's policy overrides, for the standalone `home` commands
+/// that reclassify (harvest, merge). Best-effort: a missing/broken config
+/// falls back to the built-in defaults rather than failing the command.
+fn cwd_home_policy() -> Vec<config::PolicyRule> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| config::load(&cwd).ok())
+        .map(|c| c.home.policy)
+        .unwrap_or_default()
+}
+
 fn cmd_home(cmd: HomeCmd) -> Result<()> {
     match cmd {
         HomeCmd::Harvest => {
-            // Reclassification honors the cwd project's policy overrides.
-            let cwd = std::env::current_dir()?;
-            let policy = config::load(&cwd)
-                .map(|c| c.home.policy)
-                .unwrap_or_default();
-            let runs = home::harvest_finished(&policy)?;
+            let runs = home::harvest_finished(&cwd_home_policy())?;
             if runs.is_empty() {
                 println!("no finished runs to harvest");
             } else {
@@ -316,6 +328,51 @@ fn cmd_home(cmd: HomeCmd) -> Result<()> {
             println!("dropped {run}");
             Ok(())
         }
+        HomeCmd::Merge { run } => cmd_home_merge(run),
+    }
+}
+
+fn cmd_home_merge(run: Option<String>) -> Result<()> {
+    let report = home::merge(run.as_deref(), &cwd_home_policy())?;
+    if report.steps.is_empty() {
+        // Harvest may still have had side effects (secret/state write-back)
+        // even with no knowledge changeset to promote — say so honestly.
+        if report.harvested.is_empty() {
+            println!("nothing to merge");
+        } else {
+            println!(
+                "harvested {} run(s); no knowledge changes to promote",
+                report.harvested.len()
+            );
+        }
+        return Ok(());
+    }
+    let mut conflicted: Option<&home::MergeStep> = None;
+    for step in &report.steps {
+        // Show what is being folded in, then what landed — the record of the
+        // merge (there is no confirmation prompt; `merge` is itself explicit).
+        print!("{}", step.shown);
+        for p in &step.promoted {
+            println!("promoted {p}");
+        }
+        if !step.conflicts.is_empty() {
+            conflicted = Some(step);
+        }
+    }
+    match conflicted {
+        None => Ok(()),
+        // Processing stopped at this changeset (FR-5); later ones stay staged.
+        // Exit non-zero, like `promote`, and point at per-path resolution.
+        Some(step) => Err(anyhow!(
+            "{} path(s) in {} conflicted and stay staged (base unchanged); later \
+             changesets left untouched. Resolve with `pall8t home promote {} <path>` or \
+             `pall8t home drop {} <path>`, then re-run `pall8t home merge`: {}",
+            step.conflicts.len(),
+            step.run,
+            step.run,
+            step.run,
+            step.conflicts.join(", ")
+        )),
     }
 }
 
