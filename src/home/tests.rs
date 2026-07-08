@@ -131,7 +131,8 @@ fn per_project_memory_is_knowledge_not_ephemeral() {
 fn override_beats_default_and_first_wins() {
     let overrides = vec![PolicyRule {
         glob: ".claude/skills/**".to_string(),
-        class: Class::Ephemeral,
+        class: Some(Class::Ephemeral),
+        strategy: None,
     }];
     // Override reclassifies what the default calls knowledge.
     assert_eq!(
@@ -140,6 +141,60 @@ fn override_beats_default_and_first_wins() {
     );
     // A path the override doesn't touch still hits the defaults.
     assert_eq!(classify(".claude.json", &overrides).class, Class::State);
+}
+
+#[test]
+fn history_jsonl_is_state_union_by_default() {
+    let c = classify(".claude/history.jsonl", &[]);
+    assert_eq!(c.class, Class::State);
+    assert_eq!(c.strategy, MergeStrategy::Union);
+}
+
+#[test]
+fn strategy_only_override_defaults_class_to_state() {
+    let overrides = vec![PolicyRule {
+        glob: ".config/tool/log.jsonl".to_string(),
+        class: None,
+        strategy: Some(MergeStrategy::Union),
+    }];
+    let c = classify(".config/tool/log.jsonl", &overrides);
+    assert_eq!(
+        c.class,
+        Class::State,
+        "strategy-only rule defaults to state"
+    );
+    assert_eq!(c.strategy, MergeStrategy::Union);
+}
+
+#[test]
+fn union_ignored_and_warned_for_secret_ephemeral() {
+    // union on a secret/ephemeral is meaningless: classify drops it, and
+    // validate_policy warns.
+    let overrides = vec![
+        PolicyRule {
+            glob: ".secret".to_string(),
+            class: Some(Class::Secret),
+            strategy: Some(MergeStrategy::Union),
+        },
+        PolicyRule {
+            glob: ".nostrat".to_string(),
+            class: None,
+            strategy: None,
+        },
+    ];
+    assert_eq!(
+        classify(".secret", &overrides).strategy,
+        MergeStrategy::Inherit,
+        "union is ignored for secret"
+    );
+    let warnings = validate_policy(&overrides);
+    assert_eq!(
+        warnings.len(),
+        2,
+        "both the union-on-secret and the empty rule warn"
+    );
+    assert!(warnings.iter().any(|w| w.contains(".secret")));
+    assert!(warnings.iter().any(|w| w.contains(".nostrat")));
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +506,92 @@ fn two_parallel_runs_merge_state_and_stage_independently() {
     promote_at(root.path(), "run-b", &[]).unwrap();
     assert!(root.base().join(".claude/skills/x/SKILL.md").exists());
     assert!(root.base().join(".claude/skills/y/SKILL.md").exists());
+}
+
+#[test]
+fn parallel_history_jsonl_appends_union_at_harvest_no_conflict() {
+    // Acceptance: two parallel runs each append a different line to the
+    // append-only history; after both harvests the base contains both lines,
+    // nothing conflicts, and nothing is staged (it's state, not knowledge).
+    let root = TempRoot::new("history-union");
+    root.write_base(".claude/history.jsonl", "{\"p\":\"x\"}\n");
+    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa")).unwrap();
+    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb")).unwrap();
+    write(
+        &inst_a.join(".claude/history.jsonl"),
+        "{\"p\":\"x\"}\n{\"p\":\"a\"}\n",
+    );
+    write(
+        &inst_b.join(".claude/history.jsonl"),
+        "{\"p\":\"x\"}\n{\"p\":\"b\"}\n",
+    );
+    finish_run(&root, "run-a");
+    finish_run(&root, "run-b");
+    harvest_finished_at(root.path(), &[]).unwrap();
+
+    let merged = root.read_base(".claude/history.jsonl").unwrap();
+    assert!(merged.contains("\"p\":\"x\""), "base line kept");
+    assert!(merged.contains("\"p\":\"a\""), "run-a's append kept");
+    assert!(merged.contains("\"p\":\"b\""), "run-b's append kept");
+    assert!(
+        list_changesets_at(root.path()).unwrap().is_empty(),
+        "history is state, never staged"
+    );
+}
+
+#[test]
+fn union_non_utf8_run_keeps_base_not_overwrites() {
+    // A crash-truncated (non-UTF-8) history.jsonl must not overwrite the base
+    // and drop the lines other runs accumulated — the base is left unchanged.
+    let root = TempRoot::new("history-badutf8");
+    let base_content = "{\"p\":\"acc-from-other-runs\"}\n";
+    root.write_base(".claude/history.jsonl", base_content);
+    let inst = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    // Invalid UTF-8 bytes as the run's history.
+    write_atomic(
+        &inst.join(".claude/history.jsonl"),
+        &[0xff, 0xfe, 0x00, 0xff],
+    )
+    .unwrap();
+    finish_run(&root, "r");
+    harvest_finished_at(root.path(), &[]).unwrap();
+    assert_eq!(
+        root.read_base(".claude/history.jsonl").unwrap(),
+        base_content,
+        "base kept intact rather than overwritten by the corrupt run file"
+    );
+    // The instance is still disposed (union non-UTF-8 warns, doesn't error).
+    assert!(!instances_root(root.path()).join("r").exists());
+}
+
+#[test]
+fn knowledge_union_strategy_merges_without_conflict_at_promote() {
+    // A knowledge-class file marked strategy=union merges cleanly at promote
+    // where a plain 3-way (overlapping middle-line edits) would conflict.
+    let overrides = vec![PolicyRule {
+        glob: "notes.log".to_string(),
+        class: Some(Class::Knowledge),
+        strategy: Some(MergeStrategy::Union),
+    }];
+    let root = TempRoot::new("knowledge-union");
+    root.write_base("notes.log", "top\nshared\nbottom\n");
+    // Run edits the middle line; harvest with the override stages it as
+    // knowledge+union.
+    let inst = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    write(&inst.join("notes.log"), "top\nrun\nbottom\n");
+    finish_run(&root, "r");
+    harvest_finished_at(root.path(), &overrides).unwrap();
+    // Base diverges on the same middle line -> plain 3-way would conflict.
+    root.write_base("notes.log", "top\nbase\nbottom\n");
+
+    let outcome = promote_at(root.path(), "r", &[]).unwrap();
+    assert!(
+        outcome.conflicts.is_empty(),
+        "union strategy must not conflict"
+    );
+    let merged = root.read_base("notes.log").unwrap();
+    assert!(merged.contains("base"), "base's edit kept");
+    assert!(merged.contains("run"), "run's edit kept");
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use crate::home::{Class, HomeMode};
+use crate::home::{Class, HomeMode, MergeStrategy};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -46,12 +46,22 @@ pub struct HomeConfig {
 }
 
 /// One `[[home.policy]]` rule: a glob (matched against a `$HOME`-relative
-/// path) mapped to the class it forces. First match wins, user overrides
-/// before the defaults — see [`crate::home::classify`].
+/// path) mapped to the `class` it forces and/or the merge `strategy` it uses.
+/// First match wins, user overrides before the defaults — see
+/// [`crate::home::classify`]. `class` may be omitted when only overriding the
+/// strategy (it then defaults to `state`); a rule with neither is ignored
+/// (see [`crate::home::validate_policy`]).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRule {
+    /// `path` is accepted as an alias so a rule can read naturally
+    /// (`path = ".claude/history.jsonl"`); `glob` is the documented key.
+    #[serde(alias = "path")]
     pub glob: String,
-    pub class: Class,
+    #[serde(default)]
+    pub class: Option<Class>,
+    #[serde(default)]
+    pub strategy: Option<MergeStrategy>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -180,6 +190,14 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # [[home.policy]]
 # glob = ".config/my-tool/**"
 # class = "knowledge"
+#
+# `strategy = "union"` line-merges an append-only file (keeps both sides, never
+# conflicts) instead of the class default. `class` may be omitted with a
+# strategy (defaults to state — auto-merged at harvest). `path` is an alias for
+# `glob`.
+# [[home.policy]]
+# glob = ".config/my-tool/log.jsonl"
+# strategy = "union"
 "#;
 
 /// Skeleton written by `pall8t init` as `./pall8t.toml`.
@@ -256,9 +274,44 @@ mod tests {
             cfg.home.policy,
             vec![PolicyRule {
                 glob: ".config/b/**".to_string(),
-                class: Class::Ephemeral,
+                class: Some(Class::Ephemeral),
+                strategy: None,
             }],
             "project policy replaces global policy"
+        );
+    }
+
+    #[test]
+    fn policy_strategy_and_path_alias_parse() {
+        // The user's snippet (`path` + `strategy`, no explicit class) parses;
+        // `path` is an alias for `glob`.
+        let cfg = parse(
+            r#"
+            [[home.policy]]
+            path = ".claude/history.jsonl"
+            strategy = "union"
+            "#,
+        );
+        assert_eq!(
+            cfg.home.policy.unwrap(),
+            vec![PolicyRule {
+                glob: ".claude/history.jsonl".to_string(),
+                class: None,
+                strategy: Some(MergeStrategy::Union),
+            }]
+        );
+    }
+
+    #[test]
+    fn policy_rejects_invalid_strategy_and_unknown_field() {
+        assert!(
+            toml::from_str::<Raw>("[[home.policy]]\nglob = \".x\"\nstrategy = \"bogus\"\n")
+                .is_err(),
+            "an unknown strategy value must fail to parse"
+        );
+        assert!(
+            toml::from_str::<Raw>("[[home.policy]]\nglob = \".x\"\nclas = \"state\"\n").is_err(),
+            "a misspelled field must fail to parse (deny_unknown_fields)"
         );
     }
 

@@ -48,9 +48,19 @@ Disposition by class, per the spec table:
 | Class | At harvest |
 |---|---|
 | `secret` | latest-wins write-back to the base (only if the run changed it); never staged, never in a diff |
-| `state` | key-path 3-way JSON merge into the base |
+| `state` | key-path 3-way JSON merge into the base (or line-union for `strategy = "union"`) |
 | `knowledge` | staged in the inbox; merged only on explicit promote |
 | `ephemeral` | discarded |
+
+A policy rule may carry an optional `strategy` (`inherit` — the class default —
+or `union`). `union` is a line-level 3-way (`git merge-file --union`) that keeps
+both sides' added lines and never conflicts — the right thing for append-only
+formats, so `.claude/history.jsonl` is `state` + `union` by default (auto-merged
+at harvest, never reaching the inbox). A strategy-only rule defaults its class to
+`state`; `union` is ignored (with a warning) on `secret`/`ephemeral`. Union input
+that isn't line-mergeable (non-UTF-8, e.g. a crash-truncated append) is never
+written over the base — the base is kept intact (a warning at harvest, a conflict
+at promote) rather than silently dropping the lines other runs accumulated.
 
 ## Flow
 
@@ -162,4 +172,8 @@ base) and mostly dissolved by Phase 2's registry/`gc`:
 Versioned base with `log`/`diff`/`rollback`, instance/inbox registry with
 `ls`/`rm`/`gc` and orphan detection, inbox TTL warnings, `--json` output, a
 `resolve`/`conflicts` command pair, the pluggable (local-Claude) merge resolver,
-and the production non-APFS fork. The Phase 1 interfaces don't preclude them.
+and the production non-APFS fork. Union-merge could also gain optional
+dedup / timestamp-sort of the combined lines (deliberately omitted now — git's
+plain union ordering is enough for append-only history, and sorting/deduping is
+format-specific over-engineering for Phase 1). The Phase 1 interfaces don't
+preclude any of these.

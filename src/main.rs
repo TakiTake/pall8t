@@ -249,6 +249,7 @@ fn home_for_run(cfg: &config::Config, run_name: &str, cwd: &Path) -> Result<std:
     match cfg.home.mode {
         home::HomeMode::Shared => container::home_mount(),
         home::HomeMode::Isolated => {
+            warn_policy(&cfg.home.policy);
             match home::harvest_finished(&cfg.home.policy) {
                 Ok(runs) if !runs.is_empty() => {
                     eprintln!(
@@ -270,11 +271,20 @@ fn home_for_run(cfg: &config::Config, run_name: &str, cwd: &Path) -> Result<std:
 /// that reclassify (harvest, merge). Best-effort: a missing/broken config
 /// falls back to the built-in defaults rather than failing the command.
 fn cwd_home_policy() -> Vec<config::PolicyRule> {
-    std::env::current_dir()
+    let policy = std::env::current_dir()
         .ok()
         .and_then(|cwd| config::load(&cwd).ok())
         .map(|c| c.home.policy)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    warn_policy(&policy);
+    policy
+}
+
+/// Surfaces nonsensical `[[home.policy]]` rules (see [`home::validate_policy`]).
+fn warn_policy(policy: &[config::PolicyRule]) {
+    for w in home::validate_policy(policy) {
+        eprintln!("pall8t: warning: {w}");
+    }
 }
 
 fn cmd_home(cmd: HomeCmd) -> Result<()> {

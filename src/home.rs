@@ -66,12 +66,36 @@ pub enum Class {
     Ephemeral,
 }
 
-/// A path's class plus whether an explicit rule matched it. An
-/// unclassified path is staged like `knowledge` (conservative default:
-/// never silently dropped or leaked) but flagged so the gap is visible.
+/// Which text-merge algorithm a path uses, overriding the class default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeStrategy {
+    /// The class's built-in merge: key-path JSON for `state`, textual 3-way
+    /// (conflict on overlap) for `knowledge`.
+    #[default]
+    Inherit,
+    /// Line-level 3-way that keeps both sides' added lines, never conflicts
+    /// (`git merge-file --union`). For append-only formats like
+    /// `.claude/history.jsonl` where concatenation is always valid. Lines
+    /// identical on both sides collapse to one (git's union behavior), which
+    /// is why each history entry carries a unique id/timestamp.
+    Union,
+}
+
+impl MergeStrategy {
+    fn is_inherit(&self) -> bool {
+        matches!(self, MergeStrategy::Inherit)
+    }
+}
+
+/// A path's class, its merge strategy, and whether an explicit rule matched
+/// it. An unclassified path is staged like `knowledge` (conservative
+/// default: never silently dropped or leaked) but flagged so the gap is
+/// visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Classified {
     pub class: Class,
+    pub strategy: MergeStrategy,
     pub explicit: bool,
 }
 
@@ -111,6 +135,10 @@ pub const DEFAULT_RULES: &[(&str, Class)] = &[
     (".npmrc", Class::Secret),
     // Durable structured state — mechanically key-path merged.
     (".claude.json", Class::State),
+    // Append-only JSONL prompt history: state, but line-union merged (see
+    // `default_strategy`) since parallel runs only ever append — concatenation
+    // is always valid, so it must never surface a conflict.
+    (".claude/history.jsonl", Class::State),
     // Persistent agent memory lives UNDER the per-project dir
     // (`.claude/projects/<slug>/memory/`), so it must be reclassified as
     // knowledge BEFORE the broad `.claude/projects/**` ephemeral rule below —
@@ -141,30 +169,88 @@ pub const DEFAULT_RULES: &[(&str, Class)] = &[
     ("**/*.lock", Class::Ephemeral),
 ];
 
+/// The default merge strategy for a built-in rule, keyed by its exact
+/// [`DEFAULT_RULES`] glob so the strategy travels with the rule that matched.
+/// Everything inherits its class default except append-only history.
+fn default_strategy(glob: &str) -> MergeStrategy {
+    match glob {
+        ".claude/history.jsonl" => MergeStrategy::Union,
+        _ => MergeStrategy::Inherit,
+    }
+}
+
 /// Classifies a `$HOME`-relative path. User `overrides` are tried first, then
 /// [`DEFAULT_RULES`]; first glob match wins. No match ⇒ unclassified, which is
 /// staged like `knowledge` but reported.
 pub fn classify(rel: &str, overrides: &[PolicyRule]) -> Classified {
     for rule in overrides {
-        if glob_match(&rule.glob, rel) {
-            return Classified {
-                class: rule.class,
-                explicit: true,
-            };
+        if !glob_match(&rule.glob, rel) {
+            continue;
         }
+        let strategy = rule.strategy.unwrap_or(MergeStrategy::Inherit);
+        let class = match (rule.class, strategy) {
+            (Some(c), _) => c,
+            // A strategy-only rule defaults its class to state (the user's
+            // `strategy = "union"` intent for `.claude/history.jsonl`).
+            (None, MergeStrategy::Union) => Class::State,
+            // A rule with neither class nor strategy is meaningless (warned
+            // about by `validate_policy`); fall through to the next rule.
+            (None, MergeStrategy::Inherit) => continue,
+        };
+        // `union` is meaningless for secret/ephemeral (never text-merged);
+        // ignore it there so a stray rule can't change their disposition.
+        let strategy = match class {
+            Class::Secret | Class::Ephemeral => MergeStrategy::Inherit,
+            _ => strategy,
+        };
+        return Classified {
+            class,
+            strategy,
+            explicit: true,
+        };
     }
     for (glob, class) in DEFAULT_RULES {
         if glob_match(glob, rel) {
             return Classified {
                 class: *class,
+                strategy: default_strategy(glob),
                 explicit: true,
             };
         }
     }
     Classified {
         class: Class::Knowledge,
+        strategy: MergeStrategy::Inherit,
         explicit: false,
     }
+}
+
+/// User-facing warnings about `[[home.policy]]` rules that don't make sense
+/// (emitted once by the CLI, not per path). None of these are fatal —
+/// [`classify`] handles each defensively — but they signal a config the user
+/// probably didn't intend.
+pub fn validate_policy(overrides: &[PolicyRule]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for r in overrides {
+        // A rule that forces no class and no effective strategy (absent, or an
+        // explicit `inherit`) does nothing — classify falls through it.
+        let effectively_empty =
+            r.class.is_none() && matches!(r.strategy, None | Some(MergeStrategy::Inherit));
+        match (r.class, r.strategy) {
+            _ if effectively_empty => warnings.push(format!(
+                "[[home.policy]] rule for glob \"{}\" sets neither class nor a meaningful strategy — ignored",
+                r.glob
+            )),
+            (Some(c @ (Class::Secret | Class::Ephemeral)), Some(MergeStrategy::Union)) => warnings
+                .push(format!(
+                    "[[home.policy]] strategy=\"union\" is meaningless for {}-class glob \"{}\" — ignored",
+                    class_label(c),
+                    r.glob
+                )),
+            _ => {}
+        }
+    }
+    warnings
 }
 
 /// Minimal path glob: `*` matches within one segment, `**` matches any run
@@ -519,13 +605,40 @@ fn harvest_instance(root: &Path, inst: &Path, overrides: &[PolicyRule]) -> Resul
                 Class::State => {
                     if let Some(theirs) = &theirs {
                         let path = base.join(&rel);
-                        let merged = state_merge_bytes(
-                            read_opt(&path).as_deref(),
-                            ancestor.as_deref(),
-                            theirs,
-                        )
-                        .with_context(|| format!("merging state {rel}"))?;
-                        write_atomic(&path, &merged)?;
+                        let current = read_opt(&path);
+                        match cls.strategy {
+                            // Append-only formats (history.jsonl): keep both
+                            // sides' lines, never conflict.
+                            MergeStrategy::Union => match &current {
+                                None => write_atomic(&path, theirs)?,
+                                Some(cur) => {
+                                    match union_merge(
+                                        ancestor.as_deref().unwrap_or_default(),
+                                        cur,
+                                        theirs,
+                                    )? {
+                                        Some(merged) => write_atomic(&path, &merged)?,
+                                        // Non-UTF-8 (e.g. a crash-truncated
+                                        // append): keep the base rather than
+                                        // overwrite it and lose the lines other
+                                        // runs accumulated.
+                                        None => eprintln!(
+                                            "pall8t: warning: {rel} is not valid UTF-8 — \
+                                             left the base copy unchanged"
+                                        ),
+                                    }
+                                }
+                            },
+                            MergeStrategy::Inherit => {
+                                let merged = state_merge_bytes(
+                                    current.as_deref(),
+                                    ancestor.as_deref(),
+                                    theirs,
+                                )
+                                .with_context(|| format!("merging state {rel}"))?;
+                                write_atomic(&path, &merged)?;
+                            }
+                        }
                     }
                 }
                 Class::Knowledge => {
@@ -535,6 +648,7 @@ fn harvest_instance(root: &Path, inst: &Path, overrides: &[PolicyRule]) -> Resul
                         path: rel,
                         class: cls.class,
                         change,
+                        strategy: cls.strategy,
                         explicit: cls.explicit,
                     });
                 }
@@ -675,6 +789,10 @@ struct Entry {
     path: String,
     class: Class,
     change: Change,
+    /// Merge strategy at promote time. Omitted from the manifest when the
+    /// class default (`inherit`) applies.
+    #[serde(default, skip_serializing_if = "MergeStrategy::is_inherit")]
+    strategy: MergeStrategy,
     /// Whether an explicit policy rule matched (else staged by the
     /// conservative default — surfaced so the gap is visible, FR-2).
     explicit: bool,
@@ -847,13 +965,15 @@ enum MergeResult {
 
 /// Applies one staged path to the base. `ancestor`/`theirs` presence in the
 /// changeset encodes the run's change (added/modified/deleted); the base's
-/// current state decides between a clean apply and a conflict.
+/// current state decides between a clean apply and a conflict. `union`-strategy
+/// entries (append-only formats) line-union instead of conflicting on content.
 fn merge_entry(base: &Path, cs: &Path, entry: &Entry) -> Result<MergeResult> {
     let rel = &entry.path;
     let ancestor = read_opt(&cs.join("ancestor").join(rel));
     let theirs = read_opt(&cs.join("theirs").join(rel));
     let target = base.join(rel);
     let current = read_opt(&target);
+    let union = entry.strategy == MergeStrategy::Union;
 
     match (&ancestor, &theirs) {
         // Added by the run (no fork-point version).
@@ -863,7 +983,10 @@ fn merge_entry(base: &Path, cs: &Path, entry: &Entry) -> Result<MergeResult> {
                 Ok(MergeResult::Clean)
             }
             Some(c) if c == t => Ok(MergeResult::Clean),
-            // Directory-union conflict: same path, different content.
+            // Same path, different content: union keeps both sides (a conflict
+            // only if the content isn't line-mergeable); otherwise it's a
+            // directory-union conflict.
+            Some(c) if union => write_or_conflict(&target, union_merge(b"", c, t)?),
             Some(_) => Ok(MergeResult::Conflict),
         },
         // Modified by the run.
@@ -874,6 +997,7 @@ fn merge_entry(base: &Path, cs: &Path, entry: &Entry) -> Result<MergeResult> {
                 Ok(MergeResult::Clean)
             }
             Some(c) if c == t => Ok(MergeResult::Clean),
+            Some(c) if union => write_or_conflict(&target, union_merge(a, c, t)?),
             Some(c) => match merge3_text(a, c, t)? {
                 Some(merged) => {
                     write_atomic(&target, &merged)?;
@@ -881,10 +1005,15 @@ fn merge_entry(base: &Path, cs: &Path, entry: &Entry) -> Result<MergeResult> {
                 }
                 None => Ok(MergeResult::Conflict),
             },
-            // Base deleted a file the run edited — needs a human.
+            // Base deleted a file the run edited: union re-adds the run's
+            // version; otherwise it needs a human.
+            None if union => {
+                write_atomic(&target, t)?;
+                Ok(MergeResult::Clean)
+            }
             None => Ok(MergeResult::Conflict),
         },
-        // Deleted by the run.
+        // Deleted by the run (union doesn't apply to a deletion).
         (Some(a), None) => match &current {
             None => Ok(MergeResult::Clean),
             Some(c) if c == a => {
@@ -898,12 +1027,48 @@ fn merge_entry(base: &Path, cs: &Path, entry: &Entry) -> Result<MergeResult> {
     }
 }
 
+/// Writes a successful merge to the base, or reports a conflict when the merge
+/// couldn't be produced (`None`, e.g. non-UTF-8 union input) — the base is left
+/// untouched, so it is never corrupted and the path stays staged (FR-5).
+fn write_or_conflict(target: &Path, merged: Option<Vec<u8>>) -> Result<MergeResult> {
+    match merged {
+        Some(m) => {
+            write_atomic(target, &m)?;
+            Ok(MergeResult::Clean)
+        }
+        None => Ok(MergeResult::Conflict),
+    }
+}
+
 /// Stateless textual three-way merge via `git merge-file` (git is already a
 /// dependency; no repository is involved). `Some(merged)` on a clean merge,
 /// `None` on conflict. Non-UTF-8 (binary) content is not line-merged: it's
 /// a conflict unless the sides happen to match, so the base is never
 /// corrupted by textual markers in a binary file.
 fn merge3_text(ancestor: &[u8], current: &[u8], theirs: &[u8]) -> Result<Option<Vec<u8>>> {
+    git_merge_file(ancestor, current, theirs, false)
+}
+
+/// Line-level three-way union merge (`git merge-file --union`): keeps both
+/// sides' added lines with no conflict markers — the append-only strategy.
+/// `None` when the content can't be line-merged (non-UTF-8): the caller must
+/// then NOT overwrite the base (doing so would silently drop the lines other
+/// runs accumulated), leaving it unchanged rather than corrupting it.
+fn union_merge(ancestor: &[u8], current: &[u8], theirs: &[u8]) -> Result<Option<Vec<u8>>> {
+    git_merge_file(ancestor, current, theirs, true)
+}
+
+/// Runs `git merge-file [-p] [--union] current ancestor theirs`, returning the
+/// merged bytes. `Some` on a clean merge (always, with `union`, which resolves
+/// every hunk by keeping both sides); `None` on a textual conflict or on
+/// non-UTF-8 input (never line-merged). The single place that shells out to
+/// git for text merges, so the temp-file discipline can't drift.
+fn git_merge_file(
+    ancestor: &[u8],
+    current: &[u8],
+    theirs: &[u8],
+    union: bool,
+) -> Result<Option<Vec<u8>>> {
     if [ancestor, current, theirs]
         .iter()
         .any(|b| std::str::from_utf8(b).is_err())
@@ -920,9 +1085,13 @@ fn merge3_text(ancestor: &[u8], current: &[u8], theirs: &[u8]) -> Result<Option<
     std::fs::write(&other, theirs)?;
     // `git merge-file -p a b c` folds the b->c change into a and writes the
     // result to stdout; exit 0 = clean, >0 = conflict count, <0 = error.
-    let out = std::process::Command::new("git")
-        .arg("merge-file")
-        .arg("-p")
+    // `--union` resolves every conflict hunk by keeping both sides (exit 0).
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("merge-file").arg("-p");
+    if union {
+        cmd.arg("--union");
+    }
+    let out = cmd
         .arg(&ours)
         .arg(&base)
         .arg(&other)
