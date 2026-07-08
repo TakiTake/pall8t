@@ -3,18 +3,23 @@ FROM ubuntu:24.04
 ARG UID=501
 ARG GID=501
 
-# Base tools + node + claude CLI + gh; dev user with host UID/GID (same as
-# the default pall8t image), plus a Rust toolchain for developing pall8t.
+# Base tools + node + claude CLI + gh + jq (agents post-process `gh --json`);
+# dev user with host UID/GID (same as the default pall8t image), plus a Rust
+# toolchain for developing pall8t. GitHub's SSH host keys are baked in from the
+# authenticated api.github.com/meta (not ssh-keyscan/TOFU) so git-over-SSH works
+# without an interactive host-key prompt.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git sudo ripgrep less vim openssh-client tmux \
+      ca-certificates curl git sudo ripgrep less vim openssh-client tmux jq \
       build-essential pkg-config && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
       > /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && apt-get install -y --no-install-recommends gh && \
+    curl -fsSL https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com \(.)"' \
+      >> /etc/ssh/ssh_known_hosts && \
     (getent group ${GID} || groupadd -g ${GID} dev) && \
     useradd -m -u ${UID} -g ${GID} -s /bin/bash dev && \
     echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
@@ -28,12 +33,15 @@ RUN printf '%s\n' \
       > /etc/tmux.conf
 
 # Rust goes to /usr/local, NOT /home/dev: pall8t mounts a persistent home
-# over /home/dev at runtime, which would shadow a ~/.cargo install.
+# over /home/dev at runtime, which would shadow a ~/.cargo install. The
+# aarch64-apple-darwin target is added for the cross-target clippy gate on
+# cfg(target_os = "macos") code (the build host is Linux).
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | \
       sh -s -- -y --no-modify-path --default-toolchain 1.96 --profile default && \
+    rustup target add aarch64-apple-darwin && \
     chown -R ${UID}:${GID} /usr/local/rustup /usr/local/cargo && \
     echo 'export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH' \
       > /etc/profile.d/rust.sh
