@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use pall8t::{config, container, image, repos, worktree};
+use pall8t::{config, container, home, image, repos, worktree};
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -43,6 +43,40 @@ enum Cmd {
     },
     /// Stop a container
     Stop { id: String },
+    /// Inspect and fold back changes from isolated-home runs
+    Home {
+        #[command(subcommand)]
+        cmd: HomeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum HomeCmd {
+    /// Harvest finished isolated runs into the inbox (also runs lazily on
+    /// the next `pall8t run`)
+    Harvest,
+    /// List pending changesets awaiting promotion
+    Inbox,
+    /// Show what a run changed
+    Show { run: String },
+    /// Merge a run's changes (or selected paths) into the base home
+    Promote {
+        run: String,
+        /// Limit to these `$HOME`-relative paths (default: all)
+        paths: Vec<String>,
+    },
+    /// Discard a run's changeset (or selected paths)
+    Drop {
+        run: String,
+        /// Limit to these `$HOME`-relative paths (default: the whole run)
+        paths: Vec<String>,
+    },
+    /// harvest + show + promote-all in one step: fold pending runs (or one
+    /// <run>) into the base, printing what each changed
+    Merge {
+        /// Merge just this run (default: every pending run)
+        run: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -53,6 +87,7 @@ fn main() -> Result<()> {
         Cmd::Ls { json } => cmd_ls(json),
         Cmd::Exec { id, command } => cmd_exec(&id, command),
         Cmd::Stop { id } => cmd_stop(&id),
+        Cmd::Home { cmd } => cmd_home(cmd),
     }
 }
 
@@ -109,6 +144,7 @@ fn exec_container(argv: Vec<String>) -> Result<()> {
 
 fn cmd_run(cli_command: Vec<String>) -> Result<()> {
     let (cwd, cfg, uid, gid, resolved) = workspace_image(false)?;
+    let run_name = container::run_name(&cwd);
 
     let mut mounts = vec![container::Mount::identity(cwd.clone())];
     if let Some(git_dir) = worktree::main_git_dir(&cwd) {
@@ -133,7 +169,7 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
         });
     }
     mounts.push(container::Mount {
-        host: container::home_mount()?,
+        host: home_for_run(&cfg, &run_name, &cwd)?,
         dest: "/home/dev".into(),
     });
 
@@ -143,7 +179,7 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
         cli_command
     };
     let spec = container::RunSpec {
-        name: container::run_name(&cwd),
+        name: run_name,
         image: resolved.tag,
         workdir: cwd,
         mounts,
@@ -203,6 +239,151 @@ fn cmd_stop(id: &str) -> Result<()> {
     container::stop(id)?;
     println!("stopped {id}");
     Ok(())
+}
+
+/// The host path to mount at `/home/dev`. `shared` mode is byte-for-byte
+/// today's behavior: the base home, unchanged. `isolated` mode first
+/// harvests any finished runs (lazy, FR-8), then forks a private instance
+/// for this run (FR-1).
+fn home_for_run(cfg: &config::Config, run_name: &str, cwd: &Path) -> Result<std::path::PathBuf> {
+    match cfg.home.mode {
+        home::HomeMode::Shared => container::home_mount(),
+        home::HomeMode::Isolated => {
+            warn_policy(&cfg.home.policy);
+            match home::harvest_finished(&cfg.home.policy) {
+                Ok(runs) if !runs.is_empty() => {
+                    eprintln!(
+                        "pall8t: harvested {} finished run(s) — see `pall8t home inbox`",
+                        runs.len()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("pall8t: warning: could not harvest finished runs: {e:#}"),
+            }
+            let instance = home::fork_instance(run_name, cwd)?;
+            eprintln!("pall8t: isolated home — forked a private instance for this run");
+            Ok(instance)
+        }
+    }
+}
+
+/// The cwd project's policy overrides, for the standalone `home` commands
+/// that reclassify (harvest, merge). Best-effort: a missing/broken config
+/// falls back to the built-in defaults rather than failing the command.
+fn cwd_home_policy() -> Vec<config::PolicyRule> {
+    let policy = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| config::load(&cwd).ok())
+        .map(|c| c.home.policy)
+        .unwrap_or_default();
+    warn_policy(&policy);
+    policy
+}
+
+/// Surfaces nonsensical `[[home.policy]]` rules (see [`home::validate_policy`]).
+fn warn_policy(policy: &[config::PolicyRule]) {
+    for w in home::validate_policy(policy) {
+        eprintln!("pall8t: warning: {w}");
+    }
+}
+
+fn cmd_home(cmd: HomeCmd) -> Result<()> {
+    match cmd {
+        HomeCmd::Harvest => {
+            let runs = home::harvest_finished(&cwd_home_policy())?;
+            if runs.is_empty() {
+                println!("no finished runs to harvest");
+            } else {
+                println!("harvested {} run(s):", runs.len());
+                for r in runs {
+                    println!("  {r}");
+                }
+            }
+            Ok(())
+        }
+        HomeCmd::Inbox => {
+            let changesets = home::list_changesets()?;
+            if changesets.is_empty() {
+                println!("inbox empty");
+            } else {
+                for c in changesets {
+                    println!("{}\t{} path(s)\t{}", c.run, c.entries, c.workspace);
+                }
+            }
+            Ok(())
+        }
+        HomeCmd::Show { run } => {
+            print!("{}", home::show(&run)?);
+            Ok(())
+        }
+        HomeCmd::Promote { run, paths } => {
+            let outcome = home::promote(&run, &paths)?;
+            for p in &outcome.promoted {
+                println!("promoted {p}");
+            }
+            if outcome.conflicts.is_empty() {
+                Ok(())
+            } else {
+                // Base left untouched for these; surface for resolution
+                // (FR-5) and exit non-zero so scripts notice.
+                Err(anyhow!(
+                    "{} path(s) conflicted and stay staged (base unchanged): {}",
+                    outcome.conflicts.len(),
+                    outcome.conflicts.join(", ")
+                ))
+            }
+        }
+        HomeCmd::Drop { run, paths } => {
+            home::drop_changeset(&run, &paths)?;
+            println!("dropped {run}");
+            Ok(())
+        }
+        HomeCmd::Merge { run } => cmd_home_merge(run),
+    }
+}
+
+fn cmd_home_merge(run: Option<String>) -> Result<()> {
+    let report = home::merge(run.as_deref(), &cwd_home_policy())?;
+    if report.steps.is_empty() {
+        // Harvest may still have had side effects (secret/state write-back)
+        // even with no knowledge changeset to promote — say so honestly.
+        if report.harvested.is_empty() {
+            println!("nothing to merge");
+        } else {
+            println!(
+                "harvested {} run(s); no knowledge changes to promote",
+                report.harvested.len()
+            );
+        }
+        return Ok(());
+    }
+    let mut conflicted: Option<&home::MergeStep> = None;
+    for step in &report.steps {
+        // Show what is being folded in, then what landed — the record of the
+        // merge (there is no confirmation prompt; `merge` is itself explicit).
+        print!("{}", step.shown);
+        for p in &step.promoted {
+            println!("promoted {p}");
+        }
+        if !step.conflicts.is_empty() {
+            conflicted = Some(step);
+        }
+    }
+    match conflicted {
+        None => Ok(()),
+        // Processing stopped at this changeset (FR-5); later ones stay staged.
+        // Exit non-zero, like `promote`, and point at per-path resolution.
+        Some(step) => Err(anyhow!(
+            "{} path(s) in {} conflicted and stay staged (base unchanged); later \
+             changesets left untouched. Resolve with `pall8t home promote {} <path>` or \
+             `pall8t home drop {} <path>`, then re-run `pall8t home merge`: {}",
+            step.conflicts.len(),
+            step.run,
+            step.run,
+            step.run,
+            step.conflicts.join(", ")
+        )),
+    }
 }
 
 /// FR-6: create `~/.pall8t/home`, config skeletons, and the default

@@ -1,3 +1,4 @@
+use crate::home::{Class, HomeMode, MergeStrategy};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,9 @@ pub struct Config {
     pub containerfile: Option<PathBuf>,
     pub command: Vec<String>,
     pub repos: Vec<RepoEntry>,
+    /// `[home]` — how the container home is materialized and how a run's
+    /// changes to it are classified (see [`crate::home`]).
+    pub home: HomeConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -32,6 +36,34 @@ pub struct RepoEntry {
     pub source: PathBuf,
 }
 
+/// Merged `[home]` configuration. `mode` picks today's shared home or the
+/// per-run fork-and-harvest model; `policy` prepends user overrides to the
+/// built-in path classification ([`crate::home::DEFAULT_RULES`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HomeConfig {
+    pub mode: HomeMode,
+    pub policy: Vec<PolicyRule>,
+}
+
+/// One `[[home.policy]]` rule: a glob (matched against a `$HOME`-relative
+/// path) mapped to the `class` it forces and/or the merge `strategy` it uses.
+/// First match wins, user overrides before the defaults — see
+/// [`crate::home::classify`]. `class` may be omitted when only overriding the
+/// strategy (it then defaults to `state`); a rule with neither is ignored
+/// (see [`crate::home::validate_policy`]).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyRule {
+    /// `path` is accepted as an alias so a rule can read naturally
+    /// (`path = ".claude/history.jsonl"`); `glob` is the documented key.
+    #[serde(alias = "path")]
+    pub glob: String,
+    #[serde(default)]
+    pub class: Option<Class>,
+    #[serde(default)]
+    pub strategy: Option<MergeStrategy>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct Raw {
     #[serde(default)]
@@ -39,6 +71,14 @@ struct Raw {
     #[serde(default)]
     run: RawRun,
     repos: Option<Vec<RepoEntry>>,
+    #[serde(default)]
+    home: RawHome,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawHome {
+    mode: Option<HomeMode>,
+    policy: Option<Vec<PolicyRule>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -106,6 +146,18 @@ fn merge(global: Raw, project: Raw) -> Config {
             .or(global.run.command)
             .unwrap_or_else(|| vec!["claude".to_string()]),
         repos: project.repos.or(global.repos).unwrap_or_default(),
+        home: HomeConfig {
+            mode: project.home.mode.or(global.home.mode).unwrap_or_default(),
+            // Policy overrides replace rather than append (like `repos`), so
+            // a project fully controls its classification without inheriting
+            // global rules it can't see; the built-in defaults always apply
+            // underneath in `classify`.
+            policy: project
+                .home
+                .policy
+                .or(global.home.policy)
+                .unwrap_or_default(),
+        },
     }
 }
 
@@ -122,6 +174,24 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # Command run by `pall8t run`. --dangerously-skip-permissions is NOT in
 # the default; add it here explicitly if you want it.
 # command = ["claude"]
+
+[home]
+# mode = "shared"    # default: every run mounts ~/.pall8t/home rw (v1 behavior)
+# mode = "isolated"  # per-run fork; harvest changes into an inbox to promote
+#
+# Override the built-in path classification (secret | state | knowledge |
+# ephemeral). First match wins, these before the defaults.
+# [[home.policy]]
+# glob = ".config/my-tool/**"
+# class = "knowledge"
+#
+# `strategy = "union"` line-merges an append-only file (keeps both sides, never
+# conflicts) instead of the class default. `class` may be omitted with a
+# strategy (defaults to state — auto-merged at harvest). `path` is an alias for
+# `glob`.
+# [[home.policy]]
+# glob = ".config/my-tool/log.jsonl"
+# strategy = "union"
 "#;
 
 /// Skeleton written by `pall8t init` as `./pall8t.toml`.
@@ -137,6 +207,9 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 
 [run]
 # command = ["claude"]
+
+[home]
+# mode = "isolated"  # per-run home fork + harvest/promote (default: shared)
 "#;
 
 #[cfg(test)]
@@ -155,6 +228,82 @@ mod tests {
         assert_eq!(cfg.containerfile, None);
         assert_eq!(cfg.command, vec!["claude".to_string()]);
         assert!(cfg.repos.is_empty());
+        assert_eq!(
+            cfg.home.mode,
+            HomeMode::Shared,
+            "shared home is the default"
+        );
+        assert!(cfg.home.policy.is_empty());
+    }
+
+    #[test]
+    fn home_mode_and_policy_merge_per_field() {
+        let global = parse(
+            r#"
+            [home]
+            mode = "isolated"
+            [[home.policy]]
+            glob = ".config/a/**"
+            class = "knowledge"
+            "#,
+        );
+        // Project omits mode (falls through) but replaces the policy list.
+        let project = parse(
+            r#"
+            [[home.policy]]
+            glob = ".config/b/**"
+            class = "ephemeral"
+            "#,
+        );
+        let cfg = merge(global, project);
+        assert_eq!(
+            cfg.home.mode,
+            HomeMode::Isolated,
+            "unset project mode falls through"
+        );
+        assert_eq!(
+            cfg.home.policy,
+            vec![PolicyRule {
+                glob: ".config/b/**".to_string(),
+                class: Some(Class::Ephemeral),
+                strategy: None,
+            }],
+            "project policy replaces global policy"
+        );
+    }
+
+    #[test]
+    fn policy_strategy_and_path_alias_parse() {
+        // The user's snippet (`path` + `strategy`, no explicit class) parses;
+        // `path` is an alias for `glob`.
+        let cfg = parse(
+            r#"
+            [[home.policy]]
+            path = ".claude/history.jsonl"
+            strategy = "union"
+            "#,
+        );
+        assert_eq!(
+            cfg.home.policy.unwrap(),
+            vec![PolicyRule {
+                glob: ".claude/history.jsonl".to_string(),
+                class: None,
+                strategy: Some(MergeStrategy::Union),
+            }]
+        );
+    }
+
+    #[test]
+    fn policy_rejects_invalid_strategy_and_unknown_field() {
+        assert!(
+            toml::from_str::<Raw>("[[home.policy]]\nglob = \".x\"\nstrategy = \"bogus\"\n")
+                .is_err(),
+            "an unknown strategy value must fail to parse"
+        );
+        assert!(
+            toml::from_str::<Raw>("[[home.policy]]\nglob = \".x\"\nclas = \"state\"\n").is_err(),
+            "a misspelled field must fail to parse (deny_unknown_fields)"
+        );
     }
 
     #[test]

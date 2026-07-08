@@ -39,7 +39,7 @@ Four entities:
 | Class | Examples | Fork | Disposition on harvest |
 |---|---|---|---|
 | `secret` | `.claude/.credentials.json`, `.gh-token` | copied | auto write-back to base (latest-wins); **never in diffs/logs** |
-| `state` | `.claude.json` durable keys | copied | auto structural (key-path JSON) merge — mechanical, no value judgment |
+| `state` | `.claude.json` durable keys; `.claude/history.jsonl` (append-only, `union`) | copied | auto structural (key-path JSON, or line-union for append-only) merge — mechanical, no value judgment |
 | `knowledge` | `.claude/skills/`, memory, `CLAUDE.md`, `settings.json` | copied | **staged in inbox; merged only on explicit promote** |
 | `ephemeral` | `.npm`, `.cache`, `.bash_history`, locks | fresh or copied | discarded, never merged |
 
@@ -47,7 +47,8 @@ Unclassified paths default to a conservative class (staged, reported) so a polic
 can't silently lose or leak anything. A policy override can mark specific globs
 auto-promote, but staged-by-default is the rule for knowledge: a run editing
 `.claude/skills/xxx` may be a throwaway PoC or a keeper — only the user can judge, so
-the data always flows back, and the merge is always optional.
+the data always flows back, and the merge is always optional. An optional `strategy`
+on a policy rule selects the text-merge algorithm (see FR-4).
 
 ## Functional requirements
 
@@ -69,8 +70,11 @@ the data always flows back, and the merge is always optional.
   required: one run may produce one keeper skill and three PoC scraps. Merge strategies
   per class: directory-union for additive trees like skills (conflict only on
   same-path-different-content), textual 3-way for prose/config, key-path JSON merge for
-  structured state, latest-wins for secrets, and a pluggable resolver hook — which may
-  invoke a **local** Claude as semantic merge agent, never a third-party API.
+  structured state, **line-union (`git merge-file --union`) for append-only formats like
+  `.claude/history.jsonl` — keeps both sides' lines, never conflicts**, latest-wins for
+  secrets, and a pluggable resolver hook — which may invoke a **local** Claude as semantic
+  merge agent, never a third-party API. The `union` strategy is selectable on any policy
+  rule via `strategy = "union"`.
 - **FR-5 Conflicts never poison the base.** Conflicts can only arise at promote time,
   under user attention; parallel runs' changesets sit independently in the inbox
   regardless of overlap, and promotion order determines merge order. Clean merges land;
@@ -94,9 +98,11 @@ the data always flows back, and the merge is always optional.
   refreshes OAuth tokens) propagates to the base at harvest so later runs don't
   re-login; concurrent refreshes resolve latest-wins without corruption.
 - **FR-11 Interface.** A `pall8t home` subcommand family (`inbox`, `show`, `promote`,
-  `drop`, `harvest`, `log`, `rollback`, `gc`): stable exit codes, `--json` where herdr
-  or scripts consume it, no daemon. Implemented in the pall8t crate (`src/home.rs`),
-  reusing the existing subprocess/`git()` and config plumbing.
+  `drop`, `harvest`, `merge`, `log`, `rollback`, `gc`): stable exit codes, `--json` where
+  herdr or scripts consume it, no daemon. `merge [<run>]` is a convenience composition of
+  harvest + show + promote-all (fold pending runs into the base, printing what each
+  changed). Implemented in the pall8t crate (`src/home.rs`), reusing the existing
+  subprocess/`git()` and config plumbing.
 
 ## Non-functional requirements
 
