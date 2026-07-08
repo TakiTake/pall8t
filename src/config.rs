@@ -1,6 +1,6 @@
 use crate::home::{Class, HomeMode, MergeStrategy};
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Per-project config file name, looked up in the current directory.
@@ -68,8 +68,11 @@ impl Default for HomeConfig {
 /// First match wins, user overrides before the defaults — see
 /// [`crate::home::classify`]. `class` may be omitted when only overriding the
 /// strategy (it then defaults to `state`); a rule with neither is ignored
-/// (see [`crate::home::validate_policy`]).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// (see [`crate::home::validate_policy`]). Also `Serialize`: a revision
+/// records the policy overrides active when it was recorded, so `diff` can
+/// later redact a path that was declared secret at record time even if the
+/// cwd's current policy no longer says so (see [`crate::home::diff`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyRule {
     /// `path` is accepted as an alias so a rule can read naturally

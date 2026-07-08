@@ -363,7 +363,7 @@ fn promote_directory_union_adds_new_skill() {
     run_and_harvest(&root, "r", |inst| {
         write(&inst.join(".claude/skills/new/SKILL.md"), "new skill");
     });
-    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(outcome.promoted, vec![".claude/skills/new/SKILL.md"]);
     assert!(outcome.conflicts.is_empty());
     assert_eq!(
@@ -386,6 +386,7 @@ fn promote_selected_path_only() {
         root.path(),
         "r",
         &[".claude/skills/keep".to_string()],
+        &[],
         DEFAULT_REVISIONS_KEEP,
     )
     .unwrap();
@@ -411,7 +412,7 @@ fn promote_clean_text_three_way_merge() {
     });
     // Base independently changes the first line after the fork.
     root.write_base("CLAUDE.md", "top EDITED\na\nb\nc\nbottom\n");
-    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(outcome.conflicts.is_empty(), "non-overlapping edits merge");
     assert_eq!(
         root.read_base("CLAUDE.md").unwrap(),
@@ -429,7 +430,7 @@ fn promote_conflict_leaves_base_untouched_and_keeps_staged() {
     });
     // Base diverges on the same line.
     root.write_base("CLAUDE.md", "base version\n");
-    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(outcome.conflicts, vec!["CLAUDE.md"]);
     assert!(outcome.promoted.is_empty());
     assert_eq!(
@@ -474,6 +475,7 @@ fn unknown_promote_path_errors() {
         root.path(),
         "r",
         &[".claude/skills/typo".to_string()],
+        &[],
         DEFAULT_REVISIONS_KEEP,
     )
     .unwrap_err();
@@ -514,8 +516,8 @@ fn two_parallel_runs_merge_state_and_stage_independently() {
     assert_eq!(changesets.len(), 2);
 
     // Promoting both lands both skills without conflict.
-    promote_at(root.path(), "run-a", &[], DEFAULT_REVISIONS_KEEP).unwrap();
-    promote_at(root.path(), "run-b", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    promote_at(root.path(), "run-a", &[], &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    promote_at(root.path(), "run-b", &[], &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(root.base().join(".claude/skills/x/SKILL.md").exists());
     assert!(root.base().join(".claude/skills/y/SKILL.md").exists());
 }
@@ -596,7 +598,7 @@ fn knowledge_union_strategy_merges_without_conflict_at_promote() {
     // Base diverges on the same middle line -> plain 3-way would conflict.
     root.write_base("notes.log", "top\nbase\nbottom\n");
 
-    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(
         outcome.conflicts.is_empty(),
         "union strategy must not conflict"
@@ -962,7 +964,7 @@ fn promote_records_a_revision_only_for_landed_paths() {
     });
     // Base diverges so CLAUDE.md conflicts; the skill still lands cleanly.
     root.write_base("CLAUDE.md", "base version\n");
-    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(outcome.promoted, vec![".claude/skills/a/SKILL.md"]);
     assert_eq!(outcome.conflicts, vec!["CLAUDE.md"]);
 
@@ -980,7 +982,7 @@ fn promote_landing_nothing_records_no_revision() {
         write(&inst.join("CLAUDE.md"), "run version\n");
     });
     root.write_base("CLAUDE.md", "base version\n");
-    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(outcome.promoted.is_empty());
     assert!(
         list_revisions_at(root.path()).unwrap().is_empty(),
@@ -1035,7 +1037,7 @@ fn diff_newest_revision_compares_against_current_base() {
     run_and_harvest(&root, "r", |inst| {
         write(&inst.join(".claude/skills/a/SKILL.md"), "a");
     });
-    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(outcome.promoted.len(), 1);
     let revs = list_revisions_at(root.path()).unwrap();
     assert_eq!(revs.len(), 1);
@@ -1066,7 +1068,7 @@ fn rollback_restores_base_and_is_itself_a_revision() {
     assert_eq!(revs.len(), 1);
     let seq = revs[0].seq;
 
-    rollback_at(root.path(), seq, DEFAULT_REVISIONS_KEEP).unwrap();
+    rollback_at(root.path(), seq, &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(
         root.read_base(".claude/.credentials.json").unwrap(),
         r#"{"token":"v1"}"#,
@@ -1080,7 +1082,7 @@ fn rollback_restores_base_and_is_itself_a_revision() {
 
     // The rollback is itself undoable: rolling back to its own pre-mutation
     // snapshot (the state right after the original harvest) restores v2.
-    rollback_at(root.path(), revs_after[0].seq, DEFAULT_REVISIONS_KEEP).unwrap();
+    rollback_at(root.path(), revs_after[0].seq, &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(
         root.read_base(".claude/.credentials.json").unwrap(),
         r#"{"token":"v2"}"#,
@@ -1091,7 +1093,7 @@ fn rollback_restores_base_and_is_itself_a_revision() {
 #[test]
 fn rollback_unknown_revision_errors() {
     let root = TempRoot::new("rollback-unknown");
-    let err = rollback_at(root.path(), 999, DEFAULT_REVISIONS_KEEP).unwrap_err();
+    let err = rollback_at(root.path(), 999, &[], DEFAULT_REVISIONS_KEEP).unwrap_err();
     assert!(err.to_string().contains("no revision"));
 }
 
@@ -1103,11 +1105,11 @@ fn rollback_to_already_current_state_records_nothing_new() {
         write(&inst.join(".claude/.credentials.json"), r#"{"token":"v2"}"#);
     });
     let seq = list_revisions_at(root.path()).unwrap()[0].seq;
-    rollback_at(root.path(), seq, DEFAULT_REVISIONS_KEEP).unwrap();
+    rollback_at(root.path(), seq, &[], DEFAULT_REVISIONS_KEEP).unwrap();
     let count_after_first = list_revisions_at(root.path()).unwrap().len();
     // The base is already at revision `seq`'s snapshot content; rolling back
     // to it again changes nothing.
-    rollback_at(root.path(), seq, DEFAULT_REVISIONS_KEEP).unwrap();
+    rollback_at(root.path(), seq, &[], DEFAULT_REVISIONS_KEEP).unwrap();
     let count_after_second = list_revisions_at(root.path()).unwrap().len();
     assert_eq!(
         count_after_first, count_after_second,
@@ -1364,7 +1366,7 @@ fn promote_clean_no_op_does_not_record_a_phantom_revision() {
         write(&inst.join("CLAUDE.md"), "v2\n");
     });
     root.write_base("CLAUDE.md", "v2\n"); // base already matches by promote time
-    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(
         outcome.promoted,
         vec!["CLAUDE.md"],
@@ -1487,5 +1489,187 @@ fn lock_base_repairs_an_interrupted_swap_automatically() {
     assert_eq!(
         std::fs::read_to_string(base.join("marker")).unwrap(),
         "new-content"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests: lead review round 1
+// ---------------------------------------------------------------------------
+
+#[test]
+fn diff_redacts_a_secret_declared_by_the_recorded_policy_even_with_different_current_policy() {
+    // A project declares `.config/mytool/token` secret via [[home.policy]]
+    // (the documented pattern for credentials the built-in defaults don't
+    // cover). The revision recording that harvest stores the policy that
+    // was ACTIVE then; `diff` called later from a cwd whose policy doesn't
+    // know about this rule at all must still redact it -- revisions are
+    // global but policy is per-project.
+    let overrides_at_record_time = vec![PolicyRule {
+        glob: ".config/mytool/token".to_string(),
+        class: Some(Class::Secret),
+        strategy: None,
+    }];
+    let root = TempRoot::new("diff-secret-recorded-policy");
+    root.write_base(".config/mytool/token", "old-secret");
+    let instance = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    write(&instance.join(".config/mytool/token"), "new-secret");
+    finish_run(&root, "r");
+    harvest_finished_at(
+        root.path(),
+        &overrides_at_record_time,
+        DEFAULT_REVISIONS_KEEP,
+    )
+    .unwrap();
+
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs.len(), 1);
+    // Diffed with an EMPTY current policy -- doesn't know this rule.
+    let out = diff_at(root.path(), revs[0].seq, &[]).unwrap();
+    assert!(out.contains(".config/mytool/token"));
+    assert!(out.contains("secret — content not shown"));
+    assert!(!out.contains("old-secret"));
+    assert!(!out.contains("new-secret"));
+}
+
+#[test]
+fn diff_redacts_a_path_the_current_policy_declares_secret_even_if_recorded_policy_didnt() {
+    // At harvest time `.claude.json` was classified State by the built-in
+    // defaults (not secret). A `[[home.policy]]` rule added AFTER the fact
+    // making it secret must still protect this OLD revision's diff --
+    // editing policy to protect a path re-protects old snapshots too.
+    let root = TempRoot::new("diff-secret-current-policy");
+    root.write_base(".claude.json", r#"{"n":1}"#);
+    run_and_harvest(&root, "r", |inst| {
+        write(&inst.join(".claude.json"), r#"{"n":2}"#);
+    });
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs.len(), 1);
+
+    let current_overrides = vec![PolicyRule {
+        glob: ".claude.json".to_string(),
+        class: Some(Class::Secret),
+        strategy: None,
+    }];
+    let out = diff_at(root.path(), revs[0].seq, &current_overrides).unwrap();
+    assert!(out.contains(".claude.json"));
+    assert!(out.contains("secret — content not shown"));
+    assert!(!out.contains("\"n\":1"));
+    assert!(!out.contains("\"n\":2"));
+}
+
+#[test]
+fn parallel_runs_writing_identical_secret_value_records_only_one_revision() {
+    // Both runs refresh the credential to the SAME new value. The second
+    // harvest's write is byte-identical to what the first harvest already
+    // wrote -- it must not count as a mutation and burn a second revision.
+    let root = TempRoot::new("identical-secret-writes");
+    root.write_base(".claude/.credentials.json", r#"{"token":"old"}"#);
+    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa")).unwrap();
+    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb")).unwrap();
+    write(
+        &inst_a.join(".claude/.credentials.json"),
+        r#"{"token":"new"}"#,
+    );
+    write(
+        &inst_b.join(".claude/.credentials.json"),
+        r#"{"token":"new"}"#,
+    );
+    finish_run(&root, "run-a");
+    finish_run(&root, "run-b");
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
+
+    assert_eq!(
+        root.read_base(".claude/.credentials.json").unwrap(),
+        r#"{"token":"new"}"#
+    );
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(
+        revs.len(),
+        1,
+        "the second run's write is byte-identical to the base after the first -- no new revision"
+    );
+}
+
+#[test]
+fn promote_union_merge_identical_to_current_consumes_path_without_recording_revision() {
+    // Two runs stage the exact same append to a union-strategy path. The
+    // first promote is a real content change (records a revision); the
+    // second's union merge reconstructs exactly what's already there --
+    // the path is still consumed from run-b's changeset, but no new
+    // revision should be recorded for it.
+    let overrides = vec![PolicyRule {
+        glob: "notes.log".to_string(),
+        class: Some(Class::Knowledge),
+        strategy: Some(MergeStrategy::Union),
+    }];
+    let root = TempRoot::new("union-noop-revision");
+    root.write_base("notes.log", "line1\n");
+
+    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa")).unwrap();
+    write(&inst_a.join("notes.log"), "line1\nline2\n");
+    finish_run(&root, "run-a");
+    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb")).unwrap();
+    write(&inst_b.join("notes.log"), "line1\nline2\n");
+    finish_run(&root, "run-b");
+    harvest_finished_at(root.path(), &overrides, DEFAULT_REVISIONS_KEEP).unwrap();
+
+    let outcome_a = promote_at(
+        root.path(),
+        "run-a",
+        &[],
+        &overrides,
+        DEFAULT_REVISIONS_KEEP,
+    )
+    .unwrap();
+    assert_eq!(outcome_a.promoted, vec!["notes.log".to_string()]);
+    let revs_after_a = list_revisions_at(root.path()).unwrap().len();
+    assert_eq!(revs_after_a, 1);
+
+    let outcome_b = promote_at(
+        root.path(),
+        "run-b",
+        &[],
+        &overrides,
+        DEFAULT_REVISIONS_KEEP,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome_b.promoted,
+        vec!["notes.log".to_string()],
+        "the path is still consumed from run-b's changeset"
+    );
+    let revs_after_b = list_revisions_at(root.path()).unwrap().len();
+    assert_eq!(
+        revs_after_b, revs_after_a,
+        "no new revision for a union merge whose result is byte-identical to the base"
+    );
+}
+
+#[test]
+fn prune_revisions_clamps_zero_keep_to_one() {
+    // revisions_keep = 0 must not prune the revision that was just written
+    // (which would leave `home log` permanently empty and reset
+    // `next_revision_seq` to 1 forever) -- it's clamped to keep the latest.
+    let root = TempRoot::new("prune-zero-keep");
+    root.write_base(".claude/.credentials.json", r#"{"token":"0"}"#);
+    for i in 1..=3u32 {
+        let run = format!("r{i}");
+        let instance = fork_instance_at(root.path(), &run, Path::new("/ws")).unwrap();
+        write(
+            &instance.join(".claude/.credentials.json"),
+            &format!(r#"{{"token":"{i}"}}"#),
+        );
+        finish_run(&root, &run);
+        harvest_finished_at(root.path(), &[], 0).unwrap();
+    }
+    let dirs = list_revision_dirs(root.path()).unwrap();
+    assert_eq!(
+        dirs.len(),
+        1,
+        "revisions_keep=0 is clamped to 1, not 'erase everything including what was just written'"
+    );
+    assert_eq!(
+        dirs[0].0, 3,
+        "sequence numbers keep advancing rather than resetting to 1 each time"
     );
 }

@@ -470,7 +470,6 @@ pub fn fork_instance(run_name: &str, workspace: &Path) -> Result<PathBuf> {
 
 fn fork_instance_at(root: &Path, run_name: &str, workspace: &Path) -> Result<PathBuf> {
     let base = base_dir(root);
-    std::fs::create_dir_all(&base)?;
     let inst = instances_root(root).join(run_name);
     if inst.exists() {
         // A previous fork with this exact name never harvested (same cwd +
@@ -501,9 +500,12 @@ fn fork_instance_at(root: &Path, run_name: &str, workspace: &Path) -> Result<Pat
     std::fs::create_dir_all(&partial)?;
     // Snapshot the quiescent base into the instance and its ancestor under
     // the base lock, then publish atomically by rename: a crash before the
-    // rename leaves only `<run>.partial`, never a half-instance.
+    // rename leaves only `<run>.partial`, never a half-instance. `base`'s
+    // own creation (the very first fork ever) lives in this same locked
+    // section too — every base touch happens under the lock, no exceptions.
     {
         let _lock = lock_base(root)?;
+        std::fs::create_dir_all(&base)?;
         clone_tree(&base, &partial.join("root"))?;
         clone_tree(&base, &partial.join("ancestor"))?;
     }
@@ -617,6 +619,15 @@ struct RevisionMeta {
     runs: Vec<String>,
     paths: Vec<String>,
     created: u64,
+    /// The `[[home.policy]]` overrides active when this revision was
+    /// recorded, so `diff` can redact a path some project's policy declared
+    /// secret even when read later from a cwd whose policy doesn't (or no
+    /// longer does) — see [`diff_at`]. `#[serde(default)]` so a revision
+    /// recorded before this field existed parses as an empty list rather
+    /// than failing to load; `diff_at` then falls back to relying on the
+    /// CURRENT cwd's policy alone for that older revision, same as before.
+    #[serde(default)]
+    policy: Vec<PolicyRule>,
 }
 
 /// One row of `pall8t home log`.
@@ -709,6 +720,7 @@ fn finalize_revision(
     op: RevisionOp,
     runs: Vec<String>,
     paths: Vec<String>,
+    policy: &[PolicyRule],
     keep: u32,
 ) -> Result<u64> {
     let seq = next_revision_seq(root)?;
@@ -718,6 +730,7 @@ fn finalize_revision(
         runs,
         paths,
         created: now_secs(),
+        policy: policy.to_vec(),
     };
     std::fs::write(partial.join("meta.toml"), toml::to_string(&meta)?)?;
     let dest = revisions_root(root).join(seq_name(seq));
@@ -766,8 +779,19 @@ fn latest_revision_seq(root: &Path) -> Result<Option<u64>> {
 
 /// Removes the oldest revisions beyond `keep`, returning how many were
 /// pruned. Called after every [`finalize_revision`] and again by `gc` (in
-/// case a crash skipped the post-finalize prune).
+/// case a crash skipped the post-finalize prune). `keep = 0` is clamped to 1
+/// — otherwise the revision `finalize_revision` just published would be
+/// pruned immediately after being written, leaving `home log` permanently
+/// empty and `next_revision_seq` resetting to 1 forever.
 fn prune_revisions(root: &Path, keep: u32) -> Result<usize> {
+    let keep = if keep == 0 {
+        eprintln!(
+            "pall8t: warning: [home] revisions_keep = 0 would erase all history — using 1 instead"
+        );
+        1
+    } else {
+        keep
+    };
     let dirs = list_revision_dirs(root)?;
     let keep = keep as usize;
     if dirs.len() <= keep {
@@ -821,8 +845,23 @@ pub struct DiffEntry {
     pub text_diff: Option<String>,
 }
 
-/// Every path that differs between two directory trees, in path order.
-fn diff_entries(before: &Path, after: &Path, overrides: &[PolicyRule]) -> Result<Vec<DiffEntry>> {
+/// Every path that differs between two directory trees, in path order. A
+/// path is redacted as secret if EITHER `recorded_overrides` (the policy
+/// active when the revision being diffed was recorded) OR `current_overrides`
+/// (the cwd's policy right now) classifies it as secret — never just the
+/// current one. Revisions are global (`~/.pall8t/revisions/`) but
+/// `[[home.policy]]` is per-project; without this a secret a project
+/// declared via policy (the documented pattern for credentials the built-in
+/// defaults don't cover) would render in cleartext to `pall8t home diff` run
+/// from any OTHER cwd, or from a broken/missing config falling back to
+/// defaults. Checking both directions also means editing the policy to
+/// protect a path AFTER the fact re-protects old snapshots of it too.
+fn diff_entries(
+    before: &Path,
+    after: &Path,
+    recorded_overrides: &[PolicyRule],
+    current_overrides: &[PolicyRule],
+) -> Result<Vec<DiffEntry>> {
     let mut out = Vec::new();
     for rel in union_paths(after, before)? {
         let before_path = before.join(&rel);
@@ -832,7 +871,8 @@ fn diff_entries(before: &Path, after: &Path, overrides: &[PolicyRule]) -> Result
         if a == b {
             continue;
         }
-        let secret = classify(&rel, overrides).class == Class::Secret;
+        let secret = classify(&rel, recorded_overrides).class == Class::Secret
+            || classify(&rel, current_overrides).class == Class::Secret;
         let text_diff = if secret {
             None
         } else {
@@ -901,32 +941,48 @@ pub fn diff(seq: u64, overrides: &[PolicyRule]) -> Result<String> {
 }
 
 fn diff_at(root: &Path, seq: u64, overrides: &[PolicyRule]) -> Result<String> {
-    let before = revisions_root(root).join(seq_name(seq)).join("snapshot");
+    // Locked from the start: `latest_revision_seq` must be read under the
+    // same lock that decides `after`, or a mutation landing between an
+    // unlocked read and the decision could make this diff attribute a
+    // newer change to `seq` (a stale `latest` making the live base look
+    // like `seq`'s own successor, or vice versa).
+    let lock = lock_base(root)?;
+    let rev_dir = revisions_root(root).join(seq_name(seq));
+    let before = rev_dir.join("snapshot");
     if !before.exists() {
         return Err(anyhow!(
             "no revision {seq} (see `pall8t home log`, or it may have been pruned)"
         ));
     }
+    // The policy active when THIS revision was recorded (see
+    // `diff_entries`'s doc comment) — missing only for a revision recorded
+    // before this field existed, which parses as an empty list.
+    let recorded_overrides = read_revision_meta(&rev_dir)?.policy;
     let latest = latest_revision_seq(root)?.unwrap_or(seq);
-    // Reading the live base (the `seq >= latest` case) races a concurrent
-    // rollback's `swap_base`, which briefly renames the base directory away
-    // — hold the lock only for that case, so the walk always sees a
-    // complete tree, not an ENOENT mid-rename. An older revision's `after`
-    // is an immutable, already-published snapshot nothing can still be
-    // writing, so it needs no lock — letting `diff_entries` shell out to
-    // `git diff` per changed path below without blocking every concurrent
-    // fork/harvest/promote/rollback for the duration.
-    let (after, _lock) = if seq >= latest {
-        (base_dir(root), Some(lock_base(root)?))
+    let after = if seq >= latest {
+        // Reading the live base races a concurrent rollback's `swap_base`,
+        // which briefly renames the base directory away — keep holding the
+        // lock through `diff_entries` below so the walk always sees a
+        // complete tree, not an ENOENT mid-rename.
+        base_dir(root)
     } else {
-        (
-            revisions_root(root)
-                .join(seq_name(seq + 1))
-                .join("snapshot"),
-            None,
-        )
+        // An older revision's `after` is an immutable, already-published
+        // snapshot nothing can still be writing — release the lock before
+        // `diff_entries` shells out to `git diff` per changed path, rather
+        // than block every concurrent fork/harvest/promote/rollback for
+        // that duration.
+        drop(lock);
+        revisions_root(root)
+            .join(seq_name(seq + 1))
+            .join("snapshot")
     };
-    let entries = diff_entries(&before, &after, overrides)?;
+    let entries =
+        diff_entries(&before, &after, &recorded_overrides, overrides).with_context(|| {
+            format!(
+                "reading revision {seq}'s diff — it may have been pruned by a concurrent \
+                 `gc` while this ran"
+            )
+        })?;
     let mut s = format!("revision {seq}: {} path(s) changed\n", entries.len());
     for e in &entries {
         if e.secret {
@@ -953,11 +1009,16 @@ fn diff_at(root: &Path, seq: u64, overrides: &[PolicyRule]) -> Result<String> {
 /// `rollback`), under the base lock, crash-atomic via [`swap_base`]. The
 /// rollback itself is recorded as a new revision (paths = what the swap
 /// actually changed) so it is undoable like any other base mutation.
-pub fn rollback(seq: u64, revisions_keep: u32) -> Result<()> {
-    rollback_at(&crate::config::pall8t_root()?, seq, revisions_keep)
+pub fn rollback(seq: u64, overrides: &[PolicyRule], revisions_keep: u32) -> Result<()> {
+    rollback_at(
+        &crate::config::pall8t_root()?,
+        seq,
+        overrides,
+        revisions_keep,
+    )
 }
 
-fn rollback_at(root: &Path, seq: u64, revisions_keep: u32) -> Result<()> {
+fn rollback_at(root: &Path, seq: u64, overrides: &[PolicyRule], revisions_keep: u32) -> Result<()> {
     let _lock = lock_base(root)?;
     let target = revisions_root(root).join(seq_name(seq)).join("snapshot");
     if !target.exists() {
@@ -984,6 +1045,7 @@ fn rollback_at(root: &Path, seq: u64, revisions_keep: u32) -> Result<()> {
         RevisionOp::Rollback,
         Vec::new(),
         touched,
+        overrides,
         revisions_keep,
     )?;
     Ok(())
@@ -1202,6 +1264,7 @@ fn harvest_instance(
                     RevisionOp::Harvest,
                     vec![meta.run.clone()],
                     actually_written,
+                    overrides,
                     revisions_keep,
                 )?;
             }
@@ -1216,9 +1279,22 @@ fn harvest_instance(
     };
     // The tombstone is namespaced and ignored by scanners, so deleting its
     // (whole-home-sized) tree unlocked keeps that I/O out of the critical
-    // section without weakening same-instance drain exclusion.
-    std::fs::remove_dir_all(&tombstone)
-        .with_context(|| format!("cannot remove tombstone {}", tombstone.display()))?;
+    // section without weakening same-instance drain exclusion. Tolerate it
+    // already being gone (same pattern as `prune_changeset`): a concurrent
+    // `gc` sweep can win this exact race (harvest already fully drained the
+    // instance and retired it under the lock above, so the tombstone is
+    // safe for `sweep_tombstones`/`sweep_one_tombstone` to remove) — that
+    // must not fail a harvest that, from the caller's perspective, already
+    // succeeded.
+    match std::fs::remove_dir_all(&tombstone) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(
+                anyhow!(e).context(format!("cannot remove tombstone {}", tombstone.display()))
+            )
+        }
+    }
     Ok(true)
 }
 
@@ -1252,9 +1328,13 @@ fn apply_harvest_changes(
                 // run that never touched credentials can't clobber a token
                 // another run refreshed. Deletion is not propagated —
                 // dropping a base credential is never automatic (FR-10).
+                // `write_if_changed`: two runs concurrently refreshing the
+                // same credential to the same new token must not each burn
+                // a revision — only a byte-level change counts as "wrote".
                 if let Some(content) = theirs {
-                    write_atomic(&base.join(&rel), &content)?;
-                    actually_written.push(rel);
+                    if write_if_changed(&base.join(&rel), &content)? {
+                        actually_written.push(rel);
+                    }
                 }
             }
             Class::State => {
@@ -1275,9 +1355,16 @@ fn apply_harvest_changes(
                                     cur,
                                     theirs,
                                 )? {
+                                    // A union merge whose result equals what's
+                                    // already there (the run's lines were
+                                    // already present, e.g. a concurrent run
+                                    // appended the identical entry first) is
+                                    // not a mutation — `write_if_changed`
+                                    // skips the write and doesn't count it.
                                     Some(merged) => {
-                                        write_atomic(&path, &merged)?;
-                                        actually_written.push(rel);
+                                        if write_if_changed(&path, &merged)? {
+                                            actually_written.push(rel);
+                                        }
                                     }
                                     // Non-UTF-8 (e.g. a crash-truncated
                                     // append): keep the base rather than
@@ -1294,8 +1381,9 @@ fn apply_harvest_changes(
                             let merged =
                                 state_merge_bytes(current.as_deref(), ancestor.as_deref(), theirs)
                                     .with_context(|| format!("merging state {rel}"))?;
-                            write_atomic(&path, &merged)?;
-                            actually_written.push(rel);
+                            if write_if_changed(&path, &merged)? {
+                                actually_written.push(rel);
+                            }
                         }
                     }
                 }
@@ -1647,14 +1735,26 @@ pub struct PromoteOutcome {
 /// arise only here (FR-5): a conflicted path is left staged and the base is
 /// not touched, so a re-run after manual resolution completes cleanly. All
 /// base writes happen under the base lock (FR-6).
-pub fn promote(run: &str, paths: &[String], revisions_keep: u32) -> Result<PromoteOutcome> {
-    promote_at(&crate::config::pall8t_root()?, run, paths, revisions_keep)
+pub fn promote(
+    run: &str,
+    paths: &[String],
+    overrides: &[PolicyRule],
+    revisions_keep: u32,
+) -> Result<PromoteOutcome> {
+    promote_at(
+        &crate::config::pall8t_root()?,
+        run,
+        paths,
+        overrides,
+        revisions_keep,
+    )
 }
 
 fn promote_at(
     root: &Path,
     run: &str,
     paths: &[String],
+    overrides: &[PolicyRule],
     revisions_keep: u32,
 ) -> Result<PromoteOutcome> {
     let mut manifest = read_manifest(root, run)?;
@@ -1699,6 +1799,7 @@ fn promote_at(
             RevisionOp::Promote,
             vec![run.to_string()],
             written,
+            overrides,
             revisions_keep,
         )?;
     }
@@ -1760,6 +1861,12 @@ fn merge_entry(base: &Path, cs: &Path, entry: &Entry) -> Result<MergeResult> {
             Some(c) if c == t => Ok(MergeResult::Clean(false)),
             Some(c) if union => write_or_conflict(&target, union_merge(a, c, t)?),
             Some(c) => match merge3_text(a, c, t)? {
+                // A merge that reconstructs exactly what's already there
+                // (the run's change was already reflected in the base, or
+                // canceled out by base's own independent change) is not a
+                // mutation — `c` is already read, so compare directly
+                // rather than pay for another read via `write_if_changed`.
+                Some(merged) if merged == *c => Ok(MergeResult::Clean(false)),
                 Some(merged) => {
                     write_atomic(&target, &merged)?;
                     Ok(MergeResult::Clean(true))
@@ -1791,12 +1898,11 @@ fn merge_entry(base: &Path, cs: &Path, entry: &Entry) -> Result<MergeResult> {
 /// Writes a successful merge to the base, or reports a conflict when the merge
 /// couldn't be produced (`None`, e.g. non-UTF-8 union input) — the base is left
 /// untouched, so it is never corrupted and the path stays staged (FR-5).
+/// `write_if_changed`: a union merge that reconstructs exactly what's
+/// already there (the run's lines were already present) is not a mutation.
 fn write_or_conflict(target: &Path, merged: Option<Vec<u8>>) -> Result<MergeResult> {
     match merged {
-        Some(m) => {
-            write_atomic(target, &m)?;
-            Ok(MergeResult::Clean(true))
-        }
+        Some(m) => Ok(MergeResult::Clean(write_if_changed(target, &m)?)),
         None => Ok(MergeResult::Conflict),
     }
 }
@@ -1962,7 +2068,7 @@ fn merge_at(
             continue;
         }
         let shown = show_at(root, &r)?;
-        let outcome = promote_at(root, &r, &[], revisions_keep)?;
+        let outcome = promote_at(root, &r, &[], overrides, revisions_keep)?;
         let stop = !outcome.conflicts.is_empty();
         steps.push(MergeStep {
             run: r,
@@ -2146,9 +2252,12 @@ fn rm_at(root: &Path, run: &str, force: bool) -> Result<()> {
     if is_forker_alive(meta.forker_pid) && !force {
         return Err(anyhow!(
             "run {run}'s forker (pid {}) appears to still be running — pass --force to \
-             remove it anyway. This discards whatever the run produced, unharvested; if \
-             the pid was recycled by an unrelated process after the real run ended (see \
-             `pall8t home ls`), that's exactly what --force is for.",
+             remove it anyway. If the pid was recycled by an unrelated process after the \
+             real run ended (see `pall8t home ls`), that's exactly what --force is for and \
+             this just discards the run's unharvested changes. But if the run IS still \
+             live, its instance root may be bind-mounted as /home/dev inside a running \
+             container right now — removing it out from under that container corrupts \
+             the live agent's home, not just its unharvested changes.",
             meta.forker_pid
         ));
     }
@@ -2312,6 +2421,21 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path)
         .with_context(|| format!("cannot move into place {}", path.display()))?;
     Ok(())
+}
+
+/// Writes `bytes` to `path` only if they differ from what's already there,
+/// returning whether it actually wrote. A merge/write-back whose result
+/// happens to be byte-identical to the current content (e.g. two runs
+/// concurrently refreshing a secret to the same token, or a union merge
+/// whose new lines were already present) must not count as a "wrote" for
+/// revision-recording purposes — FR-7 says a revision corresponds to an
+/// actual mutation, not merely an attempted one.
+fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if read_opt(path).as_deref() == Some(bytes) {
+        return Ok(false);
+    }
+    write_atomic(path, bytes)?;
+    Ok(true)
 }
 
 /// `path` with `suffix` appended to its final component (same parent).

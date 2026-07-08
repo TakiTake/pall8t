@@ -106,8 +106,11 @@ enum HomeCmd {
     /// Remove an instance without harvesting it (FR-9)
     Rm {
         run: String,
-        /// Remove even if the forker pid looks alive (discards the run's
-        /// unharvested changes)
+        /// Remove even if the forker pid looks alive. Safe if that's pid
+        /// recycling (discards the run's unharvested changes); if the run
+        /// IS still live, its instance root may be bind-mounted as
+        /// /home/dev inside a running container, and this corrupts that
+        /// container's home out from under it.
         #[arg(long)]
         force: bool,
     },
@@ -405,7 +408,7 @@ fn cmd_home(cmd: HomeCmd) -> Result<()> {
         }
         HomeCmd::Promote { run, paths } => {
             let cfg = cwd_home_config();
-            let outcome = home::promote(&run, &paths, cfg.revisions_keep)?;
+            let outcome = home::promote(&run, &paths, &cfg.policy, cfg.revisions_keep)?;
             for p in &outcome.promoted {
                 println!("promoted {p}");
             }
@@ -433,7 +436,8 @@ fn cmd_home(cmd: HomeCmd) -> Result<()> {
             Ok(())
         }
         HomeCmd::Rollback { seq } => {
-            home::rollback(seq, cwd_home_config().revisions_keep)?;
+            let cfg = cwd_home_config();
+            home::rollback(seq, &cfg.policy, cfg.revisions_keep)?;
             println!("rolled back to revision {seq} (recorded as a new revision)");
             Ok(())
         }
