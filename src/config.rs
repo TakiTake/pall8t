@@ -175,12 +175,6 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # the default; add it here explicitly if you want it.
 # command = ["claude"]
 
-# Reference repositories, duplicated via `git clone --local` and mounted
-# at their own path inside the container (writes hit the copy, never the
-# original).
-# [[repos]]
-# source = "~/src/other-lib"
-
 [home]
 # mode = "shared"    # default: every run mounts ~/.pall8t/home rw (v1 behavior)
 # mode = "isolated"  # per-run fork; harvest changes into an inbox to promote
@@ -213,9 +207,6 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 
 [run]
 # command = ["claude"]
-
-# [[repos]]
-# source = "~/src/other-lib"
 
 [home]
 # mode = "isolated"  # per-run home fork + harvest/promote (default: shared)
