@@ -1,2 +1,7 @@
 /target
 .DS_Store
+
+# pall8t's own agent worktrees (transient) and personal Claude Code settings.
+# .claude/settings.json and .claude/skills/ ARE tracked; only these are not.
+.claude/worktrees/
+.claude/settings.local.json
