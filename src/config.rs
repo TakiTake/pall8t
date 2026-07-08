@@ -122,12 +122,6 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # Command run by `pall8t run`. --dangerously-skip-permissions is NOT in
 # the default; add it here explicitly if you want it.
 # command = ["claude"]
-
-# Reference repositories, duplicated via `git clone --local` and mounted
-# at their own path inside the container (writes hit the copy, never the
-# original).
-# [[repos]]
-# source = "~/src/other-lib"
 "#;
 
 /// Skeleton written by `pall8t init` as `./pall8t.toml`.
@@ -143,9 +137,6 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 
 [run]
 # command = ["claude"]
-
-# [[repos]]
-# source = "~/src/other-lib"
 "#;
 
 #[cfg(test)]
