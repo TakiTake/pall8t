@@ -39,10 +39,28 @@ pub struct RepoEntry {
 /// Merged `[home]` configuration. `mode` picks today's shared home or the
 /// per-run fork-and-harvest model; `policy` prepends user overrides to the
 /// built-in path classification ([`crate::home::DEFAULT_RULES`]).
+/// `revisions_keep`/`inbox_ttl_days` bound `isolated` mode's disk usage and
+/// staleness warnings (FR-7/FR-9); both are inert in `shared` mode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HomeConfig {
     pub mode: HomeMode,
     pub policy: Vec<PolicyRule>,
+    pub revisions_keep: u32,
+    pub inbox_ttl_days: u32,
+}
+
+impl Default for HomeConfig {
+    /// Matches [`merge`]'s defaults, for callers (the standalone `home`
+    /// subcommands) that fall back to this when the cwd's config can't be
+    /// loaded at all rather than duplicating the default values.
+    fn default() -> Self {
+        HomeConfig {
+            mode: HomeMode::default(),
+            policy: Vec::new(),
+            revisions_keep: crate::home::DEFAULT_REVISIONS_KEEP,
+            inbox_ttl_days: crate::home::DEFAULT_INBOX_TTL_DAYS,
+        }
+    }
 }
 
 /// One `[[home.policy]]` rule: a glob (matched against a `$HOME`-relative
@@ -79,6 +97,8 @@ struct Raw {
 struct RawHome {
     mode: Option<HomeMode>,
     policy: Option<Vec<PolicyRule>>,
+    revisions_keep: Option<u32>,
+    inbox_ttl_days: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -157,6 +177,16 @@ fn merge(global: Raw, project: Raw) -> Config {
                 .policy
                 .or(global.home.policy)
                 .unwrap_or_default(),
+            revisions_keep: project
+                .home
+                .revisions_keep
+                .or(global.home.revisions_keep)
+                .unwrap_or(crate::home::DEFAULT_REVISIONS_KEEP),
+            inbox_ttl_days: project
+                .home
+                .inbox_ttl_days
+                .or(global.home.inbox_ttl_days)
+                .unwrap_or(crate::home::DEFAULT_INBOX_TTL_DAYS),
         },
     }
 }
@@ -192,6 +222,14 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # [[home.policy]]
 # glob = ".config/my-tool/log.jsonl"
 # strategy = "union"
+#
+# How much `isolated`-mode history to keep (FR-7). Pruned after each
+# recorded revision and again by `pall8t home gc`.
+# revisions_keep = 20
+#
+# `pall8t home gc` warns (never deletes) about inbox changesets older than
+# this many days — dropping unreviewed knowledge is always a user decision.
+# inbox_ttl_days = 14
 "#;
 
 /// Skeleton written by `pall8t init` as `./pall8t.toml`.
@@ -234,6 +272,32 @@ mod tests {
             "shared home is the default"
         );
         assert!(cfg.home.policy.is_empty());
+        assert_eq!(cfg.home.revisions_keep, crate::home::DEFAULT_REVISIONS_KEEP);
+        assert_eq!(cfg.home.inbox_ttl_days, crate::home::DEFAULT_INBOX_TTL_DAYS);
+        assert_eq!(
+            cfg.home,
+            HomeConfig::default(),
+            "Default matches merge()'s defaults"
+        );
+    }
+
+    #[test]
+    fn revisions_keep_and_inbox_ttl_merge_per_field() {
+        let global = parse(
+            r#"
+            [home]
+            revisions_keep = 5
+            inbox_ttl_days = 3
+            "#,
+        );
+        // Project overrides only one of the two.
+        let project = parse("[home]\nrevisions_keep = 50\n");
+        let cfg = merge(global, project);
+        assert_eq!(cfg.home.revisions_keep, 50, "project field wins");
+        assert_eq!(
+            cfg.home.inbox_ttl_days, 3,
+            "unset project field falls through"
+        );
     }
 
     #[test]

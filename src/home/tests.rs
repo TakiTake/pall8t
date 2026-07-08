@@ -58,7 +58,7 @@ fn run_and_harvest(root: &TempRoot, run: &str, mutate: impl FnOnce(&Path)) {
     let instance = fork_instance_at(root.path(), run, Path::new("/ws")).unwrap();
     mutate(&instance);
     finish_run(root, run);
-    let harvested = harvest_finished_at(root.path(), &[]).unwrap();
+    let harvested = harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(harvested.contains(&run.to_string()), "run should harvest");
 }
 
@@ -325,7 +325,7 @@ fn harvest_skips_live_runs() {
     root.write_base(".x", "1");
     // Forked with the (live) test process as the forker, and not finished.
     fork_instance_at(root.path(), "live-run", Path::new("/ws")).unwrap();
-    let harvested = harvest_finished_at(root.path(), &[]).unwrap();
+    let harvested = harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(harvested.is_empty(), "a live run is not harvested");
     assert!(
         instances_root(root.path()).join("live-run").exists(),
@@ -344,7 +344,7 @@ fn secret_unchanged_by_run_does_not_clobber_base() {
     // NOT touch its own copy.
     root.write_base(".claude/.credentials.json", r#"{"token":"v2"}"#);
     finish_run(&root, "r");
-    harvest_finished_at(root.path(), &[]).unwrap();
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(
         root.read_base(".claude/.credentials.json").unwrap(),
         r#"{"token":"v2"}"#,
@@ -363,7 +363,7 @@ fn promote_directory_union_adds_new_skill() {
     run_and_harvest(&root, "r", |inst| {
         write(&inst.join(".claude/skills/new/SKILL.md"), "new skill");
     });
-    let outcome = promote_at(root.path(), "r", &[]).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(outcome.promoted, vec![".claude/skills/new/SKILL.md"]);
     assert!(outcome.conflicts.is_empty());
     assert_eq!(
@@ -382,7 +382,13 @@ fn promote_selected_path_only() {
         write(&inst.join(".claude/skills/keep/SKILL.md"), "keep");
         write(&inst.join(".claude/skills/poc/SKILL.md"), "poc");
     });
-    let outcome = promote_at(root.path(), "r", &[".claude/skills/keep".to_string()]).unwrap();
+    let outcome = promote_at(
+        root.path(),
+        "r",
+        &[".claude/skills/keep".to_string()],
+        DEFAULT_REVISIONS_KEEP,
+    )
+    .unwrap();
     assert_eq!(outcome.promoted, vec![".claude/skills/keep/SKILL.md"]);
     assert!(root.base().join(".claude/skills/keep/SKILL.md").exists());
     assert!(
@@ -405,7 +411,7 @@ fn promote_clean_text_three_way_merge() {
     });
     // Base independently changes the first line after the fork.
     root.write_base("CLAUDE.md", "top EDITED\na\nb\nc\nbottom\n");
-    let outcome = promote_at(root.path(), "r", &[]).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(outcome.conflicts.is_empty(), "non-overlapping edits merge");
     assert_eq!(
         root.read_base("CLAUDE.md").unwrap(),
@@ -423,7 +429,7 @@ fn promote_conflict_leaves_base_untouched_and_keeps_staged() {
     });
     // Base diverges on the same line.
     root.write_base("CLAUDE.md", "base version\n");
-    let outcome = promote_at(root.path(), "r", &[]).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(outcome.conflicts, vec!["CLAUDE.md"]);
     assert!(outcome.promoted.is_empty());
     assert_eq!(
@@ -464,7 +470,13 @@ fn unknown_promote_path_errors() {
     run_and_harvest(&root, "r", |inst| {
         write(&inst.join(".claude/skills/real/SKILL.md"), "x");
     });
-    let err = promote_at(root.path(), "r", &[".claude/skills/typo".to_string()]).unwrap_err();
+    let err = promote_at(
+        root.path(),
+        "r",
+        &[".claude/skills/typo".to_string()],
+        DEFAULT_REVISIONS_KEEP,
+    )
+    .unwrap_err();
     assert!(err.to_string().contains("no staged path"));
 }
 
@@ -490,7 +502,7 @@ fn two_parallel_runs_merge_state_and_stage_independently() {
     // Both runs end; harvest both (serialized under the base lock).
     finish_run(&root, "run-a");
     finish_run(&root, "run-b");
-    harvest_finished_at(root.path(), &[]).unwrap();
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
 
     // Durable keys from both runs merged automatically, no corruption.
     assert_eq!(
@@ -502,8 +514,8 @@ fn two_parallel_runs_merge_state_and_stage_independently() {
     assert_eq!(changesets.len(), 2);
 
     // Promoting both lands both skills without conflict.
-    promote_at(root.path(), "run-a", &[]).unwrap();
-    promote_at(root.path(), "run-b", &[]).unwrap();
+    promote_at(root.path(), "run-a", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    promote_at(root.path(), "run-b", &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(root.base().join(".claude/skills/x/SKILL.md").exists());
     assert!(root.base().join(".claude/skills/y/SKILL.md").exists());
 }
@@ -527,7 +539,7 @@ fn parallel_history_jsonl_appends_union_at_harvest_no_conflict() {
     );
     finish_run(&root, "run-a");
     finish_run(&root, "run-b");
-    harvest_finished_at(root.path(), &[]).unwrap();
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
 
     let merged = root.read_base(".claude/history.jsonl").unwrap();
     assert!(merged.contains("\"p\":\"x\""), "base line kept");
@@ -554,7 +566,7 @@ fn union_non_utf8_run_keeps_base_not_overwrites() {
     )
     .unwrap();
     finish_run(&root, "r");
-    harvest_finished_at(root.path(), &[]).unwrap();
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(
         root.read_base(".claude/history.jsonl").unwrap(),
         base_content,
@@ -580,11 +592,11 @@ fn knowledge_union_strategy_merges_without_conflict_at_promote() {
     let inst = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
     write(&inst.join("notes.log"), "top\nrun\nbottom\n");
     finish_run(&root, "r");
-    harvest_finished_at(root.path(), &overrides).unwrap();
+    harvest_finished_at(root.path(), &overrides, DEFAULT_REVISIONS_KEEP).unwrap();
     // Base diverges on the same middle line -> plain 3-way would conflict.
     root.write_base("notes.log", "top\nbase\nbottom\n");
 
-    let outcome = promote_at(root.path(), "r", &[]).unwrap();
+    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(
         outcome.conflicts.is_empty(),
         "union strategy must not conflict"
@@ -608,7 +620,7 @@ fn two_parallel_runs_both_create_state_file() {
     write(&inst_b.join(".claude.json"), r#"{"runB":2}"#);
     finish_run(&root, "run-a");
     finish_run(&root, "run-b");
-    harvest_finished_at(root.path(), &[]).unwrap();
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(
         json(&root.read_base(".claude.json").unwrap()),
         json(r#"{"runA":1,"runB":2}"#),
@@ -661,7 +673,13 @@ fn second_harvest_of_same_instance_is_a_noop() {
     run_and_harvest(&root, "r", |inst| {
         write(&inst.join(".claude/skills/x/SKILL.md"), "x");
     });
-    let gone = harvest_instance(root.path(), &instances_root(root.path()).join("r"), &[]).unwrap();
+    let gone = harvest_instance(
+        root.path(),
+        &instances_root(root.path()).join("r"),
+        &[],
+        DEFAULT_REVISIONS_KEEP,
+    )
+    .unwrap();
     assert!(!gone, "harvesting a disposed instance is a no-op");
 }
 
@@ -702,7 +720,7 @@ fn merge_promotes_all_pending() {
     stage_run(&root, "run-b", |inst| {
         write(&inst.join(".claude/skills/y/SKILL.md"), "Y");
     });
-    let report = merge_at(root.path(), None, &[]).unwrap();
+    let report = merge_at(root.path(), None, &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(report.steps.len(), 2, "both pending runs processed");
     assert!(report.steps.iter().all(|s| s.conflicts.is_empty()));
     assert_eq!(report.steps[0].run, "run-a", "oldest fork first");
@@ -721,7 +739,7 @@ fn merge_specific_run_only() {
     stage_run(&root, "run-b", |inst| {
         write(&inst.join(".claude/skills/y/SKILL.md"), "Y");
     });
-    let report = merge_at(root.path(), Some("run-a"), &[]).unwrap();
+    let report = merge_at(root.path(), Some("run-a"), &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(report.steps.len(), 1);
     assert_eq!(report.steps[0].run, "run-a");
     assert!(root.base().join(".claude/skills/x/SKILL.md").exists());
@@ -746,7 +764,7 @@ fn merge_stops_at_conflict_leaving_remainder() {
     // conflicts.
     root.write_base("CLAUDE.md", "base version\n");
 
-    let report = merge_at(root.path(), None, &[]).unwrap();
+    let report = merge_at(root.path(), None, &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert_eq!(
         report.steps.len(),
         1,
@@ -776,7 +794,7 @@ fn merge_stops_at_conflict_leaving_remainder() {
 #[test]
 fn merge_empty_inbox_is_noop() {
     let root = TempRoot::new("merge-empty");
-    let report = merge_at(root.path(), None, &[]).unwrap();
+    let report = merge_at(root.path(), None, &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(report.steps.is_empty(), "nothing pending -> no steps");
     assert!(report.harvested.is_empty());
 }
@@ -786,7 +804,7 @@ fn merge_specific_live_run_errors() {
     let root = TempRoot::new("merge-live");
     // Forked with the live test pid, not finished.
     fork_instance_at(root.path(), "run-live", Path::new("/ws")).unwrap();
-    let err = merge_at(root.path(), Some("run-live"), &[]).unwrap_err();
+    let err = merge_at(root.path(), Some("run-live"), &[], DEFAULT_REVISIONS_KEEP).unwrap_err();
     assert!(err.to_string().contains("still running"));
 }
 
@@ -795,7 +813,7 @@ fn merge_unknown_run_errors() {
     // A typo'd run (no instance, no changeset) errors rather than silently
     // succeeding — parity with promote/drop/show.
     let root = TempRoot::new("merge-unknown");
-    let err = merge_at(root.path(), Some("run-typo"), &[]).unwrap_err();
+    let err = merge_at(root.path(), Some("run-typo"), &[], DEFAULT_REVISIONS_KEEP).unwrap_err();
     assert!(err.to_string().contains("no run run-typo"));
 }
 
@@ -811,7 +829,7 @@ fn merge_secrets_only_run_is_a_clean_noop() {
             r#"{"token":"new"}"#,
         );
     });
-    let report = merge_at(root.path(), Some("run-s"), &[]).unwrap();
+    let report = merge_at(root.path(), Some("run-s"), &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(report.steps.is_empty(), "no knowledge to promote");
     assert_eq!(report.harvested, vec!["run-s"], "but the run was harvested");
     assert_eq!(
@@ -834,4 +852,640 @@ fn atomic_write_replaces_and_creates_dirs() {
     write_atomic(&p, b"one").unwrap();
     write_atomic(&p, b"two").unwrap();
     assert_eq!(std::fs::read(&p).unwrap(), b"two");
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers for Phase 2 (backdating timestamps/mtimes)
+// ---------------------------------------------------------------------------
+
+/// Rewrites a published instance's `meta.toml` `created` field so `ls` sees
+/// it as older, mirroring `finish_run`'s line-patch approach.
+fn backdate_instance_created(root: &TempRoot, run: &str, secs_ago: u64) {
+    let meta_path = instances_root(root.path()).join(run).join("meta.toml");
+    let text = std::fs::read_to_string(&meta_path).unwrap();
+    let target = now_secs().saturating_sub(secs_ago);
+    let patched = text
+        .lines()
+        .map(|l| {
+            if l.starts_with("created") {
+                format!("created = {target}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&meta_path, patched).unwrap();
+}
+
+/// Rewrites a changeset's `manifest.toml` `created` field so `gc`'s TTL
+/// check sees it as older.
+fn backdate_changeset(root: &TempRoot, run: &str, days_ago: u64) {
+    let path = inbox_root(root.path()).join(run).join("manifest.toml");
+    let mut m: Manifest = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    m.created = now_secs().saturating_sub(days_ago * 86_400 + 3_600);
+    std::fs::write(&path, toml::to_string_pretty(&m).unwrap()).unwrap();
+}
+
+/// Sets a path's mtime `secs_ago` seconds in the past via `touch -d @<epoch>`
+/// (GNU coreutils, available in this Linux test environment) — avoids
+/// pulling in a `filetime` dependency just for one test's staleness check.
+fn set_mtime_seconds_ago(path: &Path, secs_ago: u64) {
+    let epoch = now_secs().saturating_sub(secs_ago);
+    let status = std::process::Command::new("touch")
+        .arg("-d")
+        .arg(format!("@{epoch}"))
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "touch -d failed");
+}
+
+// ---------------------------------------------------------------------------
+// Revisions (FR-7): log / diff / rollback
+// ---------------------------------------------------------------------------
+
+#[test]
+fn harvest_records_a_revision_only_when_it_writes_the_base() {
+    let root = TempRoot::new("rev-harvest");
+    root.write_base(".claude/.credentials.json", r#"{"token":"old"}"#);
+
+    // Knowledge-only run: base never mutated at harvest -> no revision.
+    run_and_harvest(&root, "know-only", |inst| {
+        write(&inst.join(".claude/skills/x/SKILL.md"), "x");
+    });
+    assert!(
+        list_revisions_at(root.path()).unwrap().is_empty(),
+        "staging knowledge alone must not record a revision"
+    );
+
+    // Secret-changing run: base mutated -> exactly one revision.
+    run_and_harvest(&root, "sec", |inst| {
+        write(
+            &inst.join(".claude/.credentials.json"),
+            r#"{"token":"new"}"#,
+        );
+    });
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs.len(), 1);
+    assert_eq!(revs[0].op, RevisionOp::Harvest);
+    assert_eq!(revs[0].runs, vec!["sec".to_string()]);
+    assert_eq!(revs[0].paths, 1);
+}
+
+#[test]
+fn revision_snapshot_is_the_pre_mutation_base() {
+    let root = TempRoot::new("rev-snapshot");
+    root.write_base(".claude/.credentials.json", r#"{"token":"v1"}"#);
+    run_and_harvest(&root, "r", |inst| {
+        write(&inst.join(".claude/.credentials.json"), r#"{"token":"v2"}"#);
+    });
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs.len(), 1);
+    let snap = revisions_root(root.path())
+        .join(seq_name(revs[0].seq))
+        .join("snapshot/.claude/.credentials.json");
+    assert_eq!(
+        std::fs::read_to_string(snap).unwrap(),
+        r#"{"token":"v1"}"#,
+        "the snapshot captures the base as it was BEFORE the mutation"
+    );
+}
+
+#[test]
+fn promote_records_a_revision_only_for_landed_paths() {
+    let root = TempRoot::new("rev-promote");
+    root.write_base("CLAUDE.md", "shared\n");
+    run_and_harvest(&root, "r", |inst| {
+        write(&inst.join(".claude/skills/a/SKILL.md"), "a");
+        write(&inst.join("CLAUDE.md"), "run version\n");
+    });
+    // Base diverges so CLAUDE.md conflicts; the skill still lands cleanly.
+    root.write_base("CLAUDE.md", "base version\n");
+    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    assert_eq!(outcome.promoted, vec![".claude/skills/a/SKILL.md"]);
+    assert_eq!(outcome.conflicts, vec!["CLAUDE.md"]);
+
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs.len(), 1, "one revision for the landed path only");
+    assert_eq!(revs[0].op, RevisionOp::Promote);
+    assert_eq!(revs[0].paths, 1);
+}
+
+#[test]
+fn promote_landing_nothing_records_no_revision() {
+    let root = TempRoot::new("rev-promote-none");
+    root.write_base("CLAUDE.md", "shared\n");
+    run_and_harvest(&root, "r", |inst| {
+        write(&inst.join("CLAUDE.md"), "run version\n");
+    });
+    root.write_base("CLAUDE.md", "base version\n");
+    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    assert!(outcome.promoted.is_empty());
+    assert!(
+        list_revisions_at(root.path()).unwrap().is_empty(),
+        "a promote that lands nothing must not burn a revision"
+    );
+}
+
+#[test]
+fn revisions_pruned_beyond_keep() {
+    let root = TempRoot::new("rev-prune");
+    root.write_base(".claude/.credentials.json", r#"{"token":"0"}"#);
+    for i in 1..=5u32 {
+        let run = format!("r{i}");
+        let instance = fork_instance_at(root.path(), &run, Path::new("/ws")).unwrap();
+        write(
+            &instance.join(".claude/.credentials.json"),
+            &format!(r#"{{"token":"{i}"}}"#),
+        );
+        finish_run(&root, &run);
+        harvest_finished_at(root.path(), &[], 2).unwrap();
+    }
+    let dirs = list_revision_dirs(root.path()).unwrap();
+    assert_eq!(dirs.len(), 2, "pruned down to revisions_keep=2 each time");
+    let seqs: Vec<u64> = dirs.iter().map(|(s, _)| *s).collect();
+    assert_eq!(seqs, vec![4, 5], "the two newest survive");
+}
+
+#[test]
+fn diff_redacts_secret_content_but_shows_the_path() {
+    let root = TempRoot::new("rev-diff-secret");
+    root.write_base(
+        ".claude/.credentials.json",
+        r#"{"token":"old-secret-value"}"#,
+    );
+    run_and_harvest(&root, "r", |inst| {
+        write(
+            &inst.join(".claude/.credentials.json"),
+            r#"{"token":"new-secret-value"}"#,
+        );
+    });
+    let revs = list_revisions_at(root.path()).unwrap();
+    let out = diff_at(root.path(), revs[0].seq, &[]).unwrap();
+    assert!(out.contains(".claude/.credentials.json"));
+    assert!(out.contains("secret — content not shown"));
+    assert!(!out.contains("old-secret-value"));
+    assert!(!out.contains("new-secret-value"));
+}
+
+#[test]
+fn diff_newest_revision_compares_against_current_base() {
+    let root = TempRoot::new("rev-diff-newest");
+    run_and_harvest(&root, "r", |inst| {
+        write(&inst.join(".claude/skills/a/SKILL.md"), "a");
+    });
+    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    assert_eq!(outcome.promoted.len(), 1);
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs.len(), 1);
+    let out = diff_at(root.path(), revs[0].seq, &[]).unwrap();
+    assert!(out.contains(".claude/skills/a/SKILL.md"));
+    assert!(out.contains("added"));
+}
+
+#[test]
+fn diff_unknown_revision_errors() {
+    let root = TempRoot::new("rev-diff-unknown");
+    let err = diff_at(root.path(), 999, &[]).unwrap_err();
+    assert!(err.to_string().contains("no revision"));
+}
+
+#[test]
+fn rollback_restores_base_and_is_itself_a_revision() {
+    let root = TempRoot::new("rollback");
+    root.write_base(".claude/.credentials.json", r#"{"token":"v1"}"#);
+    run_and_harvest(&root, "r", |inst| {
+        write(&inst.join(".claude/.credentials.json"), r#"{"token":"v2"}"#);
+    });
+    assert_eq!(
+        root.read_base(".claude/.credentials.json").unwrap(),
+        r#"{"token":"v2"}"#
+    );
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs.len(), 1);
+    let seq = revs[0].seq;
+
+    rollback_at(root.path(), seq, DEFAULT_REVISIONS_KEEP).unwrap();
+    assert_eq!(
+        root.read_base(".claude/.credentials.json").unwrap(),
+        r#"{"token":"v1"}"#,
+        "base restored to the pre-mutation snapshot"
+    );
+
+    let revs_after = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs_after.len(), 2, "the rollback itself is a new revision");
+    assert_eq!(revs_after[0].op, RevisionOp::Rollback, "newest first");
+    assert_eq!(revs_after[0].paths, 1);
+
+    // The rollback is itself undoable: rolling back to its own pre-mutation
+    // snapshot (the state right after the original harvest) restores v2.
+    rollback_at(root.path(), revs_after[0].seq, DEFAULT_REVISIONS_KEEP).unwrap();
+    assert_eq!(
+        root.read_base(".claude/.credentials.json").unwrap(),
+        r#"{"token":"v2"}"#,
+        "rolling back the rollback undoes it"
+    );
+}
+
+#[test]
+fn rollback_unknown_revision_errors() {
+    let root = TempRoot::new("rollback-unknown");
+    let err = rollback_at(root.path(), 999, DEFAULT_REVISIONS_KEEP).unwrap_err();
+    assert!(err.to_string().contains("no revision"));
+}
+
+#[test]
+fn rollback_to_already_current_state_records_nothing_new() {
+    let root = TempRoot::new("rollback-twice");
+    root.write_base(".claude/.credentials.json", r#"{"token":"v1"}"#);
+    run_and_harvest(&root, "r", |inst| {
+        write(&inst.join(".claude/.credentials.json"), r#"{"token":"v2"}"#);
+    });
+    let seq = list_revisions_at(root.path()).unwrap()[0].seq;
+    rollback_at(root.path(), seq, DEFAULT_REVISIONS_KEEP).unwrap();
+    let count_after_first = list_revisions_at(root.path()).unwrap().len();
+    // The base is already at revision `seq`'s snapshot content; rolling back
+    // to it again changes nothing.
+    rollback_at(root.path(), seq, DEFAULT_REVISIONS_KEEP).unwrap();
+    let count_after_second = list_revisions_at(root.path()).unwrap().len();
+    assert_eq!(
+        count_after_first, count_after_second,
+        "rolling back to a state the base is already in records nothing new"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Instance & inbox lifecycle (FR-9): ls / rm / gc
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ls_reports_running_and_finished_instances() {
+    let root = TempRoot::new("ls");
+    fork_instance_at(root.path(), "live", Path::new("/ws")).unwrap(); // live test pid
+    fork_instance_at(root.path(), "done", Path::new("/ws")).unwrap();
+    finish_run(&root, "done");
+
+    let mut instances = list_instances_at(root.path()).unwrap();
+    instances.sort_by(|a, b| a.run.cmp(&b.run));
+    assert_eq!(instances.len(), 2);
+    let live = instances.iter().find(|i| i.run == "live").unwrap();
+    assert_eq!(live.status, InstanceStatus::Running);
+    assert!(
+        !live.suspicious,
+        "a freshly forked live run is not suspicious"
+    );
+    let done = instances.iter().find(|i| i.run == "done").unwrap();
+    assert_eq!(done.status, InstanceStatus::Finished);
+}
+
+#[test]
+fn ls_flags_implausibly_old_running_instance_as_suspicious() {
+    let root = TempRoot::new("ls-suspicious");
+    fork_instance_at(root.path(), "old", Path::new("/ws")).unwrap();
+    backdate_instance_created(&root, "old", SUSPICIOUS_RUNNING_SECS + 3_600);
+    let instances = list_instances_at(root.path()).unwrap();
+    let old = instances.iter().find(|i| i.run == "old").unwrap();
+    assert_eq!(
+        old.status,
+        InstanceStatus::Running,
+        "the forker pid (this test process) is alive"
+    );
+    assert!(
+        old.suspicious,
+        "implausibly old for a still-\"running\" instance — likely pid recycling"
+    );
+}
+
+#[test]
+fn ls_does_not_list_partial_or_discard_tombstones() {
+    let root = TempRoot::new("ls-tombstones");
+    std::fs::create_dir_all(instances_root(root.path()).join("x.partial")).unwrap();
+    std::fs::create_dir_all(instances_root(root.path()).join("x.discard")).unwrap();
+    assert!(list_instances_at(root.path()).unwrap().is_empty());
+}
+
+#[test]
+fn rm_refuses_live_run_without_force_and_force_removes_it() {
+    let root = TempRoot::new("rm-live");
+    fork_instance_at(root.path(), "live", Path::new("/ws")).unwrap();
+    let err = rm_at(root.path(), "live", false).unwrap_err();
+    assert!(err.to_string().contains("--force"));
+    assert!(instances_root(root.path()).join("live").exists());
+
+    rm_at(root.path(), "live", true).unwrap();
+    assert!(!instances_root(root.path()).join("live").exists());
+}
+
+#[test]
+fn rm_removes_finished_run_without_force() {
+    let root = TempRoot::new("rm-finished");
+    fork_instance_at(root.path(), "done", Path::new("/ws")).unwrap();
+    finish_run(&root, "done");
+    rm_at(root.path(), "done", false).unwrap();
+    assert!(!instances_root(root.path()).join("done").exists());
+}
+
+#[test]
+fn rm_unknown_run_errors() {
+    let root = TempRoot::new("rm-unknown");
+    let err = rm_at(root.path(), "nope", false).unwrap_err();
+    assert!(err.to_string().contains("no instance"));
+}
+
+#[test]
+fn gc_sweeps_stale_discard_and_stale_partial_but_not_fresh_partial() {
+    let root = TempRoot::new("gc-tombstones");
+    // A `.discard` is always safe to sweep — by the time it exists,
+    // `retire_instance` already fully drained the instance under the lock.
+    std::fs::create_dir_all(instances_root(root.path()).join("x.discard")).unwrap();
+    // A fresh `.partial` (no meta.toml yet) might be a fork in progress —
+    // left alone; an old one is presumed abandoned.
+    let fresh_partial = instances_root(root.path()).join("fresh.partial");
+    std::fs::create_dir_all(&fresh_partial).unwrap();
+    let stale_partial = instances_root(root.path()).join("stale.partial");
+    std::fs::create_dir_all(&stale_partial).unwrap();
+    set_mtime_seconds_ago(&stale_partial, STALE_PARTIAL_SECS + 60);
+
+    let (partials, discards) = sweep_tombstones(root.path()).unwrap();
+    assert_eq!(discards, 1);
+    assert_eq!(partials, 1, "only the stale partial is swept");
+    assert!(!instances_root(root.path()).join("x.discard").exists());
+    assert!(!stale_partial.exists());
+    assert!(
+        fresh_partial.exists(),
+        "a fresh partial might be an in-progress fork"
+    );
+}
+
+#[test]
+fn harvest_lazily_sweeps_tombstones_too() {
+    // The lazy sweep folded into harvest_finished_at applies the same
+    // judgment as gc, so crashes don't accumulate garbage between gc runs.
+    let root = TempRoot::new("harvest-lazy-sweep");
+    let stale_discard = instances_root(root.path()).join("x.discard");
+    std::fs::create_dir_all(&stale_discard).unwrap();
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    assert!(!stale_discard.exists());
+}
+
+#[test]
+fn gc_prunes_revisions_and_warns_about_stale_changesets_without_deleting() {
+    let root = TempRoot::new("gc-full");
+    root.write_base(".claude/.credentials.json", r#"{"token":"0"}"#);
+    for i in 1..=3u32 {
+        let run = format!("r{i}");
+        let instance = fork_instance_at(root.path(), &run, Path::new("/ws")).unwrap();
+        write(
+            &instance.join(".claude/.credentials.json"),
+            &format!(r#"{{"token":"{i}"}}"#),
+        );
+        finish_run(&root, &run);
+        harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    }
+    assert_eq!(list_revision_dirs(root.path()).unwrap().len(), 3);
+
+    stage_run(&root, "old-run", |inst| {
+        write(&inst.join(".claude/skills/x/SKILL.md"), "x");
+    });
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    backdate_changeset(&root, "old-run", 30);
+
+    let report = gc_at(root.path(), 1, 14).unwrap();
+    assert_eq!(report.revisions_pruned, 2, "pruned down to keep=1");
+    assert_eq!(list_revision_dirs(root.path()).unwrap().len(), 1);
+    assert_eq!(report.stale_changesets.len(), 1);
+    assert_eq!(report.stale_changesets[0].run, "old-run");
+    assert!(
+        report.stale_changesets[0].age_days >= 30,
+        "age reported in days"
+    );
+    assert!(
+        inbox_root(root.path()).join("old-run").exists(),
+        "gc must never delete a stale changeset, only warn"
+    );
+}
+
+#[test]
+fn gc_does_not_warn_about_fresh_changesets() {
+    let root = TempRoot::new("gc-fresh");
+    stage_run(&root, "fresh-run", |inst| {
+        write(&inst.join(".claude/skills/x/SKILL.md"), "x");
+    });
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    let report = gc_at(root.path(), DEFAULT_REVISIONS_KEEP, 14).unwrap();
+    assert!(report.stale_changesets.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for issues found in review
+// ---------------------------------------------------------------------------
+
+#[test]
+fn harvest_records_no_revision_when_the_classified_touch_writes_nothing() {
+    // A run deletes a base secret it inherited at fork. Deletion is
+    // deliberately never propagated (FR-10) — no base write actually
+    // happens — even though the path is classified Secret and so is
+    // pre-flagged (conservatively) as possibly touching the base. Recording
+    // a revision here would be a phantom entry in `home log`/`diff` whose
+    // snapshot is byte-identical to the current base.
+    let root = TempRoot::new("phantom-revision");
+    root.write_base(".claude/.credentials.json", r#"{"token":"v1"}"#);
+    let instance = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    std::fs::remove_file(instance.join(".claude/.credentials.json")).unwrap();
+    finish_run(&root, "r");
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    assert_eq!(
+        root.read_base(".claude/.credentials.json").unwrap(),
+        r#"{"token":"v1"}"#,
+        "deletion is never propagated to the base (FR-10)"
+    );
+    assert!(
+        list_revisions_at(root.path()).unwrap().is_empty(),
+        "no base write actually happened, so no revision should be recorded"
+    );
+}
+
+#[test]
+fn pending_revision_guard_discards_on_drop_unless_disarmed() {
+    let root = TempRoot::new("guard-drop");
+    let partial = begin_revision_snapshot(root.path()).unwrap();
+    assert!(partial.exists());
+    {
+        let _guard = PendingRevisionGuard(Some(partial.clone()));
+        // Dropped here without being disarmed, simulating an early `?`
+        // return from a fallible mutation loop.
+    }
+    assert!(
+        !partial.exists(),
+        "an un-disarmed guard discards its snapshot on drop, never leaking it"
+    );
+}
+
+#[test]
+fn pending_revision_guard_disarm_prevents_the_drop_discard() {
+    let root = TempRoot::new("guard-disarm");
+    let partial = begin_revision_snapshot(root.path()).unwrap();
+    let guard = PendingRevisionGuard(Some(partial.clone()));
+    let returned = guard.disarm();
+    assert_eq!(returned, Some(partial.clone()));
+    assert!(
+        partial.exists(),
+        "disarming hands ownership back without discarding"
+    );
+    discard_revision_snapshot(&partial); // manual cleanup
+}
+
+#[test]
+fn gc_sweeps_orphaned_revision_snapshot_partials() {
+    // Simulates a `kill -9` between `begin_revision_snapshot` and
+    // `finalize_revision`/`discard_revision_snapshot`: the in-process
+    // `PendingRevisionGuard` can't help here (Drop never runs on SIGKILL),
+    // so `gc` is the actual crash-safety net for this window.
+    let root = TempRoot::new("gc-revision-partial");
+    let stray = begin_revision_snapshot(root.path()).unwrap();
+    assert!(stray.exists());
+    let report = gc_at(root.path(), DEFAULT_REVISIONS_KEEP, 14).unwrap();
+    assert_eq!(report.removed_revision_snapshots, 1);
+    assert!(!stray.exists());
+}
+
+#[test]
+fn promote_clean_no_op_does_not_record_a_phantom_revision() {
+    // Base independently advances to exactly the run's staged version
+    // before promote runs: merge_entry reports a clean landing (nothing to
+    // resolve, the path is consumed from the changeset) but performs no
+    // actual write. Recording a revision here would snapshot a mutation
+    // that never happened, and would evict a real older revision from a
+    // bounded `revisions_keep` for nothing.
+    let root = TempRoot::new("promote-noop-revision");
+    root.write_base("CLAUDE.md", "v1\n");
+    run_and_harvest(&root, "r", |inst| {
+        write(&inst.join("CLAUDE.md"), "v2\n");
+    });
+    root.write_base("CLAUDE.md", "v2\n"); // base already matches by promote time
+    let outcome = promote_at(root.path(), "r", &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    assert_eq!(
+        outcome.promoted,
+        vec!["CLAUDE.md"],
+        "the path is still consumed from the changeset"
+    );
+    assert!(outcome.conflicts.is_empty());
+    assert!(
+        list_revisions_at(root.path()).unwrap().is_empty(),
+        "a promote that writes nothing must not record a revision"
+    );
+}
+
+#[test]
+fn harvest_records_partial_progress_and_leaves_instance_for_retry_on_mid_loop_error() {
+    // Two paths change in one run: a Secret (".aws/credentials", sorted
+    // before ".claude.json") and a State path with invalid JSON that fails
+    // to merge. The secret write must land AND be recorded as a revision
+    // even though the harvest as a whole fails, and the instance must NOT
+    // be retired, so a later harvest can retry it.
+    let root = TempRoot::new("harvest-partial-failure");
+    root.write_base(".aws/credentials", "old");
+    root.write_base(".claude.json", r#"{"n":1}"#);
+    let instance = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    write(&instance.join(".aws/credentials"), "new");
+    write(&instance.join(".claude.json"), "{not valid json");
+    finish_run(&root, "r");
+
+    let err = harvest_instance(
+        root.path(),
+        &instances_root(root.path()).join("r"),
+        &[],
+        DEFAULT_REVISIONS_KEEP,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("merging state"));
+
+    assert_eq!(
+        root.read_base(".aws/credentials").unwrap(),
+        "new",
+        "the secret write that succeeded before the failure still landed"
+    );
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(
+        revs.len(),
+        1,
+        "the landed write is recorded as a revision despite the overall failure"
+    );
+    assert_eq!(revs[0].paths, 1, "only the path that actually landed");
+
+    assert!(
+        instances_root(root.path()).join("r").exists(),
+        "a failed harvest must not retire the instance -- it must stay retryable"
+    );
+}
+
+#[test]
+fn repair_base_swap_finishes_an_interrupted_publish() {
+    // Simulates the crash point mid-`swap_base`: the live base has already
+    // been retired to `.discard` and the new content published to
+    // `.partial`, but the final `.partial` -> base rename never happened.
+    let root = TempRoot::new("repair-partial");
+    root.write_base("marker", "old-content");
+    let base = root.base();
+    let partial = sibling_suffix(&base, ".partial");
+    std::fs::create_dir_all(&partial).unwrap();
+    write_atomic(&partial.join("marker"), b"new-content").unwrap();
+    let discard = sibling_suffix(&base, ".discard");
+    std::fs::rename(&base, &discard).unwrap();
+    assert!(!base.exists());
+
+    repair_base_swap(root.path()).unwrap();
+
+    assert!(base.exists(), "the interrupted publish is finished");
+    assert_eq!(
+        std::fs::read_to_string(base.join("marker")).unwrap(),
+        "new-content"
+    );
+}
+
+#[test]
+fn repair_base_swap_restores_from_tombstone_if_no_partial_exists() {
+    // Defensive case: only the discard tombstone survived (the partial
+    // should normally exist too at this crash point) -- repair must not
+    // leave the base permanently missing either way.
+    let root = TempRoot::new("repair-discard-only");
+    root.write_base("marker", "old-content");
+    let base = root.base();
+    let discard = sibling_suffix(&base, ".discard");
+    std::fs::rename(&base, &discard).unwrap();
+    assert!(!base.exists());
+
+    repair_base_swap(root.path()).unwrap();
+
+    assert!(
+        base.exists(),
+        "the base is restored rather than left missing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(base.join("marker")).unwrap(),
+        "old-content"
+    );
+}
+
+#[test]
+fn lock_base_repairs_an_interrupted_swap_automatically() {
+    // The point of running repair at the top of every `lock_base`: any
+    // base-touching operation self-heals an interrupted swap with no
+    // separate repair step required.
+    let root = TempRoot::new("repair-via-lock");
+    root.write_base("marker", "old-content");
+    let base = root.base();
+    let partial = sibling_suffix(&base, ".partial");
+    std::fs::create_dir_all(&partial).unwrap();
+    write_atomic(&partial.join("marker"), b"new-content").unwrap();
+    let discard = sibling_suffix(&base, ".discard");
+    std::fs::rename(&base, &discard).unwrap();
+
+    let _lock = lock_base(root.path()).unwrap();
+    assert!(base.exists());
+    assert_eq!(
+        std::fs::read_to_string(base.join("marker")).unwrap(),
+        "new-content"
+    );
 }
