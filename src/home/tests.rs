@@ -589,9 +589,10 @@ fn knowledge_union_strategy_merges_without_conflict_at_promote() {
     }];
     let root = TempRoot::new("knowledge-union");
     root.write_base("notes.log", "top\nshared\nbottom\n");
-    // Run edits the middle line; harvest with the override stages it as
-    // knowledge+union.
-    let inst = fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap();
+    // Forked WITH the override in effect (fork-time policy is authoritative
+    // at harvest — see `InstanceMeta::policy`); run edits the middle line,
+    // harvest stages it as knowledge+union.
+    let inst = fork_instance_at(root.path(), "r", Path::new("/ws"), &overrides).unwrap();
     write(&inst.join("notes.log"), "top\nrun\nbottom\n");
     finish_run(&root, "r");
     harvest_finished_at(root.path(), &overrides, DEFAULT_REVISIONS_KEEP).unwrap();
@@ -1511,7 +1512,18 @@ fn diff_redacts_a_secret_declared_by_the_recorded_policy_even_with_different_cur
     }];
     let root = TempRoot::new("diff-secret-recorded-policy");
     root.write_base(".config/mytool/token", "old-secret");
-    let instance = fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap();
+    // Forked WITH the same policy it's harvested under (this test is about
+    // diff redaction across cwds at *diff* time, not the separate
+    // cross-project fork/harvest pinning — see
+    // `harvest_classifies_with_the_forking_projects_policy_not_the_harvesting_cwds`
+    // for that).
+    let instance = fork_instance_at(
+        root.path(),
+        "r",
+        Path::new("/ws"),
+        &overrides_at_record_time,
+    )
+    .unwrap();
     write(&instance.join(".config/mytool/token"), "new-secret");
     finish_run(&root, "r");
     harvest_finished_at(
@@ -1603,6 +1615,71 @@ fn harvest_classifies_with_the_forking_projects_policy_not_the_harvesting_cwds()
 }
 
 #[test]
+fn harvest_uses_forks_authoritative_empty_policy_not_the_harvesting_cwds_override() {
+    // The instance was forked with EXPLICITLY ZERO overrides
+    // (`InstanceMeta::policy = Some(vec![])`) -- that's authoritative, not
+    // "nothing recorded, fall back to the caller". A harvesting cwd whose
+    // OWN policy reclassifies this path as ephemeral must not silently
+    // discard it: the fork's own (empty) policy, which classifies an
+    // unmatched path Knowledge by the conservative default, wins.
+    let root = TempRoot::new("fork-empty-policy-authoritative");
+    let instance = fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap();
+    write(&instance.join(".config/mytool/notes"), "some notes");
+    finish_run(&root, "r");
+
+    let harvesting_cwd_policy = vec![PolicyRule {
+        glob: ".config/mytool/notes".to_string(),
+        class: Some(Class::Ephemeral),
+        strategy: None,
+    }];
+    harvest_finished_at(root.path(), &harvesting_cwd_policy, DEFAULT_REVISIONS_KEEP).unwrap();
+
+    let changesets = list_changesets_at(root.path()).unwrap();
+    assert_eq!(
+        changesets.len(),
+        1,
+        "still staged as knowledge -- the harvesting cwd's ephemeral override must not apply"
+    );
+    assert_eq!(changesets[0].entries, 1);
+}
+
+#[test]
+fn harvest_falls_back_to_caller_overrides_for_a_pre_field_instance_meta() {
+    // Simulates an instance forked before `InstanceMeta::policy` existed:
+    // meta.toml has no `policy` key at all, which must parse as `None` (via
+    // `#[serde(default)]`) -- NOT `Some(vec![])` -- so harvest still falls
+    // back to the caller's overrides, preserving pre-this-field behavior
+    // for old instances rather than silently classifying them with an
+    // empty (and wrongly authoritative) policy.
+    let root = TempRoot::new("fork-pre-field-meta");
+    let instance = fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap();
+    write(&instance.join(".config/mytool/token"), "a-secret");
+    finish_run(&root, "r");
+
+    let meta_path = instances_root(root.path()).join("r").join("meta.toml");
+    let text = std::fs::read_to_string(&meta_path).unwrap();
+    let patched: String = text
+        .lines()
+        .filter(|l| !l.starts_with("policy"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&meta_path, patched).unwrap();
+
+    let caller_overrides = vec![PolicyRule {
+        glob: ".config/mytool/token".to_string(),
+        class: Some(Class::Secret),
+        strategy: None,
+    }];
+    harvest_finished_at(root.path(), &caller_overrides, DEFAULT_REVISIONS_KEEP).unwrap();
+
+    assert_eq!(
+        root.read_base(".config/mytool/token").unwrap(),
+        "a-secret",
+        "a pre-field instance (no recorded policy at all) falls back to the caller's overrides"
+    );
+}
+
+#[test]
 fn parallel_runs_writing_identical_secret_value_records_only_one_revision() {
     // Both runs refresh the credential to the SAME new value. The second
     // harvest's write is byte-identical to what the first harvest already
@@ -1662,10 +1739,12 @@ fn promote_union_merge_identical_to_current_consumes_path_without_recording_revi
     let root = TempRoot::new("union-noop-revision");
     root.write_base("notes.log", "");
 
-    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa"), &[]).unwrap();
+    // Both forked WITH the override in effect (fork-time policy is
+    // authoritative at harvest — see `InstanceMeta::policy`).
+    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa"), &overrides).unwrap();
     write(&inst_a.join("notes.log"), "l1\nl2\n");
     finish_run(&root, "run-a");
-    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb"), &[]).unwrap();
+    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb"), &overrides).unwrap();
     write(&inst_b.join("notes.log"), "l2\n");
     finish_run(&root, "run-b");
     harvest_finished_at(root.path(), &overrides, DEFAULT_REVISIONS_KEEP).unwrap();

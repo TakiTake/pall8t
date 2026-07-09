@@ -467,12 +467,22 @@ struct InstanceMeta {
     /// project X that declares some path secret via policy would have that
     /// secret staged into the inbox in cleartext (never written back per
     /// FR-10) and its harvest revision redacted with the wrong policy the
-    /// moment a project Y lazily harvests X's instance. `#[serde(default)]`
-    /// so an instance forked before this field existed parses as empty —
-    /// `harvest_instance` then falls back to the caller's overrides, which
-    /// is exactly today's (pre-fix) behavior.
+    /// moment a project Y lazily harvests X's instance.
+    ///
+    /// `Option`, not a bare `Vec`, to distinguish two cases an empty `Vec`
+    /// would conflate: `None` — an instance forked before this field
+    /// existed, so there is nothing pinned and `harvest_instance` falls
+    /// back to the caller's overrides (today's pre-fix behavior, `#[serde(
+    /// default)]` gives old meta.toml files exactly this). `Some(vec![])`
+    /// — this project genuinely has zero `[[home.policy]]` overrides, and
+    /// THAT is authoritative: harvest must classify with the built-in
+    /// defaults only, not silently fall back to whatever overrides the
+    /// harvesting cwd happens to declare (which could reclassify a path
+    /// this project never touched specially — the same cross-project bug
+    /// in miniature, e.g. the harvesting project marking some glob
+    /// `ephemeral` and silently discarding this run's knowledge under it).
     #[serde(default)]
-    policy: Vec<PolicyRule>,
+    policy: Option<Vec<PolicyRule>>,
 }
 
 /// Forks the base home for `run_name` and returns the instance root to
@@ -545,7 +555,10 @@ fn fork_instance_at(
         workspace: workspace.to_string_lossy().into_owned(),
         created: now_secs(),
         forker_pid: std::process::id(),
-        policy: overrides.to_vec(),
+        // `Some`, always — a fresh fork always pins whatever policy was
+        // active, even if it's the empty list (see the field's doc
+        // comment: `None` is reserved for pre-field instances only).
+        policy: Some(overrides.to_vec()),
     };
     std::fs::write(partial.join("meta.toml"), toml::to_string(&meta)?)?;
     std::fs::rename(&partial, &inst)
@@ -1227,12 +1240,15 @@ fn harvest_instance(
         // run from a completely different project than the one this run
         // belongs to, and the run's writes were made under ITS project's
         // regime. Falls back to the caller's `overrides` only when the
-        // instance predates this field (an empty recorded policy) — see
-        // `InstanceMeta::policy`'s doc comment.
-        let policy: &[PolicyRule] = if meta.policy.is_empty() {
-            overrides
-        } else {
-            &meta.policy
+        // instance predates this field entirely (`None`) — a fork that
+        // pinned zero overrides (`Some(vec![])`) is authoritative and used
+        // as-is, NOT treated the same as missing; see
+        // `InstanceMeta::policy`'s doc comment for why that distinction
+        // matters (the harvesting cwd's overrides must not silently apply
+        // to a project that never declared them).
+        let policy: &[PolicyRule] = match &meta.policy {
+            Some(p) => p,
+            None => overrides,
         };
 
         // Classify every changed, non-ephemeral path up front (FR-7): only
