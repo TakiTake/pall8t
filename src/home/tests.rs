@@ -1092,6 +1092,57 @@ fn rollback_restores_base_and_is_itself_a_revision() {
 }
 
 #[test]
+fn rollback_inherits_earlier_revisions_policy_to_protect_reintroduced_secret_content() {
+    // Revision 1 (harvest) recorded policy A, which declares a path secret.
+    // Rolling back to it later, invoked with a DIFFERENT (empty) policy --
+    // as if from a different project, or much later once the rule is no
+    // longer loaded -- must still protect that content in the ROLLBACK's
+    // OWN new revision's diff, not just the original harvest revision's.
+    // Without accumulating history's recorded policies into the rollback's
+    // own, this would leak: rollback never classifies anything itself, and
+    // neither the rollback-time nor the diff-time cwd policy would know the
+    // rule.
+    let policy_a = vec![PolicyRule {
+        glob: ".config/mytool/secret".to_string(),
+        class: Some(Class::Secret),
+        strategy: None,
+    }];
+    let root = TempRoot::new("rollback-inherits-policy");
+    root.write_base(".config/mytool/secret", "old-value");
+    let instance = fork_instance_at(root.path(), "r", Path::new("/ws"), &policy_a).unwrap();
+    write(&instance.join(".config/mytool/secret"), "new-value");
+    finish_run(&root, "r");
+    harvest_finished_at(root.path(), &policy_a, DEFAULT_REVISIONS_KEEP).unwrap();
+
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs.len(), 1);
+    let harvest_seq = revs[0].seq;
+    assert_eq!(
+        root.read_base(".config/mytool/secret").unwrap(),
+        "new-value"
+    );
+
+    // Rolled back with an EMPTY current policy -- restores "old-value".
+    rollback_at(root.path(), harvest_seq, &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    assert_eq!(
+        root.read_base(".config/mytool/secret").unwrap(),
+        "old-value"
+    );
+
+    let revs_after = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs_after.len(), 2);
+    let rollback_seq = revs_after[0].seq; // newest first
+
+    // Diffed with an EMPTY current policy too -- only the accumulated
+    // history (policy_a, still recorded on the harvest revision) protects it.
+    let out = diff_at(root.path(), rollback_seq, &[]).unwrap();
+    assert!(out.contains(".config/mytool/secret"));
+    assert!(out.contains("secret — content not shown"));
+    assert!(!out.contains("old-value"));
+    assert!(!out.contains("new-value"));
+}
+
+#[test]
 fn rollback_unknown_revision_errors() {
     let root = TempRoot::new("rollback-unknown");
     let err = rollback_at(root.path(), 999, &[], DEFAULT_REVISIONS_KEEP).unwrap_err();

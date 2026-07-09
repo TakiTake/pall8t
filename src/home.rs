@@ -1053,12 +1053,17 @@ fn diff_at(root: &Path, seq: u64, overrides: &[PolicyRule]) -> Result<String> {
 /// rollback itself is recorded as a new revision (paths = what the swap
 /// actually changed) so it is undoable like any other base mutation.
 ///
-/// `overrides` is the invoking cwd's policy, used only for that new
-/// revision's redaction record — like promote, rollback never classifies
-/// anything itself (it's a raw directory swap; `diff_paths` just compares
-/// bytes). This is fine even cross-project: whatever secret content the
-/// swap moves around was already protected by ITS OWN harvest revision's
-/// recorded policy, which `diff <that seq>` still consults independently.
+/// Unlike promote, rollback's OWN revision can't rely solely on
+/// `overrides` (the invoking cwd's policy): a whole-tree swap can
+/// reintroduce content byte-for-byte from ANY earlier revision, classified
+/// under THAT revision's policy, which may be a different project entirely
+/// or simply no longer loaded at rollback time. So the policy recorded for
+/// this new revision is `overrides` unioned with every still-existing
+/// revision's own recorded policy (see [`accumulated_revision_policy`]) —
+/// over-inclusive is the safe failure mode here (a stray rule that matches
+/// nothing is a no-op; a missing one is a leak). Bounded by
+/// `revisions_keep`: a revision old enough to be pruned already lost its
+/// policy record regardless of what this function does.
 pub fn rollback(seq: u64, overrides: &[PolicyRule], revisions_keep: u32) -> Result<()> {
     rollback_at(
         &crate::config::pall8t_root()?,
@@ -1066,6 +1071,21 @@ pub fn rollback(seq: u64, overrides: &[PolicyRule], revisions_keep: u32) -> Resu
         overrides,
         revisions_keep,
     )
+}
+
+/// Every still-existing revision's recorded `policy`, concatenated (FR-7
+/// `rollback`'s redaction composition — see [`rollback`]'s doc comment).
+/// Duplicate/overlapping rules are harmless: [`classify`] just tries them
+/// in order, and this is only ever OR'd against other policies for a
+/// secret-or-not check, never used to merge/apply rules structurally.
+fn accumulated_revision_policy(root: &Path) -> Result<Vec<PolicyRule>> {
+    let mut out = Vec::new();
+    for (_, path) in list_revision_dirs(root)? {
+        if let Ok(meta) = read_revision_meta(&path) {
+            out.extend(meta.policy);
+        }
+    }
+    Ok(out)
 }
 
 fn rollback_at(root: &Path, seq: u64, overrides: &[PolicyRule], revisions_keep: u32) -> Result<()> {
@@ -1086,6 +1106,13 @@ fn rollback_at(root: &Path, seq: u64, overrides: &[PolicyRule], revisions_keep: 
     if touched.is_empty() {
         return Ok(());
     }
+    // See `rollback`'s doc comment: this new revision's redaction record
+    // must cover whatever policy classified the content being reintroduced,
+    // not just the invoking cwd's — gathered before finalizing so it
+    // reflects every revision that exists right now, not one this rollback
+    // is about to add or prune.
+    let mut policy = accumulated_revision_policy(root)?;
+    policy.extend_from_slice(overrides);
     let pending = PendingRevisionGuard(Some(begin_revision_snapshot(root)?));
     swap_base(root, &target)?;
     let pending = pending.disarm().expect("armed above");
@@ -1095,7 +1122,7 @@ fn rollback_at(root: &Path, seq: u64, overrides: &[PolicyRule], revisions_keep: 
         RevisionOp::Rollback,
         Vec::new(),
         touched,
-        overrides,
+        &policy,
         revisions_keep,
     )?;
     Ok(())
@@ -1346,21 +1373,11 @@ fn harvest_instance(
     // The tombstone is namespaced and ignored by scanners, so deleting its
     // (whole-home-sized) tree unlocked keeps that I/O out of the critical
     // section without weakening same-instance drain exclusion. Tolerate it
-    // already being gone (same pattern as `prune_changeset`): a concurrent
+    // already being gone (same helper as `prune_changeset`): a concurrent
     // `gc` sweep can win this exact race (harvest already fully drained the
     // instance and retired it under the lock above, so the tombstone is
-    // safe for `sweep_tombstones`/`sweep_one_tombstone` to remove) — that
-    // must not fail a harvest that, from the caller's perspective, already
-    // succeeded.
-    match std::fs::remove_dir_all(&tombstone) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(
-                anyhow!(e).context(format!("cannot remove tombstone {}", tombstone.display()))
-            )
-        }
-    }
+    // safe for `sweep_tombstones`/`sweep_one_tombstone` to remove).
+    remove_dir_all_tolerant(&tombstone, "tombstone")?;
     Ok(true)
 }
 
@@ -1425,12 +1442,14 @@ fn apply_harvest_changes(
                                     // already there (the run's lines were
                                     // already present, e.g. a concurrent run
                                     // appended the identical entry first) is
-                                    // not a mutation — `write_if_changed`
-                                    // skips the write and doesn't count it.
+                                    // not a mutation. Compared directly
+                                    // against `cur` (already read above)
+                                    // rather than through `write_if_changed`,
+                                    // which would re-read the same file.
+                                    Some(merged) if merged == *cur => {}
                                     Some(merged) => {
-                                        if write_if_changed(&path, &merged)? {
-                                            actually_written.push(rel);
-                                        }
+                                        write_atomic(&path, &merged)?;
+                                        actually_written.push(rel);
                                     }
                                     // Non-UTF-8 (e.g. a crash-truncated
                                     // append): keep the base rather than
@@ -1447,7 +1466,11 @@ fn apply_harvest_changes(
                             let merged =
                                 state_merge_bytes(current.as_deref(), ancestor.as_deref(), theirs)
                                     .with_context(|| format!("merging state {rel}"))?;
-                            if write_if_changed(&path, &merged)? {
+                            // Compared directly against `current` (already
+                            // read above) rather than through
+                            // `write_if_changed`, which would re-read.
+                            if current.as_deref() != Some(merged.as_slice()) {
+                                write_atomic(&path, &merged)?;
                                 actually_written.push(rel);
                             }
                         }
@@ -1695,13 +1718,7 @@ fn prune_changeset(cs: &Path, manifest: &mut Manifest, paths: &[String]) -> Resu
     if manifest.entries.is_empty() {
         // Tolerate an already-removed changeset (a concurrent merge/drop got
         // here first) — the dir being gone is the desired end state.
-        match std::fs::remove_dir_all(cs) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => {
-                Err(anyhow!(e).context(format!("cannot remove emptied changeset {}", cs.display())))
-            }
-        }
+        remove_dir_all_tolerant(cs, "emptied changeset")
     } else {
         write_atomic(
             &cs.join("manifest.toml"),
@@ -2440,6 +2457,21 @@ fn gc_at(root: &Path, revisions_keep: u32, inbox_ttl_days: u32) -> Result<GcRepo
 // Small helpers
 // ---------------------------------------------------------------------------
 
+/// Removes a directory tree, tolerating it already being gone: a concurrent
+/// process (`gc`'s sweep, another `promote`/`drop`, …) can legitimately win
+/// the exact same removal race once the caller's own critical section
+/// already made the removal safe and desired — that must not fail an
+/// operation which, from the caller's perspective, already succeeded. Any
+/// OTHER error still fails normally. `what` names the thing being removed,
+/// for the error message.
+fn remove_dir_all_tolerant(path: &Path, what: &str) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow!(e).context(format!("cannot remove {what} {}", path.display()))),
+    }
+}
+
 /// Sorted union of the relative file paths under `theirs` and `ancestor` —
 /// every path that could have been added, modified, or deleted by the run.
 /// The caller classifies (cheaply skipping ephemeral) before reading bytes.
@@ -2507,6 +2539,14 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// whose new lines were already present) must not count as a "wrote" for
 /// revision-recording purposes — FR-7 says a revision corresponds to an
 /// actual mutation, not merely an attempted one.
+///
+/// Callers that don't already have the current content in hand (the Secret
+/// write-back here, and `write_or_conflict`'s union path, which has no
+/// caller-side read to reuse) should call this. A caller that already read
+/// the current bytes for its own merge logic (the State branches just
+/// below; `merge_entry`'s 3-way-text-merge branch) should compare directly
+/// against what it already has instead — same "skip if unchanged" rule,
+/// without paying for a second read of the same file.
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
     if read_opt(path).as_deref() == Some(bytes) {
         return Ok(false);

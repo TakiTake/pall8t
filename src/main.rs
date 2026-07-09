@@ -334,8 +334,7 @@ fn home_for_run(cfg: &config::Config, run_name: &str, cwd: &Path) -> Result<std:
     match cfg.home.mode {
         home::HomeMode::Shared => container::home_mount(),
         home::HomeMode::Isolated => {
-            warn_policy(&cfg.home.policy);
-            warn_zero_revisions_keep(cfg.home.revisions_keep);
+            warn_home_config_issues(&cfg.home);
             match home::harvest_finished(&cfg.home.policy, cfg.home.revisions_keep) {
                 Ok(runs) if !runs.is_empty() => {
                     eprintln!(
@@ -362,25 +361,23 @@ fn cwd_home_config() -> config::HomeConfig {
         .and_then(|cwd| config::load(&cwd).ok())
         .map(|c| c.home)
         .unwrap_or_default();
-    warn_policy(&cfg.policy);
-    warn_zero_revisions_keep(cfg.revisions_keep);
+    warn_home_config_issues(&cfg);
     cfg
 }
 
-/// Surfaces nonsensical `[[home.policy]]` rules (see [`home::validate_policy`]).
-fn warn_policy(policy: &[config::PolicyRule]) {
-    for w in home::validate_policy(policy) {
+/// Surfaces `[home]` misconfigurations once per CLI invocation: nonsensical
+/// `[[home.policy]]` rules (see [`home::validate_policy`]), and
+/// `revisions_keep = 0` (which `home.rs`'s `prune_revisions` silently
+/// clamps to 1 regardless of whether this fires — warning there instead
+/// would print once per recorded revision, for the life of the project).
+/// The two share one entry point since they're always checked together, at
+/// the same two call sites, for the same reason: a per-project setting
+/// worth telling the user about exactly once, not on every mutation.
+fn warn_home_config_issues(cfg: &config::HomeConfig) {
+    for w in home::validate_policy(&cfg.policy) {
         eprintln!("pall8t: warning: {w}");
     }
-}
-
-/// Surfaces a `[home] revisions_keep = 0` misconfiguration once per CLI
-/// invocation, rather than `prune_revisions` warning on every recorded
-/// revision (harvest/promote/rollback) for the life of the project — see
-/// its doc comment. `home.rs` silently clamps to 1 regardless of whether
-/// this warning fires.
-fn warn_zero_revisions_keep(revisions_keep: u32) {
-    if revisions_keep == 0 {
+    if cfg.revisions_keep == 0 {
         eprintln!(
             "pall8t: warning: [home] revisions_keep = 0 would erase all history — using 1 instead"
         );
