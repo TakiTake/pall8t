@@ -784,6 +784,33 @@ fn finalize_revision(
     Ok(seq)
 }
 
+/// Finalizes a candidate revision if `written` is non-empty, discards it
+/// otherwise (never both) — the "did this mutation actually change
+/// anything" decision every revision-recording caller (harvest, promote)
+/// makes the same way. `written` becomes the finalized revision's `paths`;
+/// empty means every classified-touched path turned out not to produce an
+/// actual write (e.g. a Secret deletion per FR-10, a UTF-8-skip, or every
+/// promoted path was already a byte-for-byte match) — no mutation
+/// happened, so no revision (FR-7). `rollback` has no discard branch (a
+/// no-op rollback returns early before ever taking a snapshot) so it calls
+/// [`finalize_revision`] directly instead of through this helper.
+fn finalize_or_discard(
+    root: &Path,
+    pending: PathBuf,
+    written: Vec<String>,
+    op: RevisionOp,
+    runs: Vec<String>,
+    policy: &[PolicyRule],
+    keep: u32,
+) -> Result<()> {
+    if written.is_empty() {
+        discard_revision_snapshot(&pending);
+    } else {
+        finalize_revision(root, pending, op, runs, written, policy, keep)?;
+    }
+    Ok(())
+}
+
 fn read_revision_meta(dir: &Path) -> Result<RevisionMeta> {
     let text = std::fs::read_to_string(dir.join("meta.toml"))
         .with_context(|| format!("revision {} has no meta.toml", dir.display()))?;
@@ -1002,12 +1029,16 @@ fn diff_at(root: &Path, seq: u64, overrides: &[PolicyRule]) -> Result<String> {
     // before this field existed, which parses as an empty list.
     let recorded_overrides = read_revision_meta(&rev_dir)?.policy;
     let latest = latest_revision_seq(root)?.unwrap_or(seq);
-    let after = if seq >= latest {
+    // `_lock`, paired explicitly with `after`, makes "is the base lock
+    // still held across the `diff_entries` walk below" a value visible
+    // right here, rather than a fact that depends on which arm happened to
+    // run (and whether it called `drop`).
+    let (after, _lock): (PathBuf, Option<BaseLock>) = if seq >= latest {
         // Reading the live base races a concurrent rollback's `swap_base`,
         // which briefly renames the base directory away — keep holding the
         // lock through `diff_entries` below so the walk always sees a
         // complete tree, not an ENOENT mid-rename.
-        base_dir(root)
+        (base_dir(root), Some(lock))
     } else {
         // An older revision's `after` is an immutable, already-published
         // snapshot nothing can still be writing — release the lock before
@@ -1015,9 +1046,12 @@ fn diff_at(root: &Path, seq: u64, overrides: &[PolicyRule]) -> Result<String> {
         // than block every concurrent fork/harvest/promote/rollback for
         // that duration.
         drop(lock);
-        revisions_root(root)
-            .join(seq_name(seq + 1))
-            .join("snapshot")
+        (
+            revisions_root(root)
+                .join(seq_name(seq + 1))
+                .join("snapshot"),
+            None,
+        )
     };
     let entries =
         diff_entries(&before, &after, &recorded_overrides, overrides).with_context(|| {
@@ -1273,10 +1307,7 @@ fn harvest_instance(
         // `InstanceMeta::policy`'s doc comment for why that distinction
         // matters (the harvesting cwd's overrides must not silently apply
         // to a project that never declared them).
-        let policy: &[PolicyRule] = match &meta.policy {
-            Some(p) => p,
-            None => overrides,
-        };
+        let policy: &[PolicyRule] = meta.policy.as_deref().unwrap_or(overrides);
 
         // Classify every changed, non-ephemeral path up front (FR-7): only
         // Secret/State writes touch the base — Knowledge is only ever
@@ -1309,6 +1340,12 @@ fn harvest_instance(
         let maybe_touches_base = changed
             .iter()
             .any(|c| matches!(c.cls.class, Class::Secret | Class::State));
+        // A plain `Option`, not a `PendingRevisionGuard`: see the guard's
+        // own doc comment for why — its `Drop` always discards, which
+        // would lose `apply_harvest_changes`' partial progress on a
+        // mid-loop failure instead of preserving it (this function's whole
+        // point). The finalize-or-discard decision below is made
+        // explicitly instead.
         let pending_revision = if maybe_touches_base {
             Some(begin_revision_snapshot(root)?)
         } else {
@@ -1345,22 +1382,15 @@ fn harvest_instance(
         // Finalize or discard using what ACTUALLY got written, regardless
         // of whether the loop or the manifest write above failed.
         if let Some(pending) = pending_revision {
-            if actually_written.is_empty() {
-                // Every classified-touched path turned out not to produce an
-                // actual base write (e.g. a Secret deletion, or a UTF-8-skip)
-                // — no mutation happened, so don't burn a revision on it.
-                discard_revision_snapshot(&pending);
-            } else {
-                finalize_revision(
-                    root,
-                    pending,
-                    RevisionOp::Harvest,
-                    vec![meta.run.clone()],
-                    actually_written,
-                    policy,
-                    revisions_keep,
-                )?;
-            }
+            finalize_or_discard(
+                root,
+                pending,
+                actually_written,
+                RevisionOp::Harvest,
+                vec![meta.run.clone()],
+                policy,
+                revisions_keep,
+            )?;
         }
         // Now propagate any failure — after the mutation that already
         // happened has a revision recording it. The instance is NOT retired
@@ -1884,19 +1914,15 @@ fn promote_at(
         }
     }
     let pending = pending.disarm().expect("armed above");
-    if written.is_empty() {
-        discard_revision_snapshot(&pending);
-    } else {
-        finalize_revision(
-            root,
-            pending,
-            RevisionOp::Promote,
-            vec![run.to_string()],
-            written,
-            overrides,
-            revisions_keep,
-        )?;
-    }
+    finalize_or_discard(
+        root,
+        pending,
+        written,
+        RevisionOp::Promote,
+        vec![run.to_string()],
+        overrides,
+        revisions_keep,
+    )?;
     drop(_lock);
 
     // Drop the promoted paths from the changeset; conflicted ones stay staged.
