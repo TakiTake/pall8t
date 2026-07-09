@@ -459,16 +459,47 @@ struct InstanceMeta {
     /// `container` CLI call and closing the fork→container-appears window a
     /// container-listing check would leave open.
     forker_pid: u32,
+    /// The `[[home.policy]]` overrides active at fork time. `harvest_instance`
+    /// classifies this instance's changed paths with THIS policy, not the
+    /// invoking cwd's — a run's writes were made under the project it was
+    /// forked from, and harvest is lazy (it can run from a completely
+    /// different project's `pall8t run`/`home harvest`). Without this, a
+    /// project X that declares some path secret via policy would have that
+    /// secret staged into the inbox in cleartext (never written back per
+    /// FR-10) and its harvest revision redacted with the wrong policy the
+    /// moment a project Y lazily harvests X's instance. `#[serde(default)]`
+    /// so an instance forked before this field existed parses as empty —
+    /// `harvest_instance` then falls back to the caller's overrides, which
+    /// is exactly today's (pre-fix) behavior.
+    #[serde(default)]
+    policy: Vec<PolicyRule>,
 }
 
 /// Forks the base home for `run_name` and returns the instance root to
 /// mount at `/home/dev`. Public wrapper; resolves the app dir itself so
-/// the binary doesn't need the (crate-internal) root path.
-pub fn fork_instance(run_name: &str, workspace: &Path) -> Result<PathBuf> {
-    fork_instance_at(&crate::config::pall8t_root()?, run_name, workspace)
+/// the binary doesn't need the (crate-internal) root path. `overrides` is
+/// the policy active for the project this run belongs to — pinned into the
+/// instance's metadata so a later, lazy harvest classifies its writes with
+/// THIS policy even if it runs from a different project's cwd.
+pub fn fork_instance(
+    run_name: &str,
+    workspace: &Path,
+    overrides: &[PolicyRule],
+) -> Result<PathBuf> {
+    fork_instance_at(
+        &crate::config::pall8t_root()?,
+        run_name,
+        workspace,
+        overrides,
+    )
 }
 
-fn fork_instance_at(root: &Path, run_name: &str, workspace: &Path) -> Result<PathBuf> {
+fn fork_instance_at(
+    root: &Path,
+    run_name: &str,
+    workspace: &Path,
+    overrides: &[PolicyRule],
+) -> Result<PathBuf> {
     let base = base_dir(root);
     let inst = instances_root(root).join(run_name);
     if inst.exists() {
@@ -514,6 +545,7 @@ fn fork_instance_at(root: &Path, run_name: &str, workspace: &Path) -> Result<Pat
         workspace: workspace.to_string_lossy().into_owned(),
         created: now_secs(),
         forker_pid: std::process::id(),
+        policy: overrides.to_vec(),
     };
     std::fs::write(partial.join("meta.toml"), toml::to_string(&meta)?)?;
     std::fs::rename(&partial, &inst)
@@ -779,19 +811,17 @@ fn latest_revision_seq(root: &Path) -> Result<Option<u64>> {
 
 /// Removes the oldest revisions beyond `keep`, returning how many were
 /// pruned. Called after every [`finalize_revision`] and again by `gc` (in
-/// case a crash skipped the post-finalize prune). `keep = 0` is clamped to 1
-/// — otherwise the revision `finalize_revision` just published would be
-/// pruned immediately after being written, leaving `home log` permanently
-/// empty and `next_revision_seq` resetting to 1 forever.
+/// case a crash skipped the post-finalize prune) — i.e. up to once per
+/// recorded revision, so `keep = 0` is silently clamped to 1 here rather
+/// than warning every time (that would spam one line per harvest/promote/
+/// rollback for the life of a misconfigured project); the CLI layer warns
+/// about `revisions_keep = 0` once per invocation instead (next to its
+/// `[[home.policy]]` warnings). Clamping matters because otherwise the
+/// revision [`finalize_revision`] just published would be pruned
+/// immediately after being written, leaving `home log` permanently empty
+/// and `next_revision_seq` resetting to 1 forever.
 fn prune_revisions(root: &Path, keep: u32) -> Result<usize> {
-    let keep = if keep == 0 {
-        eprintln!(
-            "pall8t: warning: [home] revisions_keep = 0 would erase all history — using 1 instead"
-        );
-        1
-    } else {
-        keep
-    };
+    let keep = if keep == 0 { 1 } else { keep };
     let dirs = list_revision_dirs(root)?;
     let keep = keep as usize;
     if dirs.len() <= keep {
@@ -1009,6 +1039,13 @@ fn diff_at(root: &Path, seq: u64, overrides: &[PolicyRule]) -> Result<String> {
 /// `rollback`), under the base lock, crash-atomic via [`swap_base`]. The
 /// rollback itself is recorded as a new revision (paths = what the swap
 /// actually changed) so it is undoable like any other base mutation.
+///
+/// `overrides` is the invoking cwd's policy, used only for that new
+/// revision's redaction record — like promote, rollback never classifies
+/// anything itself (it's a raw directory swap; `diff_paths` just compares
+/// bytes). This is fine even cross-project: whatever secret content the
+/// swap moves around was already protected by ITS OWN harvest revision's
+/// recorded policy, which `diff <that seq>` still consults independently.
 pub fn rollback(seq: u64, overrides: &[PolicyRule], revisions_keep: u32) -> Result<()> {
     rollback_at(
         &crate::config::pall8t_root()?,
@@ -1185,13 +1222,26 @@ fn harvest_instance(
         let ancestor_root = inst.join("ancestor");
         let base = base_dir(root);
 
+        // Classify with the policy that was active AT FORK TIME for this
+        // instance, not the invoking cwd's: harvest is lazy (FR-8) and can
+        // run from a completely different project than the one this run
+        // belongs to, and the run's writes were made under ITS project's
+        // regime. Falls back to the caller's `overrides` only when the
+        // instance predates this field (an empty recorded policy) — see
+        // `InstanceMeta::policy`'s doc comment.
+        let policy: &[PolicyRule] = if meta.policy.is_empty() {
+            overrides
+        } else {
+            &meta.policy
+        };
+
         // Classify every changed, non-ephemeral path up front (FR-7): only
         // Secret/State writes touch the base — Knowledge is only ever
         // staged — so this tells us before mutating anything whether a
         // revision snapshot is needed, and of what.
         let mut changed = Vec::new();
         for rel in union_paths(&theirs_root, &ancestor_root)? {
-            let cls = classify(&rel, overrides);
+            let cls = classify(&rel, policy);
             if cls.class == Class::Ephemeral {
                 continue;
             }
@@ -1264,7 +1314,7 @@ fn harvest_instance(
                     RevisionOp::Harvest,
                     vec![meta.run.clone()],
                     actually_written,
-                    overrides,
+                    policy,
                     revisions_keep,
                 )?;
             }
@@ -1735,6 +1785,17 @@ pub struct PromoteOutcome {
 /// arise only here (FR-5): a conflicted path is left staged and the base is
 /// not touched, so a re-run after manual resolution completes cleanly. All
 /// base writes happen under the base lock (FR-6).
+///
+/// `overrides` is used ONLY for the revision recorded on a successful
+/// promote (so a later `diff` can redact a path the CURRENT cwd's policy
+/// calls secret) — never for classification. Unlike harvest, promote never
+/// re-classifies a path: every entry's `class`/`strategy` was already
+/// pinned into the changeset's manifest at harvest time, under the fork
+/// instance's OWN recorded policy (see `InstanceMeta::policy`,
+/// `harvest_instance`). A promote invoked from a different project's cwd
+/// therefore can't misclassify anything — it only ever applies the class
+/// decision harvest already made. (Secrets never reach this path at all:
+/// `Class::Secret` entries are written back at harvest, never staged.)
 pub fn promote(
     run: &str,
     paths: &[String],

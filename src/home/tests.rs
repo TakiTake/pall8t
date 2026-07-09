@@ -55,7 +55,7 @@ fn finish_run(root: &TempRoot, run: &str) {
 /// Simulates a run: fork, mutate the instance's `root/` as the agent would,
 /// mark it finished, then harvest it.
 fn run_and_harvest(root: &TempRoot, run: &str, mutate: impl FnOnce(&Path)) {
-    let instance = fork_instance_at(root.path(), run, Path::new("/ws")).unwrap();
+    let instance = fork_instance_at(root.path(), run, Path::new("/ws"), &[]).unwrap();
     mutate(&instance);
     finish_run(root, run);
     let harvested = harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
@@ -247,7 +247,7 @@ fn fork_snapshots_base_and_is_removable() {
     root.write_base(".claude.json", r#"{"v":1}"#);
     root.write_base(".claude/skills/a/SKILL.md", "hello");
 
-    let instance = fork_instance_at(root.path(), "run-1", Path::new("/ws")).unwrap();
+    let instance = fork_instance_at(root.path(), "run-1", Path::new("/ws"), &[]).unwrap();
     assert_eq!(
         std::fs::read_to_string(instance.join(".claude.json")).unwrap(),
         r#"{"v":1}"#,
@@ -265,8 +265,8 @@ fn fork_snapshots_base_and_is_removable() {
 fn fork_refuses_to_clobber_existing_instance() {
     let root = TempRoot::new("fork-dup");
     root.write_base(".x", "1");
-    fork_instance_at(root.path(), "dup", Path::new("/ws")).unwrap();
-    let err = fork_instance_at(root.path(), "dup", Path::new("/ws")).unwrap_err();
+    fork_instance_at(root.path(), "dup", Path::new("/ws"), &[]).unwrap();
+    let err = fork_instance_at(root.path(), "dup", Path::new("/ws"), &[]).unwrap_err();
     assert!(err.to_string().contains("already exists"));
 }
 
@@ -324,7 +324,7 @@ fn harvest_skips_live_runs() {
     let root = TempRoot::new("live");
     root.write_base(".x", "1");
     // Forked with the (live) test process as the forker, and not finished.
-    fork_instance_at(root.path(), "live-run", Path::new("/ws")).unwrap();
+    fork_instance_at(root.path(), "live-run", Path::new("/ws"), &[]).unwrap();
     let harvested = harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
     assert!(harvested.is_empty(), "a live run is not harvested");
     assert!(
@@ -339,7 +339,7 @@ fn secret_unchanged_by_run_does_not_clobber_base() {
     // token another run refreshed into the base after this fork.
     let root = TempRoot::new("secret-keep");
     root.write_base(".claude/.credentials.json", r#"{"token":"v1"}"#);
-    fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap();
     // Base advances (another run refreshed the token) while this run does
     // NOT touch its own copy.
     root.write_base(".claude/.credentials.json", r#"{"token":"v2"}"#);
@@ -492,8 +492,8 @@ fn two_parallel_runs_merge_state_and_stage_independently() {
     root.write_base(".claude.json", r#"{"shared":0,"a":0,"b":0}"#);
 
     // Both fork from the same base.
-    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa")).unwrap();
-    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb")).unwrap();
+    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa"), &[]).unwrap();
+    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb"), &[]).unwrap();
 
     // A bumps key "a" and adds skill X; B bumps key "b" and adds skill Y.
     write(&inst_a.join(".claude.json"), r#"{"shared":0,"a":1,"b":0}"#);
@@ -529,8 +529,8 @@ fn parallel_history_jsonl_appends_union_at_harvest_no_conflict() {
     // nothing conflicts, and nothing is staged (it's state, not knowledge).
     let root = TempRoot::new("history-union");
     root.write_base(".claude/history.jsonl", "{\"p\":\"x\"}\n");
-    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa")).unwrap();
-    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb")).unwrap();
+    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa"), &[]).unwrap();
+    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb"), &[]).unwrap();
     write(
         &inst_a.join(".claude/history.jsonl"),
         "{\"p\":\"x\"}\n{\"p\":\"a\"}\n",
@@ -560,7 +560,7 @@ fn union_non_utf8_run_keeps_base_not_overwrites() {
     let root = TempRoot::new("history-badutf8");
     let base_content = "{\"p\":\"acc-from-other-runs\"}\n";
     root.write_base(".claude/history.jsonl", base_content);
-    let inst = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    let inst = fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap();
     // Invalid UTF-8 bytes as the run's history.
     write_atomic(
         &inst.join(".claude/history.jsonl"),
@@ -591,7 +591,7 @@ fn knowledge_union_strategy_merges_without_conflict_at_promote() {
     root.write_base("notes.log", "top\nshared\nbottom\n");
     // Run edits the middle line; harvest with the override stages it as
     // knowledge+union.
-    let inst = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    let inst = fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap();
     write(&inst.join("notes.log"), "top\nrun\nbottom\n");
     finish_run(&root, "r");
     harvest_finished_at(root.path(), &overrides, DEFAULT_REVISIONS_KEEP).unwrap();
@@ -616,8 +616,8 @@ fn two_parallel_runs_both_create_state_file() {
     // merge base keeps both.
     let root = TempRoot::new("parallel-create");
     // No .claude.json in the base.
-    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa")).unwrap();
-    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb")).unwrap();
+    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa"), &[]).unwrap();
+    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb"), &[]).unwrap();
     write(&inst_a.join(".claude.json"), r#"{"runA":1}"#);
     write(&inst_b.join(".claude.json"), r#"{"runB":2}"#);
     finish_run(&root, "run-a");
@@ -694,7 +694,7 @@ fn fork_refuses_over_unpromoted_changeset() {
         write(&inst.join(".claude/skills/x/SKILL.md"), "x");
     });
     // Changeset "r" now sits un-promoted in the inbox; re-forking "r" fails.
-    let err = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap_err();
+    let err = fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap_err();
     assert!(err.to_string().contains("un-promoted changeset"));
 }
 
@@ -708,7 +708,7 @@ fn fork_refuses_over_unpromoted_changeset() {
 
 /// Forks + mutates + finishes a run WITHOUT harvesting (merge does the harvest).
 fn stage_run(root: &TempRoot, run: &str, mutate: impl FnOnce(&Path)) {
-    let inst = fork_instance_at(root.path(), run, Path::new("/ws")).unwrap();
+    let inst = fork_instance_at(root.path(), run, Path::new("/ws"), &[]).unwrap();
     mutate(&inst);
     finish_run(root, run);
 }
@@ -805,7 +805,7 @@ fn merge_empty_inbox_is_noop() {
 fn merge_specific_live_run_errors() {
     let root = TempRoot::new("merge-live");
     // Forked with the live test pid, not finished.
-    fork_instance_at(root.path(), "run-live", Path::new("/ws")).unwrap();
+    fork_instance_at(root.path(), "run-live", Path::new("/ws"), &[]).unwrap();
     let err = merge_at(root.path(), Some("run-live"), &[], DEFAULT_REVISIONS_KEEP).unwrap_err();
     assert!(err.to_string().contains("still running"));
 }
@@ -996,7 +996,7 @@ fn revisions_pruned_beyond_keep() {
     root.write_base(".claude/.credentials.json", r#"{"token":"0"}"#);
     for i in 1..=5u32 {
         let run = format!("r{i}");
-        let instance = fork_instance_at(root.path(), &run, Path::new("/ws")).unwrap();
+        let instance = fork_instance_at(root.path(), &run, Path::new("/ws"), &[]).unwrap();
         write(
             &instance.join(".claude/.credentials.json"),
             &format!(r#"{{"token":"{i}"}}"#),
@@ -1124,8 +1124,8 @@ fn rollback_to_already_current_state_records_nothing_new() {
 #[test]
 fn ls_reports_running_and_finished_instances() {
     let root = TempRoot::new("ls");
-    fork_instance_at(root.path(), "live", Path::new("/ws")).unwrap(); // live test pid
-    fork_instance_at(root.path(), "done", Path::new("/ws")).unwrap();
+    fork_instance_at(root.path(), "live", Path::new("/ws"), &[]).unwrap(); // live test pid
+    fork_instance_at(root.path(), "done", Path::new("/ws"), &[]).unwrap();
     finish_run(&root, "done");
 
     let mut instances = list_instances_at(root.path()).unwrap();
@@ -1144,7 +1144,7 @@ fn ls_reports_running_and_finished_instances() {
 #[test]
 fn ls_flags_implausibly_old_running_instance_as_suspicious() {
     let root = TempRoot::new("ls-suspicious");
-    fork_instance_at(root.path(), "old", Path::new("/ws")).unwrap();
+    fork_instance_at(root.path(), "old", Path::new("/ws"), &[]).unwrap();
     backdate_instance_created(&root, "old", SUSPICIOUS_RUNNING_SECS + 3_600);
     let instances = list_instances_at(root.path()).unwrap();
     let old = instances.iter().find(|i| i.run == "old").unwrap();
@@ -1170,7 +1170,7 @@ fn ls_does_not_list_partial_or_discard_tombstones() {
 #[test]
 fn rm_refuses_live_run_without_force_and_force_removes_it() {
     let root = TempRoot::new("rm-live");
-    fork_instance_at(root.path(), "live", Path::new("/ws")).unwrap();
+    fork_instance_at(root.path(), "live", Path::new("/ws"), &[]).unwrap();
     let err = rm_at(root.path(), "live", false).unwrap_err();
     assert!(err.to_string().contains("--force"));
     assert!(instances_root(root.path()).join("live").exists());
@@ -1182,7 +1182,7 @@ fn rm_refuses_live_run_without_force_and_force_removes_it() {
 #[test]
 fn rm_removes_finished_run_without_force() {
     let root = TempRoot::new("rm-finished");
-    fork_instance_at(root.path(), "done", Path::new("/ws")).unwrap();
+    fork_instance_at(root.path(), "done", Path::new("/ws"), &[]).unwrap();
     finish_run(&root, "done");
     rm_at(root.path(), "done", false).unwrap();
     assert!(!instances_root(root.path()).join("done").exists());
@@ -1237,7 +1237,7 @@ fn gc_prunes_revisions_and_warns_about_stale_changesets_without_deleting() {
     root.write_base(".claude/.credentials.json", r#"{"token":"0"}"#);
     for i in 1..=3u32 {
         let run = format!("r{i}");
-        let instance = fork_instance_at(root.path(), &run, Path::new("/ws")).unwrap();
+        let instance = fork_instance_at(root.path(), &run, Path::new("/ws"), &[]).unwrap();
         write(
             &instance.join(".claude/.credentials.json"),
             &format!(r#"{{"token":"{i}"}}"#),
@@ -1293,7 +1293,7 @@ fn harvest_records_no_revision_when_the_classified_touch_writes_nothing() {
     // snapshot is byte-identical to the current base.
     let root = TempRoot::new("phantom-revision");
     root.write_base(".claude/.credentials.json", r#"{"token":"v1"}"#);
-    let instance = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    let instance = fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap();
     std::fs::remove_file(instance.join(".claude/.credentials.json")).unwrap();
     finish_run(&root, "r");
     harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
@@ -1389,7 +1389,7 @@ fn harvest_records_partial_progress_and_leaves_instance_for_retry_on_mid_loop_er
     let root = TempRoot::new("harvest-partial-failure");
     root.write_base(".aws/credentials", "old");
     root.write_base(".claude.json", r#"{"n":1}"#);
-    let instance = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    let instance = fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap();
     write(&instance.join(".aws/credentials"), "new");
     write(&instance.join(".claude.json"), "{not valid json");
     finish_run(&root, "r");
@@ -1511,7 +1511,7 @@ fn diff_redacts_a_secret_declared_by_the_recorded_policy_even_with_different_cur
     }];
     let root = TempRoot::new("diff-secret-recorded-policy");
     root.write_base(".config/mytool/token", "old-secret");
-    let instance = fork_instance_at(root.path(), "r", Path::new("/ws")).unwrap();
+    let instance = fork_instance_at(root.path(), "r", Path::new("/ws"), &[]).unwrap();
     write(&instance.join(".config/mytool/token"), "new-secret");
     finish_run(&root, "r");
     harvest_finished_at(
@@ -1558,14 +1558,59 @@ fn diff_redacts_a_path_the_current_policy_declares_secret_even_if_recorded_polic
 }
 
 #[test]
+fn harvest_classifies_with_the_forking_projects_policy_not_the_harvesting_cwds() {
+    // Project X declares `.config/mytool/token` secret via policy at FORK
+    // time (pinned into InstanceMeta). A later harvest invoked with a
+    // DIFFERENT (here: empty) policy -- as if it ran from project Y's cwd,
+    // or a bare `pall8t home harvest`/`pall8t run` with no matching rule
+    // (harvest is lazy, FR-8, so this is the common case, not an edge case)
+    // -- must still classify and protect it as X's policy said: written
+    // back to the base as a secret (FR-10), never staged into the inbox in
+    // cleartext, and the harvest revision's own diff still redacts it even
+    // when diffed with an empty CURRENT policy, because the policy pinned
+    // into that revision's meta.toml also came from the fork-time policy.
+    let policy_x = vec![PolicyRule {
+        glob: ".config/mytool/token".to_string(),
+        class: Some(Class::Secret),
+        strategy: None,
+    }];
+    let root = TempRoot::new("cross-project-policy");
+    root.write_base(".config/mytool/token", "old-token");
+    let instance = fork_instance_at(root.path(), "r", Path::new("/ws"), &policy_x).unwrap();
+    write(&instance.join(".config/mytool/token"), "new-token");
+    finish_run(&root, "r");
+
+    // Harvested with an EMPTY policy -- the fork-time policy must win.
+    harvest_finished_at(root.path(), &[], DEFAULT_REVISIONS_KEEP).unwrap();
+
+    assert_eq!(
+        root.read_base(".config/mytool/token").unwrap(),
+        "new-token",
+        "classified secret under the fork-time policy, written back per FR-10"
+    );
+    assert!(
+        list_changesets_at(root.path()).unwrap().is_empty(),
+        "must not be staged into the inbox in cleartext as knowledge"
+    );
+
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs.len(), 1);
+    let out = diff_at(root.path(), revs[0].seq, &[]).unwrap();
+    assert!(out.contains(".config/mytool/token"));
+    assert!(out.contains("secret — content not shown"));
+    assert!(!out.contains("old-token"));
+    assert!(!out.contains("new-token"));
+}
+
+#[test]
 fn parallel_runs_writing_identical_secret_value_records_only_one_revision() {
     // Both runs refresh the credential to the SAME new value. The second
     // harvest's write is byte-identical to what the first harvest already
     // wrote -- it must not count as a mutation and burn a second revision.
     let root = TempRoot::new("identical-secret-writes");
     root.write_base(".claude/.credentials.json", r#"{"token":"old"}"#);
-    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa")).unwrap();
-    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb")).unwrap();
+    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa"), &[]).unwrap();
+    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb"), &[]).unwrap();
     write(
         &inst_a.join(".claude/.credentials.json"),
         r#"{"token":"new"}"#,
@@ -1592,24 +1637,36 @@ fn parallel_runs_writing_identical_secret_value_records_only_one_revision() {
 
 #[test]
 fn promote_union_merge_identical_to_current_consumes_path_without_recording_revision() {
-    // Two runs stage the exact same append to a union-strategy path. The
-    // first promote is a real content change (records a revision); the
-    // second's union merge reconstructs exactly what's already there --
-    // the path is still consumed from run-b's changeset, but no new
-    // revision should be recorded for it.
+    // Constructed so run-b's promote actually REACHES `write_or_conflict`'s
+    // union path (unlike an earlier version of this test, which had both
+    // runs stage an identical append -- that hit the pre-existing `c == t`
+    // fast path in `merge_entry` before ever reaching the union branch, so
+    // it stayed green even with the `write_if_changed` fix in
+    // `write_or_conflict` reverted).
+    //
+    // notes.log starts as an EXISTING EMPTY file (ancestor = Some("")).
+    // run-a stages ancestor="", theirs="l1\nl2\n"; run-b stages
+    // ancestor="", theirs="l2\n". Promoting run-a fast-forwards (current
+    // still equals ancestor) to "l1\nl2\n". Promoting run-b then hits
+    // `current == "l1\nl2\n"`, which is neither `ancestor` nor `theirs`, so
+    // it falls through to the union branch: `union_merge("", "l1\nl2\n",
+    // "l2\n")` reconstructs exactly "l1\nl2\n" (verified against the real
+    // `git merge-file --union` this shells out to) -- a merge that runs and
+    // produces a result equal to `current`, which must not count as a
+    // write.
     let overrides = vec![PolicyRule {
         glob: "notes.log".to_string(),
         class: Some(Class::Knowledge),
         strategy: Some(MergeStrategy::Union),
     }];
     let root = TempRoot::new("union-noop-revision");
-    root.write_base("notes.log", "line1\n");
+    root.write_base("notes.log", "");
 
-    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa")).unwrap();
-    write(&inst_a.join("notes.log"), "line1\nline2\n");
+    let inst_a = fork_instance_at(root.path(), "run-a", Path::new("/wa"), &[]).unwrap();
+    write(&inst_a.join("notes.log"), "l1\nl2\n");
     finish_run(&root, "run-a");
-    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb")).unwrap();
-    write(&inst_b.join("notes.log"), "line1\nline2\n");
+    let inst_b = fork_instance_at(root.path(), "run-b", Path::new("/wb"), &[]).unwrap();
+    write(&inst_b.join("notes.log"), "l2\n");
     finish_run(&root, "run-b");
     harvest_finished_at(root.path(), &overrides, DEFAULT_REVISIONS_KEEP).unwrap();
 
@@ -1622,6 +1679,7 @@ fn promote_union_merge_identical_to_current_consumes_path_without_recording_revi
     )
     .unwrap();
     assert_eq!(outcome_a.promoted, vec!["notes.log".to_string()]);
+    assert_eq!(root.read_base("notes.log").unwrap(), "l1\nl2\n");
     let revs_after_a = list_revisions_at(root.path()).unwrap().len();
     assert_eq!(revs_after_a, 1);
 
@@ -1637,6 +1695,11 @@ fn promote_union_merge_identical_to_current_consumes_path_without_recording_revi
         outcome_b.promoted,
         vec!["notes.log".to_string()],
         "the path is still consumed from run-b's changeset"
+    );
+    assert_eq!(
+        root.read_base("notes.log").unwrap(),
+        "l1\nl2\n",
+        "the union merge reconstructs exactly what's already there"
     );
     let revs_after_b = list_revisions_at(root.path()).unwrap().len();
     assert_eq!(
@@ -1654,7 +1717,7 @@ fn prune_revisions_clamps_zero_keep_to_one() {
     root.write_base(".claude/.credentials.json", r#"{"token":"0"}"#);
     for i in 1..=3u32 {
         let run = format!("r{i}");
-        let instance = fork_instance_at(root.path(), &run, Path::new("/ws")).unwrap();
+        let instance = fork_instance_at(root.path(), &run, Path::new("/ws"), &[]).unwrap();
         write(
             &instance.join(".claude/.credentials.json"),
             &format!(r#"{{"token":"{i}"}}"#),

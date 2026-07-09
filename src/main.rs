@@ -335,6 +335,7 @@ fn home_for_run(cfg: &config::Config, run_name: &str, cwd: &Path) -> Result<std:
         home::HomeMode::Shared => container::home_mount(),
         home::HomeMode::Isolated => {
             warn_policy(&cfg.home.policy);
+            warn_zero_revisions_keep(cfg.home.revisions_keep);
             match home::harvest_finished(&cfg.home.policy, cfg.home.revisions_keep) {
                 Ok(runs) if !runs.is_empty() => {
                     eprintln!(
@@ -345,7 +346,7 @@ fn home_for_run(cfg: &config::Config, run_name: &str, cwd: &Path) -> Result<std:
                 Ok(_) => {}
                 Err(e) => eprintln!("pall8t: warning: could not harvest finished runs: {e:#}"),
             }
-            let instance = home::fork_instance(run_name, cwd)?;
+            let instance = home::fork_instance(run_name, cwd, &cfg.home.policy)?;
             eprintln!("pall8t: isolated home — forked a private instance for this run");
             Ok(instance)
         }
@@ -362,6 +363,7 @@ fn cwd_home_config() -> config::HomeConfig {
         .map(|c| c.home)
         .unwrap_or_default();
     warn_policy(&cfg.policy);
+    warn_zero_revisions_keep(cfg.revisions_keep);
     cfg
 }
 
@@ -369,6 +371,19 @@ fn cwd_home_config() -> config::HomeConfig {
 fn warn_policy(policy: &[config::PolicyRule]) {
     for w in home::validate_policy(policy) {
         eprintln!("pall8t: warning: {w}");
+    }
+}
+
+/// Surfaces a `[home] revisions_keep = 0` misconfiguration once per CLI
+/// invocation, rather than `prune_revisions` warning on every recorded
+/// revision (harvest/promote/rollback) for the life of the project — see
+/// its doc comment. `home.rs` silently clamps to 1 regardless of whether
+/// this warning fires.
+fn warn_zero_revisions_keep(revisions_keep: u32) {
+    if revisions_keep == 0 {
+        eprintln!(
+            "pall8t: warning: [home] revisions_keep = 0 would erase all history — using 1 instead"
+        );
     }
 }
 
