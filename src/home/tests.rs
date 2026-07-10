@@ -1143,6 +1143,80 @@ fn rollback_inherits_earlier_revisions_policy_to_protect_reintroduced_secret_con
 }
 
 #[test]
+fn rollback_accumulated_policy_filters_to_secret_rules_avoiding_masking() {
+    // Revision 1 (older, a promote) recorded a BROAD non-secret rule
+    // (`.config/mytool/**` -> knowledge). Revision 2 (newer, a harvest)
+    // recorded a SPECIFIC secret rule for the token path. `classify` is
+    // first-match-wins, so naively concatenating raw policy lists
+    // oldest-first would let revision 1's broad rule mask revision 2's
+    // secret rule when the ROLLBACK's own (later) revision is diffed --
+    // `accumulated_secret_policy` must filter both sources to
+    // secret-classifying rules only so this can't happen.
+    let broad_knowledge_rule = vec![PolicyRule {
+        glob: ".config/mytool/**".to_string(),
+        class: Some(Class::Knowledge),
+        strategy: None,
+    }];
+    let secret_rule = vec![PolicyRule {
+        glob: ".config/mytool/token".to_string(),
+        class: Some(Class::Secret),
+        strategy: None,
+    }];
+
+    let root = TempRoot::new("rollback-masking-hazard");
+    root.write_base(".config/mytool/token", "old-value");
+
+    // Revision 1 (older): promote a knowledge path under the broad rule.
+    let inst_a =
+        fork_instance_at(root.path(), "a", Path::new("/wa"), &broad_knowledge_rule).unwrap();
+    write(&inst_a.join(".config/mytool/notes"), "some notes");
+    finish_run(&root, "a");
+    harvest_finished_at(root.path(), &broad_knowledge_rule, DEFAULT_REVISIONS_KEEP).unwrap();
+    let outcome = promote_at(
+        root.path(),
+        "a",
+        &[],
+        &broad_knowledge_rule,
+        DEFAULT_REVISIONS_KEEP,
+    )
+    .unwrap();
+    assert_eq!(outcome.promoted, vec![".config/mytool/notes".to_string()]);
+
+    // Revision 2 (newer): harvest changes the token under the secret rule.
+    let inst_b = fork_instance_at(root.path(), "b", Path::new("/wb"), &secret_rule).unwrap();
+    write(&inst_b.join(".config/mytool/token"), "new-value");
+    finish_run(&root, "b");
+    harvest_finished_at(root.path(), &secret_rule, DEFAULT_REVISIONS_KEEP).unwrap();
+
+    let revs = list_revisions_at(root.path()).unwrap();
+    assert_eq!(
+        revs.len(),
+        2,
+        "revision 1 (promote) and revision 2 (harvest)"
+    );
+    let harvest_seq = revs[0].seq; // newest first -> the harvest is revs[0]
+    assert_eq!(root.read_base(".config/mytool/token").unwrap(), "new-value");
+
+    // Rolled back to the harvest revision's pre-mutation snapshot, invoked
+    // with an EMPTY current policy.
+    rollback_at(root.path(), harvest_seq, &[], DEFAULT_REVISIONS_KEEP).unwrap();
+    assert_eq!(root.read_base(".config/mytool/token").unwrap(), "old-value");
+
+    let revs_after = list_revisions_at(root.path()).unwrap();
+    assert_eq!(revs_after.len(), 3);
+    let rollback_seq = revs_after[0].seq; // newest first
+
+    let out = diff_at(root.path(), rollback_seq, &[]).unwrap();
+    assert!(out.contains(".config/mytool/token"));
+    assert!(
+        out.contains("secret — content not shown"),
+        "the secret rule must not be masked by the broader, older knowledge rule"
+    );
+    assert!(!out.contains("old-value"));
+    assert!(!out.contains("new-value"));
+}
+
+#[test]
 fn rollback_unknown_revision_errors() {
     let root = TempRoot::new("rollback-unknown");
     let err = rollback_at(root.path(), 999, &[], DEFAULT_REVISIONS_KEEP).unwrap_err();

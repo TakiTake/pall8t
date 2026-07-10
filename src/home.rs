@@ -1092,12 +1092,13 @@ fn diff_at(root: &Path, seq: u64, overrides: &[PolicyRule]) -> Result<String> {
 /// reintroduce content byte-for-byte from ANY earlier revision, classified
 /// under THAT revision's policy, which may be a different project entirely
 /// or simply no longer loaded at rollback time. So the policy recorded for
-/// this new revision is `overrides` unioned with every still-existing
-/// revision's own recorded policy (see [`accumulated_revision_policy`]) —
-/// over-inclusive is the safe failure mode here (a stray rule that matches
-/// nothing is a no-op; a missing one is a leak). Bounded by
-/// `revisions_keep`: a revision old enough to be pruned already lost its
-/// policy record regardless of what this function does.
+/// this new revision is the SECRET-classifying rules from `overrides` and
+/// every still-existing revision's own recorded policy (see
+/// [`accumulated_secret_policy`]) — fail-closed over-redaction is the safe
+/// failure mode here (a stray secret rule that matches nothing is a no-op;
+/// a missing one is a leak). Bounded by `revisions_keep`: a revision old
+/// enough to be pruned already lost its policy record regardless of what
+/// this function does.
 pub fn rollback(seq: u64, overrides: &[PolicyRule], revisions_keep: u32) -> Result<()> {
     rollback_at(
         &crate::config::pall8t_root()?,
@@ -1107,18 +1108,32 @@ pub fn rollback(seq: u64, overrides: &[PolicyRule], revisions_keep: u32) -> Resu
     )
 }
 
-/// Every still-existing revision's recorded `policy`, concatenated (FR-7
-/// `rollback`'s redaction composition — see [`rollback`]'s doc comment).
-/// Duplicate/overlapping rules are harmless: [`classify`] just tries them
-/// in order, and this is only ever OR'd against other policies for a
-/// secret-or-not check, never used to merge/apply rules structurally.
-fn accumulated_revision_policy(root: &Path) -> Result<Vec<PolicyRule>> {
-    let mut out = Vec::new();
+/// The secret-classifying rules from `overrides` and from every
+/// still-existing revision's own recorded policy (FR-7 `rollback`'s
+/// redaction composition — see [`rollback`]'s doc comment). Filtered to
+/// `class == Some(Secret)` ONLY, never the raw rule lists: `classify` is
+/// first-match-wins, so concatenating full policies oldest-first would let
+/// a broader, non-secret rule recorded by an EARLIER revision (e.g. a
+/// project's own `class = "knowledge"` rule over the same glob) sort
+/// before a LATER revision's more specific `secret` rule and mask it —
+/// exactly the hazard round 1's `diff_entries` fix exists to avoid, by
+/// never merging raw rule lists across policies. A list containing only
+/// secret-classifying rules can't mask anything this way: any match means
+/// secret, no match falls through to `classify`'s own built-in defaults,
+/// same as everywhere else this "is it secret" check is used. The cost is
+/// fail-closed: a project's specific NON-secret rule that happened to
+/// shadow a broader secret rule within its OWN policy isn't reproduced
+/// here (only the secret rule survives the filter) — over-redaction, never
+/// a leak, which is the acceptable direction to err.
+fn accumulated_secret_policy(root: &Path, overrides: &[PolicyRule]) -> Result<Vec<PolicyRule>> {
+    let is_secret = |r: &PolicyRule| r.class == Some(Class::Secret);
+    let mut out: Vec<PolicyRule> = Vec::new();
     for (_, path) in list_revision_dirs(root)? {
         if let Ok(meta) = read_revision_meta(&path) {
-            out.extend(meta.policy);
+            out.extend(meta.policy.into_iter().filter(is_secret));
         }
     }
+    out.extend(overrides.iter().filter(|r| is_secret(r)).cloned());
     Ok(out)
 }
 
@@ -1145,8 +1160,7 @@ fn rollback_at(root: &Path, seq: u64, overrides: &[PolicyRule], revisions_keep: 
     // not just the invoking cwd's — gathered before finalizing so it
     // reflects every revision that exists right now, not one this rollback
     // is about to add or prune.
-    let mut policy = accumulated_revision_policy(root)?;
-    policy.extend_from_slice(overrides);
+    let policy = accumulated_secret_policy(root, overrides)?;
     let pending = PendingRevisionGuard(Some(begin_revision_snapshot(root)?));
     swap_base(root, &target)?;
     let pending = pending.disarm().expect("armed above");
