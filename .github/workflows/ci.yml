@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # Both runners actually execute `cargo test`, not just build/lint — a
+    # prior bug (ENOENT in `clone_tree`'s macOS `clonefile(2)` path) shipped
+    # because every real test run happened on Linux, where `home.rs`'s
+    # non-macOS fallback masked the exact defect. Lint-only cross-compiling
+    # to the other target isn't a substitute for running the suite on it.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

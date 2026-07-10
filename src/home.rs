@@ -483,7 +483,6 @@ fn fork_instance_at(
         std::fs::remove_dir_all(&partial)
             .with_context(|| format!("cannot clear stale partial fork {}", partial.display()))?;
     }
-    std::fs::create_dir_all(&partial)?;
     // Snapshot the quiescent base into the instance and its ancestor under
     // the base lock, then publish atomically by rename: a crash before the
     // rename leaves only `<run>.partial`, never a half-instance. `base`'s
@@ -492,8 +491,8 @@ fn fork_instance_at(
     {
         let _lock = lock_base(root)?;
         std::fs::create_dir_all(&base)?;
-        clone_tree(&base, &partial.join("root"))?;
-        clone_tree(&base, &partial.join("ancestor"))?;
+        clone_into(&partial, "root", &base)?;
+        clone_into(&partial, "ancestor", &base)?;
     }
     let meta = InstanceMeta {
         run: run_name.to_string(),
@@ -512,10 +511,11 @@ fn fork_instance_at(
 }
 
 /// Copy-on-write clone of a directory hierarchy from `src` to `dst` (which
-/// must not exist). On macOS this is `clonefile(2)` — O(1) metadata, the
-/// spec's primary fork mechanism, requiring `src`/`dst` on the same APFS
-/// volume. Phase 1 errors clearly if that fails; the non-APFS recursive-copy
-/// fallback is Phase 3.
+/// must not exist, though `dst`'s parent must — see [`clone_into`], the
+/// only sanctioned way to call this). On macOS this is `clonefile(2)` —
+/// O(1) metadata, the spec's primary fork mechanism, requiring `src`/`dst`
+/// on the same APFS volume. Phase 1 errors clearly if that fails; the
+/// non-APFS recursive-copy fallback is Phase 3.
 #[cfg(target_os = "macos")]
 fn clone_tree(src: &Path, dst: &Path) -> Result<()> {
     use std::ffi::CString;
@@ -526,13 +526,41 @@ fn clone_tree(src: &Path, dst: &Path) -> Result<()> {
     // the call; flags 0 is the documented default.
     let rc = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
     if rc != 0 {
-        return Err(anyhow!(io::Error::last_os_error()).context(format!(
-            "clonefile {} -> {} failed — Phase 1 requires the pall8t home on an APFS volume",
+        let err = io::Error::last_os_error();
+        // EXDEV (cross-device) and ENOTSUP are `clonefile`'s actual
+        // "src/dst aren't on the same APFS volume" signature. Anything else
+        // (ENOENT from a missing parent dir, EACCES, ...) is a real bug and
+        // must not be misreported as an environment/filesystem problem —
+        // that's exactly what sent a prior ENOENT regression down the
+        // wrong debugging path (see `clone_into`'s regression test).
+        let hint = match err.raw_os_error() {
+            Some(libc::EXDEV) | Some(libc::ENOTSUP) => {
+                " (src/dst must be on the same APFS volume — Phase 1 has no \
+                 cross-volume fallback; that's Phase 3)"
+            }
+            _ => "",
+        };
+        return Err(anyhow!(err).context(format!(
+            "clonefile {} -> {} failed{hint}",
             src.display(),
             dst.display()
         )));
     }
     Ok(())
+}
+
+/// Clones `src` into `<dst_parent>/<name>`, first creating `dst_parent` —
+/// `clone_tree`'s destination leaf must not exist, but its parent must. The
+/// only entry point that should call `clone_tree`: both `fork_instance_at`
+/// and `begin_revision_snapshot` clone into a freshly-named `.partial`
+/// directory, and this is where that shared "parent must exist, leaf must
+/// not" invariant is enforced once instead of at each call site by hand —
+/// a prior version left it out of `begin_revision_snapshot` alone, which
+/// only broke on the real macOS `clonefile` syscall (the non-macOS
+/// `copy_tree` fallback tolerates a missing parent, so it never caught it).
+fn clone_into(dst_parent: &Path, name: &str, src: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst_parent)?;
+    clone_tree(src, &dst_parent.join(name))
 }
 
 /// Non-macOS builds have no `clonefile`; fall back to a plain recursive
@@ -653,14 +681,9 @@ fn begin_revision_snapshot(root: &Path) -> Result<PathBuf> {
         std::process::id(),
         next_seq()
     ));
-    // `clone_tree`'s destination leaf must not exist, but its parent must —
-    // create `partial` itself (the fresh pid+seq name guarantees `snapshot`
-    // beneath it doesn't exist yet), mirroring `fork_instance`'s
-    // partial/root split.
-    std::fs::create_dir_all(&partial)?;
     let base = base_dir(root);
     if base.exists() {
-        clone_tree(&base, &partial.join("snapshot"))?;
+        clone_into(&partial, "snapshot", &base)?;
     } else {
         // No base yet (nothing has ever been forked) — the pre-mutation
         // state is legitimately empty.

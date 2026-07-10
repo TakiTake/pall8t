@@ -1,8 +1,11 @@
 use super::*;
 
 /// A throwaway `~/.pall8t`-shaped root under the system temp dir, removed on
-/// drop. Tests here run on Linux (CI/dev container) where `clone_tree` is the
-/// recursive-copy fallback, so the full fork/harvest/promote flow is real.
+/// drop. Under CI/the dev container (Linux) `clone_tree` runs the
+/// recursive-copy fallback; on a bare macOS host it runs the real
+/// `clonefile(2)` syscall — the two have different tolerance for a missing
+/// destination parent dir (see `clone_into`'s regression test below), so
+/// don't assume this suite's coverage of `clone_tree` is OS-independent.
 struct TempRoot(PathBuf);
 
 impl TempRoot {
@@ -954,18 +957,29 @@ fn backdate_changeset(root: &TempRoot, run: &str, days_ago: u64) {
     std::fs::write(&path, toml::to_string_pretty(&m).unwrap()).unwrap();
 }
 
-/// Sets a path's mtime `secs_ago` seconds in the past via `touch -d @<epoch>`
-/// (GNU coreutils, available in this Linux test environment) — avoids
-/// pulling in a `filetime` dependency just for one test's staleness check.
+/// Sets a path's mtime `secs_ago` seconds in the past via `utimes(2)` (`libc`
+/// is already a dependency, so this avoids both a `filetime` dependency and
+/// shelling out to `touch -d @<epoch>`, which is a GNU coreutils-ism that
+/// doesn't exist on macOS's BSD `touch`.
 fn set_mtime_seconds_ago(path: &Path, secs_ago: u64) {
-    let epoch = now_secs().saturating_sub(secs_ago);
-    let status = std::process::Command::new("touch")
-        .arg("-d")
-        .arg(format!("@{epoch}"))
-        .arg(path)
-        .status()
-        .unwrap();
-    assert!(status.success(), "touch -d failed");
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let epoch = now_secs().saturating_sub(secs_ago) as libc::time_t;
+    let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let times = [
+        libc::timeval {
+            tv_sec: epoch,
+            tv_usec: 0,
+        },
+        libc::timeval {
+            tv_sec: epoch,
+            tv_usec: 0,
+        },
+    ];
+    // SAFETY: `path_c` is a valid NUL-terminated C string live for the call;
+    // `times` is a valid 2-element array as `utimes(2)` requires.
+    let rc = unsafe { libc::utimes(path_c.as_ptr(), times.as_ptr()) };
+    assert_eq!(rc, 0, "utimes failed: {}", std::io::Error::last_os_error());
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,6 +1030,30 @@ fn revision_snapshot_is_the_pre_mutation_base() {
         std::fs::read_to_string(snap).unwrap(),
         r#"{"token":"v1"}"#,
         "the snapshot captures the base as it was BEFORE the mutation"
+    );
+}
+
+/// Regression test for a real `clonefile(2)` ENOENT that `copy_tree` (the
+/// non-macOS fallback) can't reproduce: `clone_into` must create its
+/// `dst_parent` before cloning `name` beneath it, because `clonefile`
+/// requires the destination's parent to exist even though the destination
+/// leaf itself must not. `copy_tree` tolerates a missing parent (its
+/// directory branch just `create_dir_all`s the destination), so this
+/// assertion only means anything gated to macOS — that mismatch is exactly
+/// why the bug shipped without a single test catching it.
+#[cfg(target_os = "macos")]
+#[test]
+fn clone_into_creates_a_fresh_parent_dir_before_cloning() {
+    let root = TempRoot::new("clone-into-fresh-parent");
+    root.write_base("CLAUDE.md", "base\n");
+    // The exact shape that triggered the bug: nothing has ever recorded a
+    // revision before, so `revisions/` itself doesn't exist yet either.
+    assert!(!revisions_root(root.path()).exists());
+    let partial =
+        begin_revision_snapshot(root.path()).expect("clone into a never-before-seen .partial dir");
+    assert_eq!(
+        std::fs::read_to_string(partial.join("snapshot/CLAUDE.md")).unwrap(),
+        "base\n"
     );
 }
 
