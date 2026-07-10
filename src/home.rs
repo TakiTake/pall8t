@@ -123,101 +123,32 @@ pub enum Change {
 // Policy
 // ---------------------------------------------------------------------------
 
-/// Built-in classification, applied after any user `[[home.policy]]`
-/// overrides. Order matters — first match wins — so the specific secret
-/// (`.claude/.credentials.json`) precedes any broader rule. Anything
-/// unmatched is treated as unclassified/staged by [`classify`].
-pub const DEFAULT_RULES: &[(&str, Class)] = &[
-    // Secrets — credentials that must reach later runs but never a diff.
-    // Kept deliberately broad: an unmatched credential would fall through to
-    // staged-knowledge (host-side, not a leak to agents, but no
-    // auto-propagation and cleartext in the inbox), so cover the common ones.
-    // Users add more via `[[home.policy]]`.
-    (".claude/.credentials.json", Class::Secret),
-    (".config/gh/hosts.yml", Class::Secret),
-    (".config/gh/**", Class::Secret),
-    (".gh-token", Class::Secret),
-    (".netrc", Class::Secret),
-    (".ssh/**", Class::Secret),
-    (".git-credentials", Class::Secret),
-    (".aws/credentials", Class::Secret),
-    (".config/gcloud/**", Class::Secret),
-    (".docker/config.json", Class::Secret),
-    (".npmrc", Class::Secret),
-    // Durable structured state — mechanically key-path merged.
-    (".claude.json", Class::State),
-    // Append-only JSONL prompt history: state, but line-union merged (see
-    // `default_strategy`) since parallel runs only ever append — concatenation
-    // is always valid, so it must never surface a conflict.
-    (".claude/history.jsonl", Class::State),
-    // Persistent agent memory lives UNDER the per-project dir
-    // (`.claude/projects/<slug>/memory/`), so it must be reclassified as
-    // knowledge BEFORE the broad `.claude/projects/**` ephemeral rule below —
-    // otherwise first-match-wins would discard it (the spec lists memory as
-    // knowledge).
-    (".claude/projects/*/memory/**", Class::Knowledge),
-    // Ephemeral — runtime scratch, never worth harvesting.
-    (".cache/**", Class::Ephemeral),
-    (".npm/**", Class::Ephemeral),
-    (".bash_history", Class::Ephemeral),
-    (".zsh_history", Class::Ephemeral),
-    (".claude/projects/**", Class::Ephemeral),
-    (".claude/todos/**", Class::Ephemeral),
-    (".claude/statsig/**", Class::Ephemeral),
-    (".claude/shell-snapshots/**", Class::Ephemeral),
-    // Claude Code's automatic `.claude.json` backups and auto-updater
-    // bookkeeping: pure churn, staging them would nag on every harvest.
-    (".claude/backups/**", Class::Ephemeral),
-    (".claude/.last-update-result.json", Class::Ephemeral),
-    // Plugin/marketplace SELECTION: durable JSON that Claude Code restamps
-    // with `lastUpdated` every session — as knowledge it would nag the inbox
-    // on every harvest, as state an install made inside a run propagates to
-    // the base mechanically.
-    (".claude/plugins/installed_plugins.json", Class::State),
-    (".claude/plugins/known_marketplaces.json", Class::State),
-    // The rest of `.claude/plugins/` is re-fetchable from the marketplace
-    // (installed payload under `cache/`, marketplace clones, the plugin
-    // catalog) or per-session bookkeeping. All six rules here must precede
-    // the broad `.claude/plugins/**` knowledge rule below (first match
-    // wins), which stays as the conservative catch-all for plugin paths we
-    // haven't seen.
-    (".claude/plugins/cache/**", Class::Ephemeral),
-    (".claude/plugins/marketplaces/**", Class::Ephemeral),
-    (
-        ".claude/plugins/plugin-catalog-cache.json",
-        Class::Ephemeral,
-    ),
-    (".claude/plugins/.last_inuse_sweep", Class::Ephemeral),
-    // Knowledge — the point of the exercise: staged, promoted on demand. These
-    // precede the broad `**/*.lock` below so a `.lock` file a skill
-    // legitimately ships is not silently discarded (first match wins).
-    (".claude/skills/**", Class::Knowledge),
-    (".claude/agents/**", Class::Knowledge),
-    (".claude/commands/**", Class::Knowledge),
-    (".claude/plugins/**", Class::Knowledge),
-    (".claude/memory/**", Class::Knowledge),
-    (".claude/CLAUDE.md", Class::Knowledge),
-    (".claude/settings.json", Class::Knowledge),
-    ("CLAUDE.md", Class::Knowledge),
-    // Generic lock files, last so specific knowledge rules win.
-    ("**/*.lock", Class::Ephemeral),
-];
-
-/// The default merge strategy for a built-in rule, keyed by its exact
-/// [`DEFAULT_RULES`] glob so the strategy travels with the rule that matched.
-/// Everything inherits its class default except append-only history.
-fn default_strategy(glob: &str) -> MergeStrategy {
-    match glob {
-        ".claude/history.jsonl" => MergeStrategy::Union,
-        _ => MergeStrategy::Inherit,
+/// Built-in classification for Claude Code homes, embedded at compile time
+/// from `policies/claude.toml` so the rule set is reviewed and edited as
+/// data, not Rust code. The file uses the same rule format as a project's
+/// `[[home.policy]]` and documents its own ordering constraints (first
+/// match wins). Parsed once, on first use; the unit tests reject an
+/// embedded file that fails to parse or bends the rules the comments in it
+/// promise (see `tests::embedded_claude_policy_is_well_formed`).
+pub fn default_rules() -> &'static [PolicyRule] {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PolicyFile {
+        rules: Vec<PolicyRule>,
     }
+    static RULES: std::sync::LazyLock<Vec<PolicyRule>> = std::sync::LazyLock::new(|| {
+        let file: PolicyFile = toml::from_str(include_str!("../policies/claude.toml"))
+            .expect("embedded policies/claude.toml must parse (pinned by unit test)");
+        file.rules
+    });
+    &RULES
 }
 
 /// Classifies a `$HOME`-relative path. User `overrides` are tried first, then
-/// [`DEFAULT_RULES`]; first glob match wins. No match ⇒ unclassified, which is
-/// staged like `knowledge` but reported.
+/// the built-in [`default_rules`]; first glob match wins. No match ⇒
+/// unclassified, which is staged like `knowledge` but reported.
 pub fn classify(rel: &str, overrides: &[PolicyRule]) -> Classified {
-    for rule in overrides {
+    for rule in overrides.iter().chain(default_rules()) {
         if !glob_match(&rule.glob, rel) {
             continue;
         }
@@ -242,15 +173,6 @@ pub fn classify(rel: &str, overrides: &[PolicyRule]) -> Classified {
             strategy,
             explicit: true,
         };
-    }
-    for (glob, class) in DEFAULT_RULES {
-        if glob_match(glob, rel) {
-            return Classified {
-                class: *class,
-                strategy: default_strategy(glob),
-                explicit: true,
-            };
-        }
     }
     Classified {
         class: Class::Knowledge,

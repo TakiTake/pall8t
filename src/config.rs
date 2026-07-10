@@ -38,7 +38,7 @@ pub struct RepoEntry {
 
 /// Merged `[home]` configuration. `mode` picks today's shared home or the
 /// per-run fork-and-harvest model; `policy` prepends user overrides to the
-/// built-in path classification ([`crate::home::DEFAULT_RULES`]).
+/// built-in path classification ([`crate::home::default_rules`]).
 /// `revisions_keep`/`inbox_ttl_days` bound `isolated` mode's disk usage and
 /// staleness warnings (FR-7/FR-9); both are inert in `shared` mode.
 #[derive(Debug, Clone, PartialEq)]

@@ -106,6 +106,38 @@ fn default_classification() {
 }
 
 #[test]
+fn embedded_claude_policy_is_well_formed() {
+    // `default_rules()` panics on a file that doesn't parse, so calling it
+    // is itself the parse check; the classify-behavior tests around this
+    // one pin the ordering. Beyond that, hold the built-ins to a stricter
+    // standard than user rules: every rule carries an explicit class (the
+    // strategy-only → state fallback is a user-rule convenience, not
+    // something the shipped policy may lean on), and nothing trips the
+    // lints users get warned about.
+    let rules = default_rules();
+    assert!(!rules.is_empty());
+    for r in rules {
+        assert!(
+            r.class.is_some(),
+            "built-in rule {} must set a class",
+            r.glob
+        );
+        // Union merging is line-oriented; on a structured-JSON file it
+        // would interleave both sides into invalid JSON, and neither the
+        // parse nor validate_policy would object. Built-ins may only union
+        // append-only line formats.
+        if r.strategy == Some(MergeStrategy::Union) {
+            assert!(
+                r.glob.ends_with(".jsonl"),
+                "built-in union rule {} must target a line-oriented file",
+                r.glob
+            );
+        }
+    }
+    assert_eq!(validate_policy(rules), Vec::<String>::new());
+}
+
+#[test]
 fn claude_code_maintenance_churn_is_ephemeral() {
     // Session-churn paths (all observed live while dogfooding) must not be
     // staged; the selection files stay state; unrecognized plugin paths
