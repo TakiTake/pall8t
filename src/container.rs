@@ -439,6 +439,12 @@ pub struct RunSpec {
     /// terminal: apple/container 1.0.0 fails outright when `-t` is
     /// requested without one, which would break scripted callers.
     pub tty: bool,
+    /// Host `$TERM`, propagated as `-e TERM=…` alongside `-t`. apple/container
+    /// does not inherit the host environment, so without this the shell
+    /// inside the container sees no `TERM` and readline/Claude Code can't
+    /// interpret arrow-key or Tab escape sequences (issue #20). Only takes
+    /// effect when `tty` is true; pass `None` when it isn't.
+    pub term: Option<String>,
     pub command: Vec<String>,
 }
 
@@ -449,6 +455,10 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
     let mut argv: Vec<String> = vec!["run".into(), "-i".into()];
     if spec.tty {
         argv.push("-t".into());
+        if let Some(term) = &spec.term {
+            argv.push("-e".into());
+            argv.push(format!("TERM={term}"));
+        }
     }
     argv.extend(["--rm".into(), "--name".into(), spec.name.clone()]);
     for m in &spec.mounts {
@@ -475,14 +485,25 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
 }
 
 /// argv (after `container`) for `pall8t exec`: a command inside a running
-/// container (all pall8t containers have the `dev` user). `tty` follows
-/// the same rule as [`RunSpec::tty`]. `workdir` — the directory the
-/// container was created with (see [`workdir`]) — anchors the command to
-/// the workspace instead of the image WORKDIR; omitted when unknown.
-pub fn exec_argv(name: &str, cmd: &[String], tty: bool, workdir: Option<&str>) -> Vec<String> {
+/// container (all pall8t containers have the `dev` user). `tty` and `term`
+/// follow the same rules as [`RunSpec::tty`] and [`RunSpec::term`].
+/// `workdir` — the directory the container was created with (see
+/// [`workdir`]) — anchors the command to the workspace instead of the
+/// image WORKDIR; omitted when unknown.
+pub fn exec_argv(
+    name: &str,
+    cmd: &[String],
+    tty: bool,
+    term: Option<&str>,
+    workdir: Option<&str>,
+) -> Vec<String> {
     let mut argv: Vec<String> = vec!["exec".into(), "-i".into()];
     if tty {
         argv.push("-t".into());
+        if let Some(term) = term {
+            argv.push("-e".into());
+            argv.push(format!("TERM={term}"));
+        }
     }
     if let Some(w) = workdir {
         argv.extend(["-w".into(), w.to_string()]);
@@ -768,9 +789,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_argv_shape() {
-        let spec = RunSpec {
+    /// A representative [`RunSpec`] for the argv-shape tests below. Neither
+    /// `RunSpec` nor `Mount` derives `Clone` (no production caller needs
+    /// to), so each test variant calls this afresh rather than cloning one.
+    fn base_run_spec() -> RunSpec {
+        RunSpec {
             name: "pall8t-x-abc12345-99".into(),
             image: "pall8t-x:501-20-abc123456789".into(),
             workdir: PathBuf::from("/Users/me/src/x"),
@@ -786,12 +809,24 @@ mod tests {
             uid: 501,
             gid: 20,
             tty: true,
+            term: Some("xterm-256color".into()),
             command: vec!["claude".into()],
-        };
+        }
+    }
+
+    #[test]
+    fn run_argv_shape() {
+        let spec = base_run_spec();
         let argv = run_argv(&spec);
         assert_eq!(argv[0], "run");
         assert!(argv.contains(&"-i".to_string()));
         assert!(argv.contains(&"-t".to_string()), "tty: true requests -t");
+        let e = argv.iter().position(|a| a == "-e").unwrap();
+        assert_eq!(
+            argv[e + 1],
+            "TERM=xterm-256color",
+            "tty + term propagates TERM (issue #20)"
+        );
         assert!(argv.contains(&"--rm".to_string()));
         assert!(argv.contains(&"/Users/me/src/x:/Users/me/src/x".to_string()));
         assert!(argv.contains(&"/Users/me/.pall8t/home:/home/dev".to_string()));
@@ -806,10 +841,26 @@ mod tests {
             .unwrap();
         assert_eq!(image_pos, argv.len() - 2);
 
-        let scripted = run_argv(&RunSpec { tty: false, ..spec });
+        let no_term = run_argv(&RunSpec {
+            term: None,
+            ..base_run_spec()
+        });
+        assert!(
+            !no_term.contains(&"-e".to_string()),
+            "no -e when the host has no TERM"
+        );
+
+        let scripted = run_argv(&RunSpec {
+            tty: false,
+            ..base_run_spec()
+        });
         assert!(
             !scripted.contains(&"-t".to_string()),
             "no -t without a terminal — apple/container 1.0.0 fails on -t sans TTY"
+        );
+        assert!(
+            !scripted.contains(&"-e".to_string()),
+            "no TERM propagation without a TTY, even if term is Some"
         );
         assert!(scripted.contains(&"-i".to_string()));
     }
@@ -818,10 +869,22 @@ mod tests {
     fn exec_argv_shape() {
         let cmd = vec!["git".to_string(), "status".to_string()];
 
-        let tty = exec_argv("pall8t-x-abc12345-99", &cmd, true, Some("/Users/me/src/x"));
+        let tty = exec_argv(
+            "pall8t-x-abc12345-99",
+            &cmd,
+            true,
+            Some("xterm-256color"),
+            Some("/Users/me/src/x"),
+        );
         assert_eq!(tty[0], "exec");
         assert!(tty.contains(&"-i".to_string()));
         assert!(tty.contains(&"-t".to_string()));
+        let e = tty.iter().position(|a| a == "-e").unwrap();
+        assert_eq!(
+            tty[e + 1],
+            "TERM=xterm-256color",
+            "tty + term propagates TERM (issue #20)"
+        );
         let w = tty.iter().position(|a| a == "-w").unwrap();
         assert_eq!(tty[w + 1], "/Users/me/src/x");
         assert_eq!(tty.last(), Some(&"status".to_string()));
@@ -833,10 +896,26 @@ mod tests {
             "the command follows the container name"
         );
 
-        let scripted = exec_argv("pall8t-x-abc12345-99", &cmd, false, None);
+        let tty_no_term = exec_argv("pall8t-x-abc12345-99", &cmd, true, None, None);
+        assert!(
+            !tty_no_term.contains(&"-e".to_string()),
+            "no -e when the host has no TERM"
+        );
+
+        let scripted = exec_argv(
+            "pall8t-x-abc12345-99",
+            &cmd,
+            false,
+            Some("xterm-256color"),
+            None,
+        );
         assert!(
             !scripted.contains(&"-t".to_string()),
             "no -t without a terminal"
+        );
+        assert!(
+            !scripted.contains(&"-e".to_string()),
+            "no TERM propagation without a TTY, even if term is Some"
         );
         assert!(
             !scripted.contains(&"-w".to_string()),

@@ -3,9 +3,15 @@ FROM ubuntu:24.04
 ARG UID=501
 ARG GID=501
 
-# node + claude CLI + gh + common tools; dev user with host UID/GID
+# node + claude CLI + gh + common tools; dev user with host UID/GID.
+# ncurses-term: apple/container doesn't inherit the host environment, so
+# pall8t propagates the host's $TERM verbatim (see term_for_tty in main.rs,
+# issue #20) — ncurses-base alone only knows a handful of entries (xterm,
+# xterm-256color, vt100, screen, …), so terminfo-strict tools would fail to
+# resolve less-common host terminals (e.g. kitty, ghostty) without it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git sudo ripgrep less vim openssh-client tmux && \
+      ca-certificates curl git sudo ripgrep less vim openssh-client tmux \
+      ncurses-term && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

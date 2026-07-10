@@ -189,6 +189,28 @@ fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// Host `$TERM` to propagate into the container, gated on `tty`: apple/
+/// container does not inherit the host environment, so without this the
+/// shell inside the container has no `TERM` and readline/Claude Code can't
+/// interpret arrow-key or Tab escape sequences (issue #20). `None` when
+/// there's no TTY to attach it to, or when the host itself has no usable
+/// `TERM`.
+fn term_for_tty(tty: bool) -> Option<String> {
+    if tty {
+        normalize_term(std::env::var("TERM").ok())
+    } else {
+        None
+    }
+}
+
+/// `TERM` set-but-empty (`std::env::var` returns `Ok("")`, not `Err`) is
+/// equivalent to unset — without this, an empty `$TERM` would propagate as
+/// a literal `-e TERM=`, contradicting `term_for_tty`'s "no usable TERM"
+/// contract.
+fn normalize_term(term: Option<String>) -> Option<String> {
+    term.filter(|t| !t.is_empty())
+}
+
 /// Shared `run`/`build` preamble: container system up, canonical cwd,
 /// merged config, host ids, image resolved (and built if missing/forced).
 fn workspace_image(
@@ -263,6 +285,7 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
     } else {
         cli_command
     };
+    let tty = stdin_is_tty();
     let spec = container::RunSpec {
         name: run_name,
         image: resolved.tag,
@@ -272,7 +295,8 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
         memory: cfg.memory,
         uid,
         gid,
-        tty: stdin_is_tty(),
+        tty,
+        term: term_for_tty(tty),
         command,
     };
     exec_container(container::run_argv(&spec))
@@ -311,10 +335,12 @@ fn cmd_exec(id: &str, command: Vec<String>) -> Result<()> {
     // The container's own initial workdir (the workspace) — best-effort;
     // without it the command runs in the image WORKDIR.
     let workdir = container::workdir(id);
+    let tty = stdin_is_tty();
     exec_container(container::exec_argv(
         id,
         &command,
-        stdin_is_tty(),
+        tty,
+        term_for_tty(tty).as_deref(),
         workdir.as_deref(),
     ))
 }
@@ -637,5 +663,26 @@ mod tests {
 
         let generic = anyhow!("some other failure");
         assert!(generic.downcast_ref::<ConflictError>().is_none());
+    }
+
+    #[test]
+    fn normalize_term_table() {
+        assert_eq!(
+            normalize_term(Some("xterm-256color".into())),
+            Some("xterm-256color".into())
+        );
+        assert_eq!(
+            normalize_term(Some(String::new())),
+            None,
+            "set-but-empty TERM is equivalent to unset"
+        );
+        assert_eq!(normalize_term(None), None);
+    }
+
+    #[test]
+    fn term_for_tty_without_a_tty_is_always_none() {
+        // Deliberately doesn't touch $TERM: without a TTY, term_for_tty must
+        // short-circuit to None before ever reading the environment.
+        assert_eq!(term_for_tty(false), None);
     }
 }
