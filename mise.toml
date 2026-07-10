@@ -18,5 +18,9 @@ description = "Install pall8t to ~/.cargo/bin"
 run = "cargo install --path ."
 
 [tasks.lint]
-description = "Clippy + rustfmt check"
-run = ["cargo clippy -- -D warnings", "cargo fmt --check"]
+description = "rustfmt + clippy (-D warnings) across every supported target"
+run = "./scripts/lint.sh"
+
+[tasks.setup-hooks]
+description = "Enable the repo's git hooks (pre-commit lint gate)"
+run = "git config core.hooksPath .githooks"
