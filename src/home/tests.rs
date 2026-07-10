@@ -106,6 +106,38 @@ fn default_classification() {
 }
 
 #[test]
+fn claude_code_maintenance_churn_is_ephemeral() {
+    // Session-churn paths (all observed live while dogfooding) must not be
+    // staged; the selection files stay state; unrecognized plugin paths
+    // still fall to the conservative `.claude/plugins/**` catch-all.
+    for (path, want) in [
+        (
+            ".claude/backups/.claude.json.backup.1783525774217",
+            Class::Ephemeral,
+        ),
+        (".claude/.last-update-result.json", Class::Ephemeral),
+        (
+            ".claude/plugins/cache/official/some-plugin/.in_use/1",
+            Class::Ephemeral,
+        ),
+        (
+            ".claude/plugins/marketplaces/official/README.md",
+            Class::Ephemeral,
+        ),
+        (
+            ".claude/plugins/plugin-catalog-cache.json",
+            Class::Ephemeral,
+        ),
+        (".claude/plugins/.last_inuse_sweep", Class::Ephemeral),
+        (".claude/plugins/installed_plugins.json", Class::State),
+        (".claude/plugins/known_marketplaces.json", Class::State),
+        (".claude/plugins/some-future-file.json", Class::Knowledge),
+    ] {
+        assert_eq!(classify(path, &[]).class, want, "{path}");
+    }
+}
+
+#[test]
 fn per_project_memory_is_knowledge_not_ephemeral() {
     // Claude Code's persistent memory lives under the per-project dir; it must
     // beat the broad `.claude/projects/**` ephemeral rule (first match wins),

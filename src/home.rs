@@ -165,6 +165,29 @@ pub const DEFAULT_RULES: &[(&str, Class)] = &[
     (".claude/todos/**", Class::Ephemeral),
     (".claude/statsig/**", Class::Ephemeral),
     (".claude/shell-snapshots/**", Class::Ephemeral),
+    // Claude Code's automatic `.claude.json` backups and auto-updater
+    // bookkeeping: pure churn, staging them would nag on every harvest.
+    (".claude/backups/**", Class::Ephemeral),
+    (".claude/.last-update-result.json", Class::Ephemeral),
+    // Plugin/marketplace SELECTION: durable JSON that Claude Code restamps
+    // with `lastUpdated` every session — as knowledge it would nag the inbox
+    // on every harvest, as state an install made inside a run propagates to
+    // the base mechanically.
+    (".claude/plugins/installed_plugins.json", Class::State),
+    (".claude/plugins/known_marketplaces.json", Class::State),
+    // The rest of `.claude/plugins/` is re-fetchable from the marketplace
+    // (installed payload under `cache/`, marketplace clones, the plugin
+    // catalog) or per-session bookkeeping. All six rules here must precede
+    // the broad `.claude/plugins/**` knowledge rule below (first match
+    // wins), which stays as the conservative catch-all for plugin paths we
+    // haven't seen.
+    (".claude/plugins/cache/**", Class::Ephemeral),
+    (".claude/plugins/marketplaces/**", Class::Ephemeral),
+    (
+        ".claude/plugins/plugin-catalog-cache.json",
+        Class::Ephemeral,
+    ),
+    (".claude/plugins/.last_inuse_sweep", Class::Ephemeral),
     // Knowledge — the point of the exercise: staged, promoted on demand. These
     // precede the broad `**/*.lock` below so a `.lock` file a skill
     // legitimately ships is not silently discarded (first match wins).
