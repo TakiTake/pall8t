@@ -1,0 +1,99 @@
+# Built-in path classification for Claude Code agent homes.
+#
+# Embedded into the pall8t binary at compile time (`include_str!`) and
+# evaluated AFTER a project's `[[home.policy]]` overrides — same rule format:
+# `glob` (matched against a `$HOME`-relative path), `class`
+# (secret | state | knowledge | ephemeral), optional `strategy` (union).
+#
+# ORDER MATTERS: first matching rule wins, top to bottom. A path no rule
+# matches is staged like knowledge but flagged unclassified.
+#
+# Applied unconditionally to every run — per-agent policy selection (a
+# hypothetical codex.toml) is deliberate future work, which is why generic
+# home hygiene (.ssh, .netrc, shell history, .cache) lives here too rather
+# than in a common file.
+#
+# EDITING SECRET RULES: revision redaction falls back to the CURRENT
+# binary's built-in secret rules for paths a project's recorded overrides
+# don't cover — narrowing or dropping a secret glob here retroactively
+# un-redacts matching content in already-recorded revisions shown by
+# `pall8t home diff`.
+
+rules = [
+    # Secrets — credentials that must reach later runs but never a diff.
+    # Kept deliberately broad: an unmatched credential would fall through to
+    # staged-knowledge (host-side, not a leak to agents, but no
+    # auto-propagation and cleartext in the inbox), so cover the common ones.
+    # Users add more via `[[home.policy]]`.
+    { glob = ".claude/.credentials.json", class = "secret" },
+    # Covers hosts.yml, gh's actual credential store.
+    { glob = ".config/gh/**", class = "secret" },
+    { glob = ".gh-token", class = "secret" },
+    { glob = ".netrc", class = "secret" },
+    { glob = ".ssh/**", class = "secret" },
+    { glob = ".git-credentials", class = "secret" },
+    { glob = ".aws/credentials", class = "secret" },
+    { glob = ".config/gcloud/**", class = "secret" },
+    { glob = ".docker/config.json", class = "secret" },
+    { glob = ".npmrc", class = "secret" },
+
+    # Durable structured state — mechanically key-path merged.
+    { glob = ".claude.json", class = "state" },
+    # Append-only JSONL prompt history: state, but line-union merged since
+    # parallel runs only ever append — concatenation is always valid, so it
+    # must never surface a conflict.
+    { glob = ".claude/history.jsonl", class = "state", strategy = "union" },
+
+    # Persistent agent memory lives UNDER the per-project dir
+    # (`.claude/projects/<slug>/memory/`), so it must be reclassified as
+    # knowledge BEFORE the broad `.claude/projects/**` ephemeral rule below —
+    # otherwise first-match-wins would discard it (the spec lists memory as
+    # knowledge).
+    { glob = ".claude/projects/*/memory/**", class = "knowledge" },
+
+    # Ephemeral — runtime scratch, never worth harvesting.
+    { glob = ".cache/**", class = "ephemeral" },
+    { glob = ".npm/**", class = "ephemeral" },
+    { glob = ".bash_history", class = "ephemeral" },
+    { glob = ".zsh_history", class = "ephemeral" },
+    { glob = ".claude/projects/**", class = "ephemeral" },
+    { glob = ".claude/todos/**", class = "ephemeral" },
+    { glob = ".claude/statsig/**", class = "ephemeral" },
+    { glob = ".claude/shell-snapshots/**", class = "ephemeral" },
+    # Claude Code's automatic `.claude.json` backups and auto-updater
+    # bookkeeping: pure churn, staging them would nag on every harvest.
+    { glob = ".claude/backups/**", class = "ephemeral" },
+    { glob = ".claude/.last-update-result.json", class = "ephemeral" },
+
+    # Plugin/marketplace SELECTION: durable JSON that Claude Code restamps
+    # with `lastUpdated` every session — as knowledge it would nag the inbox
+    # on every harvest, as state an install made inside a run propagates to
+    # the base mechanically.
+    { glob = ".claude/plugins/installed_plugins.json", class = "state" },
+    { glob = ".claude/plugins/known_marketplaces.json", class = "state" },
+    # The rest of `.claude/plugins/` is re-fetchable from the marketplace
+    # (installed payload under `cache/`, marketplace clones, the plugin
+    # catalog) or per-session bookkeeping. All six rules here must precede
+    # the broad `.claude/plugins/**` knowledge rule below (first match
+    # wins), which stays as the conservative catch-all for plugin paths we
+    # haven't seen.
+    { glob = ".claude/plugins/cache/**", class = "ephemeral" },
+    { glob = ".claude/plugins/marketplaces/**", class = "ephemeral" },
+    { glob = ".claude/plugins/plugin-catalog-cache.json", class = "ephemeral" },
+    { glob = ".claude/plugins/.last_inuse_sweep", class = "ephemeral" },
+
+    # Knowledge — the point of the exercise: staged, promoted on demand. These
+    # precede the broad `**/*.lock` below so a `.lock` file a skill
+    # legitimately ships is not silently discarded (first match wins).
+    { glob = ".claude/skills/**", class = "knowledge" },
+    { glob = ".claude/agents/**", class = "knowledge" },
+    { glob = ".claude/commands/**", class = "knowledge" },
+    { glob = ".claude/plugins/**", class = "knowledge" },
+    { glob = ".claude/memory/**", class = "knowledge" },
+    { glob = ".claude/CLAUDE.md", class = "knowledge" },
+    { glob = ".claude/settings.json", class = "knowledge" },
+    { glob = "CLAUDE.md", class = "knowledge" },
+
+    # Generic lock files, last so specific knowledge rules win.
+    { glob = "**/*.lock", class = "ephemeral" },
+]

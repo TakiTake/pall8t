@@ -21,11 +21,22 @@
 //!   manifest.toml           entries: path, class, change
 //!   theirs/<rel>            the run's version of each staged (knowledge) path
 //!   ancestor/<rel>          the fork-point version of each staged path
+//! revisions/<seq>/          one base mutation (FR-7), seq zero-padded, oldest first
+//!   snapshot/               the base as it was BEFORE this mutation
+//!   meta.toml               seq, op (harvest|promote|rollback), run(s), paths, time
 //! ```
 //!
 //! Secrets and durable state never enter the inbox: they are written back
 //! to the base at harvest (latest-wins / key-path merge). Only `knowledge`
 //! and unclassified paths are staged for explicit promotion (FR-2 table).
+//!
+//! No revision holds secret content by omission, not filtering: a
+//! revision's `snapshot/` is a full `clone_tree` of the base, which DOES
+//! include secret files (they live in the base like everything else) — but
+//! [`diff`] never renders their bytes, only a redaction marker, and nothing
+//! in this module ships a snapshot anywhere off-host. This mirrors the
+//! spec's stance that secrets are host-side-only, never leaked to an agent
+//! or a diff/log, rather than excluded from the base itself.
 
 use crate::config::PolicyRule;
 use anyhow::{anyhow, Context, Result};
@@ -112,78 +123,32 @@ pub enum Change {
 // Policy
 // ---------------------------------------------------------------------------
 
-/// Built-in classification, applied after any user `[[home.policy]]`
-/// overrides. Order matters — first match wins — so the specific secret
-/// (`.claude/.credentials.json`) precedes any broader rule. Anything
-/// unmatched is treated as unclassified/staged by [`classify`].
-pub const DEFAULT_RULES: &[(&str, Class)] = &[
-    // Secrets — credentials that must reach later runs but never a diff.
-    // Kept deliberately broad: an unmatched credential would fall through to
-    // staged-knowledge (host-side, not a leak to agents, but no
-    // auto-propagation and cleartext in the inbox), so cover the common ones.
-    // Users add more via `[[home.policy]]`.
-    (".claude/.credentials.json", Class::Secret),
-    (".config/gh/hosts.yml", Class::Secret),
-    (".config/gh/**", Class::Secret),
-    (".gh-token", Class::Secret),
-    (".netrc", Class::Secret),
-    (".ssh/**", Class::Secret),
-    (".git-credentials", Class::Secret),
-    (".aws/credentials", Class::Secret),
-    (".config/gcloud/**", Class::Secret),
-    (".docker/config.json", Class::Secret),
-    (".npmrc", Class::Secret),
-    // Durable structured state — mechanically key-path merged.
-    (".claude.json", Class::State),
-    // Append-only JSONL prompt history: state, but line-union merged (see
-    // `default_strategy`) since parallel runs only ever append — concatenation
-    // is always valid, so it must never surface a conflict.
-    (".claude/history.jsonl", Class::State),
-    // Persistent agent memory lives UNDER the per-project dir
-    // (`.claude/projects/<slug>/memory/`), so it must be reclassified as
-    // knowledge BEFORE the broad `.claude/projects/**` ephemeral rule below —
-    // otherwise first-match-wins would discard it (the spec lists memory as
-    // knowledge).
-    (".claude/projects/*/memory/**", Class::Knowledge),
-    // Ephemeral — runtime scratch, never worth harvesting.
-    (".cache/**", Class::Ephemeral),
-    (".npm/**", Class::Ephemeral),
-    (".bash_history", Class::Ephemeral),
-    (".zsh_history", Class::Ephemeral),
-    (".claude/projects/**", Class::Ephemeral),
-    (".claude/todos/**", Class::Ephemeral),
-    (".claude/statsig/**", Class::Ephemeral),
-    (".claude/shell-snapshots/**", Class::Ephemeral),
-    // Knowledge — the point of the exercise: staged, promoted on demand. These
-    // precede the broad `**/*.lock` below so a `.lock` file a skill
-    // legitimately ships is not silently discarded (first match wins).
-    (".claude/skills/**", Class::Knowledge),
-    (".claude/agents/**", Class::Knowledge),
-    (".claude/commands/**", Class::Knowledge),
-    (".claude/plugins/**", Class::Knowledge),
-    (".claude/memory/**", Class::Knowledge),
-    (".claude/CLAUDE.md", Class::Knowledge),
-    (".claude/settings.json", Class::Knowledge),
-    ("CLAUDE.md", Class::Knowledge),
-    // Generic lock files, last so specific knowledge rules win.
-    ("**/*.lock", Class::Ephemeral),
-];
-
-/// The default merge strategy for a built-in rule, keyed by its exact
-/// [`DEFAULT_RULES`] glob so the strategy travels with the rule that matched.
-/// Everything inherits its class default except append-only history.
-fn default_strategy(glob: &str) -> MergeStrategy {
-    match glob {
-        ".claude/history.jsonl" => MergeStrategy::Union,
-        _ => MergeStrategy::Inherit,
+/// Built-in classification for Claude Code homes, embedded at compile time
+/// from `rules/claude.toml` so the rule set is reviewed and edited as
+/// data, not Rust code. The file uses the same rule format as a project's
+/// `[[home.policy]]` and documents its own ordering constraints (first
+/// match wins). Parsed once, on first use; the unit tests reject an
+/// embedded file that fails to parse or bends the rules the comments in it
+/// promise (see `tests::embedded_claude_policy_is_well_formed`).
+pub fn default_rules() -> &'static [PolicyRule] {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PolicyFile {
+        rules: Vec<PolicyRule>,
     }
+    static RULES: std::sync::LazyLock<Vec<PolicyRule>> = std::sync::LazyLock::new(|| {
+        let file: PolicyFile = toml::from_str(include_str!("../rules/claude.toml"))
+            .expect("embedded rules/claude.toml must parse (pinned by unit test)");
+        file.rules
+    });
+    &RULES
 }
 
 /// Classifies a `$HOME`-relative path. User `overrides` are tried first, then
-/// [`DEFAULT_RULES`]; first glob match wins. No match ⇒ unclassified, which is
-/// staged like `knowledge` but reported.
+/// the built-in [`default_rules`]; first glob match wins. No match ⇒
+/// unclassified, which is staged like `knowledge` but reported.
 pub fn classify(rel: &str, overrides: &[PolicyRule]) -> Classified {
-    for rule in overrides {
+    for rule in overrides.iter().chain(default_rules()) {
         if !glob_match(&rule.glob, rel) {
             continue;
         }
@@ -208,15 +173,6 @@ pub fn classify(rel: &str, overrides: &[PolicyRule]) -> Classified {
             strategy,
             explicit: true,
         };
-    }
-    for (glob, class) in DEFAULT_RULES {
-        if glob_match(glob, rel) {
-            return Classified {
-                class: *class,
-                strategy: default_strategy(glob),
-                explicit: true,
-            };
-        }
     }
     Classified {
         class: Class::Knowledge,
@@ -300,6 +256,31 @@ fn inbox_root(root: &Path) -> PathBuf {
     root.join("inbox")
 }
 
+fn revisions_root(root: &Path) -> PathBuf {
+    root.join("revisions")
+}
+
+/// `[home] revisions_keep` default (FR-7): enough history to be useful,
+/// bounded so an isolated-mode project doesn't accumulate snapshots forever.
+pub const DEFAULT_REVISIONS_KEEP: u32 = 20;
+
+/// `[home] inbox_ttl_days` default (FR-9): changesets older than this warn
+/// (never auto-delete — dropping unreviewed knowledge is a user decision).
+pub const DEFAULT_INBOX_TTL_DAYS: u32 = 14;
+
+/// How old an instance's `running` status must be before `ls` flags it as
+/// suspicious (a real run is a foreground `pall8t run` a human is watching;
+/// nothing legitimate stays "running" this long — more likely the forker
+/// pid was recycled by an unrelated process after the real run crashed).
+const SUSPICIOUS_RUNNING_SECS: u64 = 24 * 3_600;
+
+/// How old an instance `.partial` (fork interrupted before publish) must be,
+/// judged by its own mtime, before gc treats it as abandoned rather than a
+/// fork that is merely still in progress. `clone_tree` is O(ms) on APFS and
+/// O(seconds) on the copy fallback even at the spec's 1 GB target, so
+/// anything older than this never legitimately completes.
+const STALE_PARTIAL_SECS: u64 = 3_600;
+
 /// Held for the duration of any base mutation (fork snapshot, harvest
 /// write-back, promote). A blocking `flock(2)` on `home.lock` (a sibling of
 /// the base, not inside it) serializes concurrent harvests/promotes and is
@@ -324,7 +305,85 @@ fn lock_base(root: &Path) -> Result<BaseLock> {
     if rc != 0 {
         return Err(anyhow!(io::Error::last_os_error()).context("cannot acquire base lock"));
     }
+    repair_base_swap(root).context("repairing an interrupted base swap")?;
     Ok(BaseLock { _file: file })
+}
+
+/// Repairs an interrupted [`swap_base`] (rollback's whole-base replace),
+/// which crashes between its two renames as `<base>.partial` (the built
+/// replacement, ready to publish) and `<base>.discard` (the retired old
+/// base). Runs first thing under every base lock acquisition so every
+/// base-touching operation always sees a consistent, present base — the
+/// same "the base is a valid `$HOME` at every instant" invariant fork and
+/// harvest already provide via their own temp+rename discipline.
+fn repair_base_swap(root: &Path) -> Result<()> {
+    let base = base_dir(root);
+    let partial = sibling_suffix(&base, ".partial");
+    let discard = sibling_suffix(&base, ".discard");
+    if base.exists() {
+        // The swap either never ran or completed; a stray partial/discard is
+        // leftover cleanup from a completed swap that was interrupted after
+        // publishing — safe to drop, nothing references it.
+        let _ = std::fs::remove_dir_all(&partial);
+        let _ = std::fs::remove_dir_all(&discard);
+        return Ok(());
+    }
+    if partial.exists() {
+        // Crashed after retiring the old base but before publishing the new
+        // one: finish the publish.
+        std::fs::rename(&partial, &base)
+            .with_context(|| format!("cannot finish publishing base swap at {}", base.display()))?;
+    } else if discard.exists() {
+        // Crashed between the two renames is the only way to reach this
+        // state with no partial; restore the retired base rather than leave
+        // $HOME missing.
+        std::fs::rename(&discard, &base)
+            .with_context(|| format!("cannot restore base from {}", discard.display()))?;
+    }
+    // Neither exists: a fresh root — callers create the base lazily.
+    Ok(())
+}
+
+/// Replaces the base's contents with `new_content` (a revision snapshot),
+/// crash-atomically: build `<base>.partial` as a full clone first, then swap
+/// by two renames (retire the live base to `<base>.discard`, publish the
+/// clone). A crash between the renames leaves the base briefly missing on
+/// disk, which [`repair_base_swap`] — run at the top of every subsequent
+/// `lock_base` — resolves before any other base operation proceeds. Must be
+/// called with the base lock held.
+fn swap_base(root: &Path, new_content: &Path) -> Result<()> {
+    let base = base_dir(root);
+    let partial = sibling_suffix(&base, ".partial");
+    if partial.exists() {
+        std::fs::remove_dir_all(&partial)
+            .with_context(|| format!("cannot clear stale swap partial {}", partial.display()))?;
+    }
+    clone_tree(new_content, &partial)?;
+    let discard = sibling_suffix(&base, ".discard");
+    if discard.exists() {
+        std::fs::remove_dir_all(&discard)
+            .with_context(|| format!("cannot clear stale swap tombstone {}", discard.display()))?;
+    }
+    std::fs::rename(&base, &discard)
+        .with_context(|| format!("cannot retire base {}", base.display()))?;
+    std::fs::rename(&partial, &base)
+        .with_context(|| format!("cannot publish restored base {}", base.display()))?;
+    // The swap itself is done the instant the rename above lands — the base
+    // is already the new content. A failure removing the retired-base
+    // tombstone from here on is NOT a swap failure and must not be reported
+    // as one (a caller like `rollback_at` decides whether to record a
+    // revision based on this `Result`, and the mutation already happened
+    // either way): `repair_base_swap`, run at the top of every future
+    // `lock_base`, sweeps a stray `.discard` opportunistically once the base
+    // exists again, the same best-effort tombstone discipline `harvest`
+    // already uses for its own tombstone.
+    if let Err(e) = std::fs::remove_dir_all(&discard) {
+        eprintln!(
+            "pall8t: warning: could not remove old base tombstone {}: {e}",
+            discard.display()
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -345,18 +404,58 @@ struct InstanceMeta {
     /// `container` CLI call and closing the fork→container-appears window a
     /// container-listing check would leave open.
     forker_pid: u32,
+    /// The `[[home.policy]]` overrides active at fork time. `harvest_instance`
+    /// classifies this instance's changed paths with THIS policy, not the
+    /// invoking cwd's — a run's writes were made under the project it was
+    /// forked from, and harvest is lazy (it can run from a completely
+    /// different project's `pall8t run`/`home harvest`). Without this, a
+    /// project X that declares some path secret via policy would have that
+    /// secret staged into the inbox in cleartext (never written back per
+    /// FR-10) and its harvest revision redacted with the wrong policy the
+    /// moment a project Y lazily harvests X's instance.
+    ///
+    /// `Option`, not a bare `Vec`, to distinguish two cases an empty `Vec`
+    /// would conflate: `None` — an instance forked before this field
+    /// existed, so there is nothing pinned and `harvest_instance` falls
+    /// back to the caller's overrides (today's pre-fix behavior, `#[serde(
+    /// default)]` gives old meta.toml files exactly this). `Some(vec![])`
+    /// — this project genuinely has zero `[[home.policy]]` overrides, and
+    /// THAT is authoritative: harvest must classify with the built-in
+    /// defaults only, not silently fall back to whatever overrides the
+    /// harvesting cwd happens to declare (which could reclassify a path
+    /// this project never touched specially — the same cross-project bug
+    /// in miniature, e.g. the harvesting project marking some glob
+    /// `ephemeral` and silently discarding this run's knowledge under it).
+    #[serde(default)]
+    policy: Option<Vec<PolicyRule>>,
 }
 
 /// Forks the base home for `run_name` and returns the instance root to
 /// mount at `/home/dev`. Public wrapper; resolves the app dir itself so
-/// the binary doesn't need the (crate-internal) root path.
-pub fn fork_instance(run_name: &str, workspace: &Path) -> Result<PathBuf> {
-    fork_instance_at(&crate::config::pall8t_root()?, run_name, workspace)
+/// the binary doesn't need the (crate-internal) root path. `overrides` is
+/// the policy active for the project this run belongs to — pinned into the
+/// instance's metadata so a later, lazy harvest classifies its writes with
+/// THIS policy even if it runs from a different project's cwd.
+pub fn fork_instance(
+    run_name: &str,
+    workspace: &Path,
+    overrides: &[PolicyRule],
+) -> Result<PathBuf> {
+    fork_instance_at(
+        &crate::config::pall8t_root()?,
+        run_name,
+        workspace,
+        overrides,
+    )
 }
 
-fn fork_instance_at(root: &Path, run_name: &str, workspace: &Path) -> Result<PathBuf> {
+fn fork_instance_at(
+    root: &Path,
+    run_name: &str,
+    workspace: &Path,
+    overrides: &[PolicyRule],
+) -> Result<PathBuf> {
     let base = base_dir(root);
-    std::fs::create_dir_all(&base)?;
     let inst = instances_root(root).join(run_name);
     if inst.exists() {
         // A previous fork with this exact name never harvested (same cwd +
@@ -384,20 +483,26 @@ fn fork_instance_at(root: &Path, run_name: &str, workspace: &Path) -> Result<Pat
         std::fs::remove_dir_all(&partial)
             .with_context(|| format!("cannot clear stale partial fork {}", partial.display()))?;
     }
-    std::fs::create_dir_all(&partial)?;
     // Snapshot the quiescent base into the instance and its ancestor under
     // the base lock, then publish atomically by rename: a crash before the
-    // rename leaves only `<run>.partial`, never a half-instance.
+    // rename leaves only `<run>.partial`, never a half-instance. `base`'s
+    // own creation (the very first fork ever) lives in this same locked
+    // section too — every base touch happens under the lock, no exceptions.
     {
         let _lock = lock_base(root)?;
-        clone_tree(&base, &partial.join("root"))?;
-        clone_tree(&base, &partial.join("ancestor"))?;
+        std::fs::create_dir_all(&base)?;
+        clone_into(&partial, "root", &base)?;
+        clone_into(&partial, "ancestor", &base)?;
     }
     let meta = InstanceMeta {
         run: run_name.to_string(),
         workspace: workspace.to_string_lossy().into_owned(),
         created: now_secs(),
         forker_pid: std::process::id(),
+        // `Some`, always — a fresh fork always pins whatever policy was
+        // active, even if it's the empty list (see the field's doc
+        // comment: `None` is reserved for pre-field instances only).
+        policy: Some(overrides.to_vec()),
     };
     std::fs::write(partial.join("meta.toml"), toml::to_string(&meta)?)?;
     std::fs::rename(&partial, &inst)
@@ -406,10 +511,11 @@ fn fork_instance_at(root: &Path, run_name: &str, workspace: &Path) -> Result<Pat
 }
 
 /// Copy-on-write clone of a directory hierarchy from `src` to `dst` (which
-/// must not exist). On macOS this is `clonefile(2)` — O(1) metadata, the
-/// spec's primary fork mechanism, requiring `src`/`dst` on the same APFS
-/// volume. Phase 1 errors clearly if that fails; the non-APFS recursive-copy
-/// fallback is Phase 3.
+/// must not exist, though `dst`'s parent must — see [`clone_into`], the
+/// only sanctioned way to call this). On macOS this is `clonefile(2)` —
+/// O(1) metadata, the spec's primary fork mechanism, requiring `src`/`dst`
+/// on the same APFS volume. Phase 1 errors clearly if that fails; the
+/// non-APFS recursive-copy fallback is Phase 3.
 #[cfg(target_os = "macos")]
 fn clone_tree(src: &Path, dst: &Path) -> Result<()> {
     use std::ffi::CString;
@@ -420,13 +526,41 @@ fn clone_tree(src: &Path, dst: &Path) -> Result<()> {
     // the call; flags 0 is the documented default.
     let rc = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
     if rc != 0 {
-        return Err(anyhow!(io::Error::last_os_error()).context(format!(
-            "clonefile {} -> {} failed — Phase 1 requires the pall8t home on an APFS volume",
+        let err = io::Error::last_os_error();
+        // EXDEV (cross-device) and ENOTSUP are `clonefile`'s actual
+        // "src/dst aren't on the same APFS volume" signature. Anything else
+        // (ENOENT from a missing parent dir, EACCES, ...) is a real bug and
+        // must not be misreported as an environment/filesystem problem —
+        // that's exactly what sent a prior ENOENT regression down the
+        // wrong debugging path (see `clone_into`'s regression test).
+        let hint = match err.raw_os_error() {
+            Some(libc::EXDEV) | Some(libc::ENOTSUP) => {
+                " (src/dst must be on the same APFS volume — Phase 1 has no \
+                 cross-volume fallback; that's Phase 3)"
+            }
+            _ => "",
+        };
+        return Err(anyhow!(err).context(format!(
+            "clonefile {} -> {} failed{hint}",
             src.display(),
             dst.display()
         )));
     }
     Ok(())
+}
+
+/// Clones `src` into `<dst_parent>/<name>`, first creating `dst_parent` —
+/// `clone_tree`'s destination leaf must not exist, but its parent must. The
+/// only entry point that should call `clone_tree`: both `fork_instance_at`
+/// and `begin_revision_snapshot` clone into a freshly-named `.partial`
+/// directory, and this is where that shared "parent must exist, leaf must
+/// not" invariant is enforced once instead of at each call site by hand —
+/// a prior version left it out of `begin_revision_snapshot` alone, which
+/// only broke on the real macOS `clonefile` syscall (the non-macOS
+/// `copy_tree` fallback tolerates a missing parent, so it never caught it).
+fn clone_into(dst_parent: &Path, name: &str, src: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst_parent)?;
+    clone_tree(src, &dst_parent.join(name))
 }
 
 /// Non-macOS builds have no `clonefile`; fall back to a plain recursive
@@ -470,6 +604,552 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Revisions (FR-7): every base mutation is a snapshot + manifest, no VCS
+// ---------------------------------------------------------------------------
+
+/// What kind of base mutation produced a revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RevisionOp {
+    /// Secret/state write-back at harvest (knowledge staging alone — no base
+    /// write — never records a revision).
+    Harvest,
+    /// A promote (direct or via `merge`) that landed at least one path.
+    Promote,
+    /// `pall8t home rollback` itself — recorded so a rollback is undoable.
+    Rollback,
+}
+
+impl std::fmt::Display for RevisionOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RevisionOp::Harvest => "harvest",
+            RevisionOp::Promote => "promote",
+            RevisionOp::Rollback => "rollback",
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RevisionMeta {
+    seq: u64,
+    op: RevisionOp,
+    runs: Vec<String>,
+    paths: Vec<String>,
+    created: u64,
+    /// The `[[home.policy]]` overrides active when this revision was
+    /// recorded, so `diff` can redact a path some project's policy declared
+    /// secret even when read later from a cwd whose policy doesn't (or no
+    /// longer does) — see [`diff_at`]. `#[serde(default)]` so a revision
+    /// recorded before this field existed parses as an empty list rather
+    /// than failing to load; `diff_at` then falls back to relying on the
+    /// CURRENT cwd's policy alone for that older revision, same as before.
+    #[serde(default)]
+    policy: Vec<PolicyRule>,
+}
+
+/// One row of `pall8t home log`.
+#[derive(Serialize)]
+pub struct RevisionSummary {
+    pub seq: u64,
+    pub op: RevisionOp,
+    pub runs: Vec<String>,
+    pub paths: usize,
+    pub created: u64,
+}
+
+/// Zero-padded revision directory name so `ls`-style sorting matches
+/// numeric order; six digits comfortably outlives any project's lifetime at
+/// one revision per harvest/promote/rollback.
+fn seq_name(seq: u64) -> String {
+    format!("{seq:06}")
+}
+
+/// Begins a candidate revision: clones the base's CURRENT content (i.e. the
+/// state right before whatever mutation the caller is about to apply) into a
+/// freshly named `revisions/<tmp>.partial` directory. The caller either
+/// [`finalize_revision`]s it (the mutation actually changed something) or
+/// [`discard_revision_snapshot`]s it (nothing landed) — so a promote that
+/// lands nothing, or a no-op harvest, never burns a sequence number on an
+/// empty revision. Must be called with the base lock held, before the
+/// mutation, so the snapshot is the pre-mutation state.
+fn begin_revision_snapshot(root: &Path) -> Result<PathBuf> {
+    let revisions = revisions_root(root);
+    std::fs::create_dir_all(&revisions)?;
+    let partial = revisions.join(format!(
+        "pending-{}-{}.partial",
+        std::process::id(),
+        next_seq()
+    ));
+    let base = base_dir(root);
+    if base.exists() {
+        clone_into(&partial, "snapshot", &base)?;
+    } else {
+        // No base yet (nothing has ever been forked) — the pre-mutation
+        // state is legitimately empty.
+        std::fs::create_dir_all(partial.join("snapshot"))?;
+    }
+    Ok(partial)
+}
+
+/// Abandons a candidate snapshot that turned out not to be needed.
+fn discard_revision_snapshot(partial: &Path) {
+    let _ = std::fs::remove_dir_all(partial);
+}
+
+/// Guarantees a [`begin_revision_snapshot`] is never silently leaked when a
+/// fallible mutation loop between it and [`finalize_revision`] returns early
+/// via a bare `?` (`promote_at`'s `merge_entry` loop, `rollback_at`'s
+/// `diff_paths`/`swap_base`): the caller either [`Self::disarm`]s it right
+/// before deciding finalize-vs-discard, or, on early return, `Drop` discards
+/// the still-owned snapshot instead of leaving it as unreachable litter under
+/// `revisions/`. Not used by `harvest_instance` — its mutation loop is
+/// wrapped in [`apply_harvest_changes`] specifically so a failure preserves
+/// partial progress (recorded as a revision) instead of discarding it, which
+/// makes a bare `?`-escapes-the-loop guard moot there. This only covers
+/// graceful error propagation either way — a `kill -9` mid-mutation skips
+/// `Drop` entirely, which is why `gc` also sweeps stray `pending-*.partial`
+/// directories directly (belt and suspenders, matching the same
+/// crash-safety story instance tombstones already have).
+struct PendingRevisionGuard(Option<PathBuf>);
+
+impl PendingRevisionGuard {
+    fn disarm(mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
+
+impl Drop for PendingRevisionGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            discard_revision_snapshot(&p);
+        }
+    }
+}
+
+/// Publishes a candidate snapshot as the next revision, then prunes beyond
+/// `keep`. Atomic by rename: a crash before the rename leaves only the
+/// (ignored, namespaced) `.partial`; a crash after it leaves the revision
+/// published but pruning undone, which the next `finalize_revision` or an
+/// explicit `gc` catches. Must be called with the base lock held.
+fn finalize_revision(
+    root: &Path,
+    partial: PathBuf,
+    op: RevisionOp,
+    runs: Vec<String>,
+    paths: Vec<String>,
+    policy: &[PolicyRule],
+    keep: u32,
+) -> Result<u64> {
+    let seq = next_revision_seq(root)?;
+    let meta = RevisionMeta {
+        seq,
+        op,
+        runs,
+        paths,
+        created: now_secs(),
+        policy: policy.to_vec(),
+    };
+    std::fs::write(partial.join("meta.toml"), toml::to_string(&meta)?)?;
+    let dest = revisions_root(root).join(seq_name(seq));
+    std::fs::rename(&partial, &dest).with_context(|| format!("cannot publish revision {seq}"))?;
+    prune_revisions(root, keep)?;
+    Ok(seq)
+}
+
+/// Finalizes a candidate revision if `written` is non-empty, discards it
+/// otherwise (never both) — the "did this mutation actually change
+/// anything" decision every revision-recording caller (harvest, promote)
+/// makes the same way. `written` becomes the finalized revision's `paths`;
+/// empty means every classified-touched path turned out not to produce an
+/// actual write (e.g. a Secret deletion per FR-10, a UTF-8-skip, or every
+/// promoted path was already a byte-for-byte match) — no mutation
+/// happened, so no revision (FR-7). `rollback` has no discard branch (a
+/// no-op rollback returns early before ever taking a snapshot) so it calls
+/// [`finalize_revision`] directly instead of through this helper.
+fn finalize_or_discard(
+    root: &Path,
+    pending: PathBuf,
+    written: Vec<String>,
+    op: RevisionOp,
+    runs: Vec<String>,
+    policy: &[PolicyRule],
+    keep: u32,
+) -> Result<()> {
+    if written.is_empty() {
+        discard_revision_snapshot(&pending);
+    } else {
+        finalize_revision(root, pending, op, runs, written, policy, keep)?;
+    }
+    Ok(())
+}
+
+fn read_revision_meta(dir: &Path) -> Result<RevisionMeta> {
+    let text = std::fs::read_to_string(dir.join("meta.toml"))
+        .with_context(|| format!("revision {} has no meta.toml", dir.display()))?;
+    toml::from_str(&text).with_context(|| format!("cannot parse {}/meta.toml", dir.display()))
+}
+
+/// Published (non-`.partial`) revision directories, oldest first.
+fn list_revision_dirs(root: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let dir = revisions_root(root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Ok(seq) = name.parse::<u64>() {
+            out.push((seq, entry.path()));
+        }
+        // Anything else (`pending-*.partial` from a crashed finalize) is
+        // transient litter, cleaned up by `gc`, not a revision.
+    }
+    out.sort_by_key(|(seq, _)| *seq);
+    Ok(out)
+}
+
+fn next_revision_seq(root: &Path) -> Result<u64> {
+    Ok(list_revision_dirs(root)?.last().map_or(1, |(s, _)| s + 1))
+}
+
+/// Highest published revision number, if any.
+fn latest_revision_seq(root: &Path) -> Result<Option<u64>> {
+    Ok(list_revision_dirs(root)?.last().map(|(s, _)| *s))
+}
+
+/// Removes the oldest revisions beyond `keep`, returning how many were
+/// pruned. Called after every [`finalize_revision`] and again by `gc` (in
+/// case a crash skipped the post-finalize prune) — i.e. up to once per
+/// recorded revision, so `keep = 0` is silently clamped to 1 here rather
+/// than warning every time (that would spam one line per harvest/promote/
+/// rollback for the life of a misconfigured project); the CLI layer warns
+/// about `revisions_keep = 0` once per invocation instead (next to its
+/// `[[home.policy]]` warnings). Clamping matters because otherwise the
+/// revision [`finalize_revision`] just published would be pruned
+/// immediately after being written, leaving `home log` permanently empty
+/// and `next_revision_seq` resetting to 1 forever.
+fn prune_revisions(root: &Path, keep: u32) -> Result<usize> {
+    let keep = if keep == 0 { 1 } else { keep };
+    let dirs = list_revision_dirs(root)?;
+    let keep = keep as usize;
+    if dirs.len() <= keep {
+        return Ok(0);
+    }
+    let excess = dirs.len() - keep;
+    for (_, path) in dirs.into_iter().take(excess) {
+        std::fs::remove_dir_all(&path)
+            .with_context(|| format!("cannot prune revision {}", path.display()))?;
+    }
+    Ok(excess)
+}
+
+/// Lists revisions newest-first (FR-7 `log`).
+pub fn list_revisions() -> Result<Vec<RevisionSummary>> {
+    list_revisions_at(&crate::config::pall8t_root()?)
+}
+
+fn list_revisions_at(root: &Path) -> Result<Vec<RevisionSummary>> {
+    let mut out = Vec::new();
+    for (seq, path) in list_revision_dirs(root)? {
+        match read_revision_meta(&path) {
+            Ok(m) => out.push(RevisionSummary {
+                seq,
+                op: m.op,
+                runs: m.runs,
+                paths: m.paths.len(),
+                created: m.created,
+            }),
+            Err(e) => eprintln!("pall8t: warning: skipping revision {seq}: {e:#}"),
+        }
+    }
+    // `list_revision_dirs` is already seq-ascending; newest-first is just
+    // the reverse, cheaper than re-sorting.
+    out.reverse();
+    Ok(out)
+}
+
+/// One changed path in a `diff` rendering.
+pub struct DiffEntry {
+    pub path: String,
+    pub change: Change,
+    /// Secret content is never rendered, only redacted (never in diffs/logs
+    /// — the secrets NFR); this flags the redaction so the CLI can show the
+    /// marker instead of a content diff.
+    pub secret: bool,
+    /// A textual diff (`git diff --no-index`, no repository needed) when
+    /// the path is non-secret and both sides are readable UTF-8 text.
+    /// `None` for secrets, binaries, or a git failure — the caller then
+    /// falls back to just the change label.
+    pub text_diff: Option<String>,
+}
+
+/// Every path that differs between two directory trees, in path order. A
+/// path is redacted as secret if EITHER `recorded_overrides` (the policy
+/// active when the revision being diffed was recorded) OR `current_overrides`
+/// (the cwd's policy right now) classifies it as secret — never just the
+/// current one. Revisions are global (`~/.pall8t/revisions/`) but
+/// `[[home.policy]]` is per-project; without this a secret a project
+/// declared via policy (the documented pattern for credentials the built-in
+/// defaults don't cover) would render in cleartext to `pall8t home diff` run
+/// from any OTHER cwd, or from a broken/missing config falling back to
+/// defaults. Checking both directions also means editing the policy to
+/// protect a path AFTER the fact re-protects old snapshots of it too.
+fn diff_entries(
+    before: &Path,
+    after: &Path,
+    recorded_overrides: &[PolicyRule],
+    current_overrides: &[PolicyRule],
+) -> Result<Vec<DiffEntry>> {
+    let mut out = Vec::new();
+    for rel in union_paths(after, before)? {
+        let before_path = before.join(&rel);
+        let after_path = after.join(&rel);
+        let b = read_opt(&before_path);
+        let a = read_opt(&after_path);
+        if a == b {
+            continue;
+        }
+        let secret = classify(&rel, recorded_overrides).class == Class::Secret
+            || classify(&rel, current_overrides).class == Class::Secret;
+        let text_diff = if secret {
+            None
+        } else {
+            text_diff(&before_path, &after_path)
+        };
+        out.push(DiffEntry {
+            path: rel,
+            change: classify_change(&b, &a),
+            secret,
+            text_diff,
+        });
+    }
+    out.sort_by(|x, y| x.path.cmp(&y.path));
+    Ok(out)
+}
+
+/// Just the changed paths between two trees, no classification — the
+/// touched-paths list [`rollback`] records for its own revision. Deliberately
+/// NOT built on top of [`diff_entries`]: that also classifies every path and
+/// shells out to `git diff` per non-secret change for [`text_diff`], which
+/// `rollback`'s bookkeeping doesn't need and shouldn't pay for (it runs under
+/// the base lock, blocking every other base operation) — and it would need
+/// policy overrides threaded in for no benefit.
+fn diff_paths(before: &Path, after: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for rel in union_paths(after, before)? {
+        if read_opt(&before.join(&rel)) != read_opt(&after.join(&rel)) {
+            out.push(rel);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Unified diff of one path via `git diff --no-index` — works on two
+/// arbitrary files with no repository involved, the same trick
+/// [`git_merge_file`] uses for merging. `None` on a non-zero-or-one exit
+/// (error, or non-UTF-8/binary content `git diff` can't usefully render)
+/// so the caller falls back to just the change label rather than fail the
+/// whole `diff` command over one unrenderable path.
+fn text_diff(before: &Path, after: &Path) -> Option<String> {
+    let missing = Path::new("/dev/null");
+    let out = std::process::Command::new("git")
+        .arg("diff")
+        .arg("--no-index")
+        .arg("--no-color")
+        .arg(if before.exists() { before } else { missing })
+        .arg(if after.exists() { after } else { missing })
+        .output()
+        .ok()?;
+    // exit 0 = identical (shouldn't happen, caller already filtered), 1 =
+    // differences rendered, >1 = error (e.g. binary content) — don't render.
+    match out.status.code() {
+        Some(0) | Some(1) => String::from_utf8(out.stdout).ok(),
+        _ => None,
+    }
+}
+
+/// Renders a revision's diff (FR-7 `diff <seq>`): the newest revision
+/// compares its snapshot against the current base; any earlier revision
+/// compares against the next revision's snapshot (which IS the base as it
+/// stood right after this revision's mutation) — pruning never breaks this
+/// since keeping revision `seq` always implies keeping the newer `seq+1`.
+pub fn diff(seq: u64, overrides: &[PolicyRule]) -> Result<String> {
+    diff_at(&crate::config::pall8t_root()?, seq, overrides)
+}
+
+fn diff_at(root: &Path, seq: u64, overrides: &[PolicyRule]) -> Result<String> {
+    // Locked from the start: `latest_revision_seq` must be read under the
+    // same lock that decides `after`, or a mutation landing between an
+    // unlocked read and the decision could make this diff attribute a
+    // newer change to `seq` (a stale `latest` making the live base look
+    // like `seq`'s own successor, or vice versa).
+    let lock = lock_base(root)?;
+    let rev_dir = revisions_root(root).join(seq_name(seq));
+    let before = rev_dir.join("snapshot");
+    if !before.exists() {
+        return Err(anyhow!(
+            "no revision {seq} (see `pall8t home log`, or it may have been pruned)"
+        ));
+    }
+    // The policy active when THIS revision was recorded (see
+    // `diff_entries`'s doc comment) — missing only for a revision recorded
+    // before this field existed, which parses as an empty list.
+    let recorded_overrides = read_revision_meta(&rev_dir)?.policy;
+    let latest = latest_revision_seq(root)?.unwrap_or(seq);
+    // `_lock`, paired explicitly with `after`, makes "is the base lock
+    // still held across the `diff_entries` walk below" a value visible
+    // right here, rather than a fact that depends on which arm happened to
+    // run (and whether it called `drop`).
+    let (after, _lock): (PathBuf, Option<BaseLock>) = if seq >= latest {
+        // Reading the live base races a concurrent rollback's `swap_base`,
+        // which briefly renames the base directory away — keep holding the
+        // lock through `diff_entries` below so the walk always sees a
+        // complete tree, not an ENOENT mid-rename.
+        (base_dir(root), Some(lock))
+    } else {
+        // An older revision's `after` is an immutable, already-published
+        // snapshot nothing can still be writing — release the lock before
+        // `diff_entries` shells out to `git diff` per changed path, rather
+        // than block every concurrent fork/harvest/promote/rollback for
+        // that duration.
+        drop(lock);
+        (
+            revisions_root(root)
+                .join(seq_name(seq + 1))
+                .join("snapshot"),
+            None,
+        )
+    };
+    let entries =
+        diff_entries(&before, &after, &recorded_overrides, overrides).with_context(|| {
+            format!(
+                "reading revision {seq}'s diff — it may have been pruned by a concurrent \
+                 `gc` while this ran"
+            )
+        })?;
+    let mut s = format!("revision {seq}: {} path(s) changed\n", entries.len());
+    for e in &entries {
+        if e.secret {
+            s.push_str(&format!(
+                "  {:<8} {}  [secret — content not shown]\n",
+                change_label(e.change),
+                e.path
+            ));
+        } else if let Some(d) = &e.text_diff {
+            s.push_str(&format!("  {:<8} {}\n", change_label(e.change), e.path));
+            for line in d.lines() {
+                s.push_str("    ");
+                s.push_str(line);
+                s.push('\n');
+            }
+        } else {
+            s.push_str(&format!("  {:<8} {}\n", change_label(e.change), e.path));
+        }
+    }
+    Ok(s)
+}
+
+/// Restores the base to revision `seq`'s pre-mutation snapshot (FR-7
+/// `rollback`), under the base lock, crash-atomic via [`swap_base`]. The
+/// rollback itself is recorded as a new revision (paths = what the swap
+/// actually changed) so it is undoable like any other base mutation.
+///
+/// Unlike promote, rollback's OWN revision can't rely solely on
+/// `overrides` (the invoking cwd's policy): a whole-tree swap can
+/// reintroduce content byte-for-byte from ANY earlier revision, classified
+/// under THAT revision's policy, which may be a different project entirely
+/// or simply no longer loaded at rollback time. So the policy recorded for
+/// this new revision is the SECRET-classifying rules from `overrides` and
+/// every still-existing revision's own recorded policy (see
+/// [`accumulated_secret_policy`]) — fail-closed over-redaction is the safe
+/// failure mode here (a stray secret rule that matches nothing is a no-op;
+/// a missing one is a leak). Bounded by `revisions_keep`: a revision old
+/// enough to be pruned already lost its policy record regardless of what
+/// this function does.
+pub fn rollback(seq: u64, overrides: &[PolicyRule], revisions_keep: u32) -> Result<()> {
+    rollback_at(
+        &crate::config::pall8t_root()?,
+        seq,
+        overrides,
+        revisions_keep,
+    )
+}
+
+/// The secret-classifying rules from `overrides` and from every
+/// still-existing revision's own recorded policy (FR-7 `rollback`'s
+/// redaction composition — see [`rollback`]'s doc comment). Filtered to
+/// `class == Some(Secret)` ONLY, never the raw rule lists: `classify` is
+/// first-match-wins, so concatenating full policies oldest-first would let
+/// a broader, non-secret rule recorded by an EARLIER revision (e.g. a
+/// project's own `class = "knowledge"` rule over the same glob) sort
+/// before a LATER revision's more specific `secret` rule and mask it —
+/// exactly the hazard round 1's `diff_entries` fix exists to avoid, by
+/// never merging raw rule lists across policies. A list containing only
+/// secret-classifying rules can't mask anything this way: any match means
+/// secret, no match falls through to `classify`'s own built-in defaults,
+/// same as everywhere else this "is it secret" check is used. The cost is
+/// fail-closed: a project's specific NON-secret rule that happened to
+/// shadow a broader secret rule within its OWN policy isn't reproduced
+/// here (only the secret rule survives the filter) — over-redaction, never
+/// a leak, which is the acceptable direction to err.
+fn accumulated_secret_policy(root: &Path, overrides: &[PolicyRule]) -> Result<Vec<PolicyRule>> {
+    let is_secret = |r: &PolicyRule| r.class == Some(Class::Secret);
+    let mut out: Vec<PolicyRule> = Vec::new();
+    for (_, path) in list_revision_dirs(root)? {
+        if let Ok(meta) = read_revision_meta(&path) {
+            out.extend(meta.policy.into_iter().filter(is_secret));
+        }
+    }
+    out.extend(overrides.iter().filter(|r| is_secret(r)).cloned());
+    Ok(out)
+}
+
+fn rollback_at(root: &Path, seq: u64, overrides: &[PolicyRule], revisions_keep: u32) -> Result<()> {
+    let _lock = lock_base(root)?;
+    let target = revisions_root(root).join(seq_name(seq)).join("snapshot");
+    if !target.exists() {
+        return Err(anyhow!(
+            "no revision {seq} (see `pall8t home log`, or it may have been pruned)"
+        ));
+    }
+    let base = base_dir(root);
+    // Check first, snapshot only if needed: rolling back to a snapshot
+    // identical to the current base is a true no-op, and `diff_paths` is a
+    // cheap byte comparison that doesn't require a base clone to answer —
+    // so skip `begin_revision_snapshot`'s clone-then-immediately-discard
+    // entirely rather than pay for it on every no-op rollback.
+    let touched = diff_paths(&base, &target)?;
+    if touched.is_empty() {
+        return Ok(());
+    }
+    // See `rollback`'s doc comment: this new revision's redaction record
+    // must cover whatever policy classified the content being reintroduced,
+    // not just the invoking cwd's — gathered before finalizing so it
+    // reflects every revision that exists right now, not one this rollback
+    // is about to add or prune.
+    let policy = accumulated_secret_policy(root, overrides)?;
+    let pending = PendingRevisionGuard(Some(begin_revision_snapshot(root)?));
+    swap_base(root, &target)?;
+    let pending = pending.disarm().expect("armed above");
+    finalize_revision(
+        root,
+        pending,
+        RevisionOp::Rollback,
+        Vec::new(),
+        touched,
+        &policy,
+        revisions_keep,
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Harvest (FR-3 / FR-8)
 // ---------------------------------------------------------------------------
 
@@ -480,11 +1160,15 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 /// proceed. Returns the run names harvested. Oldest-fork-first, so among
 /// concurrent runs the most recently started one's secret/state writes land
 /// last (a better "latest-wins" than readdir order).
-pub fn harvest_finished(overrides: &[PolicyRule]) -> Result<Vec<String>> {
-    harvest_finished_at(&crate::config::pall8t_root()?, overrides)
+pub fn harvest_finished(overrides: &[PolicyRule], revisions_keep: u32) -> Result<Vec<String>> {
+    harvest_finished_at(&crate::config::pall8t_root()?, overrides, revisions_keep)
 }
 
-fn harvest_finished_at(root: &Path, overrides: &[PolicyRule]) -> Result<Vec<String>> {
+fn harvest_finished_at(
+    root: &Path,
+    overrides: &[PolicyRule],
+    revisions_keep: u32,
+) -> Result<Vec<String>> {
     let dir = instances_root(root);
     if !dir.exists() {
         return Ok(Vec::new());
@@ -495,10 +1179,17 @@ fn harvest_finished_at(root: &Path, overrides: &[PolicyRule]) -> Result<Vec<Stri
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         // `.partial` (fork in progress) and `.discard` (dispose in progress)
-        // are transient, not instances.
-        if !entry.file_type()?.is_dir() || name.ends_with(".partial") || name.ends_with(".discard")
-        {
+        // are transient, not instances — but a leftover one, from a fork or
+        // harvest that crashed, is garbage. Sweep it lazily here (best
+        // effort) so crashes don't accumulate litter until someone runs
+        // `gc` (FR-9 residual); `sweep_tombstones` applies the same
+        // liveness/staleness judgment `gc` does.
+        if name.ends_with(".partial") || name.ends_with(".discard") {
+            sweep_one_tombstone(&entry.path(), &name);
             continue;
         }
         let meta = match read_meta(&entry.path()) {
@@ -520,7 +1211,7 @@ fn harvest_finished_at(root: &Path, overrides: &[PolicyRule]) -> Result<Vec<Stri
 
     let mut harvested = Vec::new();
     for (path, meta) in finished {
-        match harvest_instance(root, &path, overrides) {
+        match harvest_instance(root, &path, overrides, revisions_keep) {
             Ok(true) => harvested.push(meta.run),
             // Already harvested (and disposed) by a concurrent process.
             Ok(false) => {}
@@ -555,6 +1246,15 @@ fn is_forker_alive(pid: u32) -> bool {
     !matches!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
 }
 
+/// One changed, non-ephemeral path found by [`harvest_instance`]'s
+/// classification pass, carried into [`apply_harvest_changes`].
+struct Changed {
+    rel: String,
+    cls: Classified,
+    ancestor: Option<Vec<u8>>,
+    theirs: Option<Vec<u8>>,
+}
+
 /// Harvests a single finished instance under the base lock: classifies every
 /// path that changed since the fork, writes secrets/state back to the base,
 /// stages knowledge into an inbox changeset, discards ephemeral, then
@@ -565,7 +1265,12 @@ fn is_forker_alive(pid: u32) -> bool {
 /// The whole operation holds the base lock (FR-6), so two processes can't
 /// both drain the same instance, and secret/state write-backs (which read the
 /// current base) stay consistent with concurrent forks and promotes.
-fn harvest_instance(root: &Path, inst: &Path, overrides: &[PolicyRule]) -> Result<bool> {
+fn harvest_instance(
+    root: &Path,
+    inst: &Path,
+    overrides: &[PolicyRule],
+    revisions_keep: u32,
+) -> Result<bool> {
     // Everything that touches the shared base runs under the lock; the heavy
     // delete of the drained instance is done afterwards, outside it.
     let tombstone = {
@@ -578,11 +1283,26 @@ fn harvest_instance(root: &Path, inst: &Path, overrides: &[PolicyRule]) -> Resul
         let ancestor_root = inst.join("ancestor");
         let base = base_dir(root);
 
-        let mut staged: Vec<Entry> = Vec::new();
+        // Classify with the policy that was active AT FORK TIME for this
+        // instance, not the invoking cwd's: harvest is lazy (FR-8) and can
+        // run from a completely different project than the one this run
+        // belongs to, and the run's writes were made under ITS project's
+        // regime. Falls back to the caller's `overrides` only when the
+        // instance predates this field entirely (`None`) — a fork that
+        // pinned zero overrides (`Some(vec![])`) is authoritative and used
+        // as-is, NOT treated the same as missing; see
+        // `InstanceMeta::policy`'s doc comment for why that distinction
+        // matters (the harvesting cwd's overrides must not silently apply
+        // to a project that never declared them).
+        let policy: &[PolicyRule] = meta.policy.as_deref().unwrap_or(overrides);
+
+        // Classify every changed, non-ephemeral path up front (FR-7): only
+        // Secret/State writes touch the base — Knowledge is only ever
+        // staged — so this tells us before mutating anything whether a
+        // revision snapshot is needed, and of what.
+        let mut changed = Vec::new();
         for rel in union_paths(&theirs_root, &ancestor_root)? {
-            // Classify before reading: ephemeral paths (caches etc., the bulk
-            // of a home) are skipped without ever loading their bytes.
-            let cls = classify(&rel, overrides);
+            let cls = classify(&rel, policy);
             if cls.class == Class::Ephemeral {
                 continue;
             }
@@ -591,81 +1311,203 @@ fn harvest_instance(root: &Path, inst: &Path, overrides: &[PolicyRule]) -> Resul
             if theirs == ancestor {
                 continue; // unchanged by the run
             }
-            match cls.class {
-                Class::Ephemeral => unreachable!("handled above"),
-                Class::Secret => {
-                    // Only a secret the run actually changed propagates, so a
-                    // run that never touched credentials can't clobber a token
-                    // another run refreshed. Deletion is not propagated —
-                    // dropping a base credential is never automatic (FR-10).
-                    if let Some(content) = theirs {
-                        write_atomic(&base.join(&rel), &content)?;
-                    }
-                }
-                Class::State => {
-                    if let Some(theirs) = &theirs {
-                        let path = base.join(&rel);
-                        let current = read_opt(&path);
-                        match cls.strategy {
-                            // Append-only formats (history.jsonl): keep both
-                            // sides' lines, never conflict.
-                            MergeStrategy::Union => match &current {
-                                None => write_atomic(&path, theirs)?,
-                                Some(cur) => {
-                                    match union_merge(
-                                        ancestor.as_deref().unwrap_or_default(),
-                                        cur,
-                                        theirs,
-                                    )? {
-                                        Some(merged) => write_atomic(&path, &merged)?,
-                                        // Non-UTF-8 (e.g. a crash-truncated
-                                        // append): keep the base rather than
-                                        // overwrite it and lose the lines other
-                                        // runs accumulated.
-                                        None => eprintln!(
-                                            "pall8t: warning: {rel} is not valid UTF-8 — \
-                                             left the base copy unchanged"
-                                        ),
-                                    }
-                                }
-                            },
-                            MergeStrategy::Inherit => {
-                                let merged = state_merge_bytes(
-                                    current.as_deref(),
-                                    ancestor.as_deref(),
-                                    theirs,
-                                )
-                                .with_context(|| format!("merging state {rel}"))?;
-                                write_atomic(&path, &merged)?;
-                            }
-                        }
-                    }
-                }
-                Class::Knowledge => {
-                    let change = classify_change(&ancestor, &theirs);
-                    stage_path(root, &meta.run, &rel, &ancestor, &theirs)?;
-                    staged.push(Entry {
-                        path: rel,
-                        class: cls.class,
-                        change,
-                        strategy: cls.strategy,
-                        explicit: cls.explicit,
-                    });
-                }
-            }
+            changed.push(Changed {
+                rel,
+                cls,
+                ancestor,
+                theirs,
+            });
         }
+        // Whether a revision snapshot is worth taking at all: cheap
+        // pre-check on classification alone (a Knowledge-only harvest never
+        // writes the base, so never needs one). The revision is ultimately
+        // recorded WITH `actually_written` below, not this — classification
+        // over-approximates (e.g. a run deleting a Secret is classified
+        // Secret but, per FR-10, never triggers a base write at all).
+        let maybe_touches_base = changed
+            .iter()
+            .any(|c| matches!(c.cls.class, Class::Secret | Class::State));
+        // A plain `Option`, not a `PendingRevisionGuard`: see the guard's
+        // own doc comment for why — its `Drop` always discards, which
+        // would lose `apply_harvest_changes`' partial progress on a
+        // mid-loop failure instead of preserving it (this function's whole
+        // point). The finalize-or-discard decision below is made
+        // explicitly instead.
+        let pending_revision = if maybe_touches_base {
+            Some(begin_revision_snapshot(root)?)
+        } else {
+            None
+        };
 
-        if !staged.is_empty() {
-            write_manifest(root, &meta, staged)?;
+        let mut staged: Vec<Entry> = Vec::new();
+        let mut actually_written: Vec<String> = Vec::new();
+        // `apply_harvest_changes` accumulates into `staged`/`actually_written`
+        // as it goes, so a failure partway through (a malformed run's
+        // `.claude.json`, a `git merge-file` error, …) still leaves them
+        // holding whatever landed before the failure — its `Result` is
+        // captured, not `?`-propagated here, precisely so the revision
+        // decision below sees that partial progress instead of losing all
+        // record of a mutation that already happened.
+        let loop_result = apply_harvest_changes(
+            root,
+            &base,
+            &meta.run,
+            changed,
+            &mut actually_written,
+            &mut staged,
+        );
+
+        // Same reasoning applies to the manifest write: run it (and capture
+        // its own outcome) before deciding the revision's fate, rather than
+        // letting a `?` here skip straight past the finalize/discard below.
+        let manifest_result: Result<()> = if staged.is_empty() {
+            Ok(())
+        } else {
+            write_manifest(root, &meta, staged)
+        };
+
+        // Finalize or discard using what ACTUALLY got written, regardless
+        // of whether the loop or the manifest write above failed.
+        if let Some(pending) = pending_revision {
+            finalize_or_discard(
+                root,
+                pending,
+                actually_written,
+                RevisionOp::Harvest,
+                vec![meta.run.clone()],
+                policy,
+                revisions_keep,
+            )?;
         }
+        // Now propagate any failure — after the mutation that already
+        // happened has a revision recording it. The instance is NOT retired
+        // on failure, so harvest can be retried (e.g. after the run's
+        // `.claude.json` is fixed, or indefinitely if it can't be).
+        loop_result?;
+        manifest_result?;
         retire_instance(inst)?
     };
     // The tombstone is namespaced and ignored by scanners, so deleting its
     // (whole-home-sized) tree unlocked keeps that I/O out of the critical
-    // section without weakening same-instance drain exclusion.
-    std::fs::remove_dir_all(&tombstone)
-        .with_context(|| format!("cannot remove tombstone {}", tombstone.display()))?;
+    // section without weakening same-instance drain exclusion. Tolerate it
+    // already being gone (same helper as `prune_changeset`): a concurrent
+    // `gc` sweep can win this exact race (harvest already fully drained the
+    // instance and retired it under the lock above, so the tombstone is
+    // safe for `sweep_tombstones`/`sweep_one_tombstone` to remove).
+    remove_dir_all_tolerant(&tombstone, "tombstone")?;
     Ok(true)
+}
+
+/// Applies each [`Changed`] path to the base or the inbox, per its class:
+/// Secret/State write (or merge) into `base`, appending the ones that
+/// actually changed a byte on disk to `actually_written`; Knowledge is
+/// staged into `run`'s changeset and appended to `staged`. Stops at the
+/// first error (a malformed `.claude.json`, a `git merge-file` failure, …),
+/// returning it — but whatever was pushed to `actually_written`/`staged`
+/// before that point stays in the caller's vectors, so a partial mutation
+/// is never silently unaccounted for.
+fn apply_harvest_changes(
+    root: &Path,
+    base: &Path,
+    run: &str,
+    changed: Vec<Changed>,
+    actually_written: &mut Vec<String>,
+    staged: &mut Vec<Entry>,
+) -> Result<()> {
+    for Changed {
+        rel,
+        cls,
+        ancestor,
+        theirs,
+    } in changed
+    {
+        match cls.class {
+            Class::Ephemeral => unreachable!("filtered out by the caller's classification pass"),
+            Class::Secret => {
+                // Only a secret the run actually changed propagates, so a
+                // run that never touched credentials can't clobber a token
+                // another run refreshed. Deletion is not propagated —
+                // dropping a base credential is never automatic (FR-10).
+                // `write_if_changed`: two runs concurrently refreshing the
+                // same credential to the same new token must not each burn
+                // a revision — only a byte-level change counts as "wrote".
+                if let Some(content) = theirs {
+                    if write_if_changed(&base.join(&rel), &content)? {
+                        actually_written.push(rel);
+                    }
+                }
+            }
+            Class::State => {
+                if let Some(theirs) = &theirs {
+                    let path = base.join(&rel);
+                    let current = read_opt(&path);
+                    match cls.strategy {
+                        // Append-only formats (history.jsonl): keep both
+                        // sides' lines, never conflict.
+                        MergeStrategy::Union => match &current {
+                            None => {
+                                write_atomic(&path, theirs)?;
+                                actually_written.push(rel);
+                            }
+                            Some(cur) => {
+                                match union_merge(
+                                    ancestor.as_deref().unwrap_or_default(),
+                                    cur,
+                                    theirs,
+                                )? {
+                                    // A union merge whose result equals what's
+                                    // already there (the run's lines were
+                                    // already present, e.g. a concurrent run
+                                    // appended the identical entry first) is
+                                    // not a mutation. Compared directly
+                                    // against `cur` (already read above)
+                                    // rather than through `write_if_changed`,
+                                    // which would re-read the same file.
+                                    Some(merged) if merged == *cur => {}
+                                    Some(merged) => {
+                                        write_atomic(&path, &merged)?;
+                                        actually_written.push(rel);
+                                    }
+                                    // Non-UTF-8 (e.g. a crash-truncated
+                                    // append): keep the base rather than
+                                    // overwrite it and lose the lines other
+                                    // runs accumulated.
+                                    None => eprintln!(
+                                        "pall8t: warning: {rel} is not valid UTF-8 — \
+                                         left the base copy unchanged"
+                                    ),
+                                }
+                            }
+                        },
+                        MergeStrategy::Inherit => {
+                            let merged =
+                                state_merge_bytes(current.as_deref(), ancestor.as_deref(), theirs)
+                                    .with_context(|| format!("merging state {rel}"))?;
+                            // Compared directly against `current` (already
+                            // read above) rather than through
+                            // `write_if_changed`, which would re-read.
+                            if current.as_deref() != Some(merged.as_slice()) {
+                                write_atomic(&path, &merged)?;
+                                actually_written.push(rel);
+                            }
+                        }
+                    }
+                }
+            }
+            Class::Knowledge => {
+                let change = classify_change(&ancestor, &theirs);
+                stage_path(root, run, &rel, &ancestor, &theirs)?;
+                staged.push(Entry {
+                    path: rel,
+                    class: cls.class,
+                    change,
+                    strategy: cls.strategy,
+                    explicit: cls.explicit,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Retires a drained instance crash-atomically by renaming it to a `.discard`
@@ -682,6 +1524,75 @@ fn retire_instance(inst: &Path) -> Result<PathBuf> {
     std::fs::rename(inst, &tomb)
         .with_context(|| format!("cannot retire instance {}", inst.display()))?;
     Ok(tomb)
+}
+
+/// Removes one `.partial`/`.discard` leftover if it's actually garbage,
+/// returning whether it was removed (FR-9 residual: orphan tombstone GC). A
+/// `.discard` is always safe to remove — [`retire_instance`] only creates one
+/// after the harvest that produced it already finished draining the instance
+/// under the lock, so nothing still needs it. A `.partial` is only removed
+/// once it's [`STALE_PARTIAL_SECS`] old (or has a `meta.toml` naming a dead
+/// forker pid, for the case a fork got far enough to write it): a fresh one
+/// may be a fork legitimately still in progress. Best-effort; a failed
+/// removal is reported as not-removed rather than erroring the whole sweep,
+/// since this is opportunistic cleanup, not the caller's main job.
+fn sweep_one_tombstone(path: &Path, name: &str) -> bool {
+    let stale = if name.ends_with(".discard") {
+        true
+    } else if let Ok(meta) = read_meta(path) {
+        !is_forker_alive(meta.forker_pid)
+    } else {
+        older_than(path, STALE_PARTIAL_SECS)
+    };
+    stale && std::fs::remove_dir_all(path).is_ok()
+}
+
+/// True if `path`'s mtime is more than `secs` in the past (fail-closed:
+/// unreadable metadata is treated as NOT stale, so a filesystem hiccup
+/// never triggers an unwanted delete).
+fn older_than(path: &Path, secs: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    match std::time::SystemTime::now().duration_since(modified) {
+        Ok(age) => age.as_secs() > secs,
+        Err(_) => false, // mtime in the future (clock skew) — not stale
+    }
+}
+
+/// Sweeps every `.partial`/`.discard` leftover under `instances/` (FR-9
+/// `gc`). Returns `(partials removed, discards removed)`. The lazy sweep in
+/// [`harvest_finished_at`] does the same per-entry judgment as instances are
+/// scanned; this is the explicit, whole-directory version for `gc`.
+fn sweep_tombstones(root: &Path) -> Result<(usize, usize)> {
+    let dir = instances_root(root);
+    if !dir.exists() {
+        return Ok((0, 0));
+    }
+    let (mut partials, mut discards) = (0, 0);
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_partial = name.ends_with(".partial");
+        let is_discard = name.ends_with(".discard");
+        if !is_partial && !is_discard {
+            continue;
+        }
+        if sweep_one_tombstone(&entry.path(), &name) {
+            if is_partial {
+                partials += 1;
+            } else {
+                discards += 1;
+            }
+        }
+    }
+    Ok((partials, discards))
 }
 
 /// Merges a run's durable-state file into the base's current bytes. When the
@@ -824,13 +1735,7 @@ fn prune_changeset(cs: &Path, manifest: &mut Manifest, paths: &[String]) -> Resu
     if manifest.entries.is_empty() {
         // Tolerate an already-removed changeset (a concurrent merge/drop got
         // here first) — the dir being gone is the desired end state.
-        match std::fs::remove_dir_all(cs) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => {
-                Err(anyhow!(e).context(format!("cannot remove emptied changeset {}", cs.display())))
-            }
-        }
+        remove_dir_all_tolerant(cs, "emptied changeset")
     } else {
         write_atomic(
             &cs.join("manifest.toml"),
@@ -847,6 +1752,7 @@ fn read_manifest(root: &Path, run: &str) -> Result<Manifest> {
 }
 
 /// One row of `pall8t home inbox`.
+#[derive(Serialize)]
 pub struct ChangesetSummary {
     pub run: String,
     pub workspace: String,
@@ -929,11 +1835,39 @@ pub struct PromoteOutcome {
 /// arise only here (FR-5): a conflicted path is left staged and the base is
 /// not touched, so a re-run after manual resolution completes cleanly. All
 /// base writes happen under the base lock (FR-6).
-pub fn promote(run: &str, paths: &[String]) -> Result<PromoteOutcome> {
-    promote_at(&crate::config::pall8t_root()?, run, paths)
+///
+/// `overrides` is used ONLY for the revision recorded on a successful
+/// promote (so a later `diff` can redact a path the CURRENT cwd's policy
+/// calls secret) — never for classification. Unlike harvest, promote never
+/// re-classifies a path: every entry's `class`/`strategy` was already
+/// pinned into the changeset's manifest at harvest time, under the fork
+/// instance's OWN recorded policy (see `InstanceMeta::policy`,
+/// `harvest_instance`). A promote invoked from a different project's cwd
+/// therefore can't misclassify anything — it only ever applies the class
+/// decision harvest already made. (Secrets never reach this path at all:
+/// `Class::Secret` entries are written back at harvest, never staged.)
+pub fn promote(
+    run: &str,
+    paths: &[String],
+    overrides: &[PolicyRule],
+    revisions_keep: u32,
+) -> Result<PromoteOutcome> {
+    promote_at(
+        &crate::config::pall8t_root()?,
+        run,
+        paths,
+        overrides,
+        revisions_keep,
+    )
 }
 
-fn promote_at(root: &Path, run: &str, paths: &[String]) -> Result<PromoteOutcome> {
+fn promote_at(
+    root: &Path,
+    run: &str,
+    paths: &[String],
+    overrides: &[PolicyRule],
+    revisions_keep: u32,
+) -> Result<PromoteOutcome> {
     let mut manifest = read_manifest(root, run)?;
     let selected = select_entries(&manifest.entries, paths)?;
     let cs = inbox_root(root).join(run);
@@ -941,13 +1875,41 @@ fn promote_at(root: &Path, run: &str, paths: &[String]) -> Result<PromoteOutcome
 
     let mut promoted = Vec::new();
     let mut conflicts = Vec::new();
+    // Distinct from `promoted`: only entries that actually wrote/removed a
+    // base file. A "clean" merge_entry outcome can be a true no-op (base
+    // already matches `theirs`, or both sides agree there's nothing there)
+    // — such a path is still consumed from the changeset (hence in
+    // `promoted`), but recording it as part of a revision would snapshot a
+    // mutation that never happened.
+    let mut written = Vec::new();
     let _lock = lock_base(root)?;
+    // Speculative: this promote may land nothing (every entry conflicts or
+    // is a no-op), in which case the snapshot is discarded rather than
+    // becoming a phantom revision (FR-7). Guarded so a `merge_entry` error
+    // partway through the loop (e.g. `git merge-file` failing) discards the
+    // snapshot too, instead of leaking it.
+    let pending = PendingRevisionGuard(Some(begin_revision_snapshot(root)?));
     for entry in &selected {
         match merge_entry(&base, &cs, entry)? {
-            MergeResult::Clean => promoted.push(entry.path.clone()),
+            MergeResult::Clean(wrote) => {
+                promoted.push(entry.path.clone());
+                if wrote {
+                    written.push(entry.path.clone());
+                }
+            }
             MergeResult::Conflict => conflicts.push(entry.path.clone()),
         }
     }
+    let pending = pending.disarm().expect("armed above");
+    finalize_or_discard(
+        root,
+        pending,
+        written,
+        RevisionOp::Promote,
+        vec![run.to_string()],
+        overrides,
+        revisions_keep,
+    )?;
     drop(_lock);
 
     // Drop the promoted paths from the changeset; conflicted ones stay staged.
@@ -959,7 +1921,14 @@ fn promote_at(root: &Path, run: &str, paths: &[String]) -> Result<PromoteOutcome
 }
 
 enum MergeResult {
-    Clean,
+    /// Landed without a conflict. `true` only if a byte on disk actually
+    /// changed (a `write_atomic` or `remove_file` happened) — `false` for a
+    /// true no-op (the base already matched, or both sides agree there's
+    /// nothing there). The caller still treats the path as consumed from
+    /// the changeset either way; only the `true` paths belong in a
+    /// recorded revision (FR-7 — a revision must correspond to an actual
+    /// mutation).
+    Clean(bool),
     Conflict,
 }
 
@@ -980,9 +1949,9 @@ fn merge_entry(base: &Path, cs: &Path, entry: &Entry) -> Result<MergeResult> {
         (None, Some(t)) => match &current {
             None => {
                 write_atomic(&target, t)?;
-                Ok(MergeResult::Clean)
+                Ok(MergeResult::Clean(true))
             }
-            Some(c) if c == t => Ok(MergeResult::Clean),
+            Some(c) if c == t => Ok(MergeResult::Clean(false)),
             // Same path, different content: union keeps both sides (a conflict
             // only if the content isn't line-mergeable); otherwise it's a
             // directory-union conflict.
@@ -994,14 +1963,20 @@ fn merge_entry(base: &Path, cs: &Path, entry: &Entry) -> Result<MergeResult> {
             // Base still matches the fork point: fast-forward.
             Some(c) if c == a => {
                 write_atomic(&target, t)?;
-                Ok(MergeResult::Clean)
+                Ok(MergeResult::Clean(true))
             }
-            Some(c) if c == t => Ok(MergeResult::Clean),
+            Some(c) if c == t => Ok(MergeResult::Clean(false)),
             Some(c) if union => write_or_conflict(&target, union_merge(a, c, t)?),
             Some(c) => match merge3_text(a, c, t)? {
+                // A merge that reconstructs exactly what's already there
+                // (the run's change was already reflected in the base, or
+                // canceled out by base's own independent change) is not a
+                // mutation — `c` is already read, so compare directly
+                // rather than pay for another read via `write_if_changed`.
+                Some(merged) if merged == *c => Ok(MergeResult::Clean(false)),
                 Some(merged) => {
                     write_atomic(&target, &merged)?;
-                    Ok(MergeResult::Clean)
+                    Ok(MergeResult::Clean(true))
                 }
                 None => Ok(MergeResult::Conflict),
             },
@@ -1009,33 +1984,32 @@ fn merge_entry(base: &Path, cs: &Path, entry: &Entry) -> Result<MergeResult> {
             // version; otherwise it needs a human.
             None if union => {
                 write_atomic(&target, t)?;
-                Ok(MergeResult::Clean)
+                Ok(MergeResult::Clean(true))
             }
             None => Ok(MergeResult::Conflict),
         },
         // Deleted by the run (union doesn't apply to a deletion).
         (Some(a), None) => match &current {
-            None => Ok(MergeResult::Clean),
+            None => Ok(MergeResult::Clean(false)),
             Some(c) if c == a => {
                 std::fs::remove_file(&target)
                     .with_context(|| format!("cannot remove {}", target.display()))?;
-                Ok(MergeResult::Clean)
+                Ok(MergeResult::Clean(true))
             }
             Some(_) => Ok(MergeResult::Conflict),
         },
-        (None, None) => Ok(MergeResult::Clean),
+        (None, None) => Ok(MergeResult::Clean(false)),
     }
 }
 
 /// Writes a successful merge to the base, or reports a conflict when the merge
 /// couldn't be produced (`None`, e.g. non-UTF-8 union input) — the base is left
 /// untouched, so it is never corrupted and the path stays staged (FR-5).
+/// `write_if_changed`: a union merge that reconstructs exactly what's
+/// already there (the run's lines were already present) is not a mutation.
 fn write_or_conflict(target: &Path, merged: Option<Vec<u8>>) -> Result<MergeResult> {
     match merged {
-        Some(m) => {
-            write_atomic(target, &m)?;
-            Ok(MergeResult::Clean)
-        }
+        Some(m) => Ok(MergeResult::Clean(write_if_changed(target, &m)?)),
         None => Ok(MergeResult::Conflict),
     }
 }
@@ -1156,14 +2130,28 @@ pub struct MergeReport {
 /// land; conflicted ones and every later changeset stay staged) — no rollback,
 /// consistent with FR-5/FR-6. Pure composition of the existing harvest/show/
 /// promote internals; no new merge logic.
-pub fn merge(run: Option<&str>, overrides: &[PolicyRule]) -> Result<MergeReport> {
-    merge_at(&crate::config::pall8t_root()?, run, overrides)
+pub fn merge(
+    run: Option<&str>,
+    overrides: &[PolicyRule],
+    revisions_keep: u32,
+) -> Result<MergeReport> {
+    merge_at(
+        &crate::config::pall8t_root()?,
+        run,
+        overrides,
+        revisions_keep,
+    )
 }
 
-fn merge_at(root: &Path, run: Option<&str>, overrides: &[PolicyRule]) -> Result<MergeReport> {
+fn merge_at(
+    root: &Path,
+    run: Option<&str>,
+    overrides: &[PolicyRule],
+    revisions_keep: u32,
+) -> Result<MergeReport> {
     let harvested = match run {
-        Some(r) => harvest_run(root, r, overrides)?,
-        None => harvest_finished_at(root, overrides)?,
+        Some(r) => harvest_run(root, r, overrides, revisions_keep)?,
+        None => harvest_finished_at(root, overrides, revisions_keep)?,
     };
     let targets = match run {
         Some(r) if changeset_exists(root, r) => vec![r.to_string()],
@@ -1187,7 +2175,7 @@ fn merge_at(root: &Path, run: Option<&str>, overrides: &[PolicyRule]) -> Result<
             continue;
         }
         let shown = show_at(root, &r)?;
-        let outcome = promote_at(root, &r, &[])?;
+        let outcome = promote_at(root, &r, &[], overrides, revisions_keep)?;
         let stop = !outcome.conflicts.is_empty();
         steps.push(MergeStep {
             run: r,
@@ -1206,7 +2194,12 @@ fn merge_at(root: &Path, run: Option<&str>, overrides: &[PolicyRule]) -> Result<
 /// name if it actually harvested one. Empty if the instance is gone (already
 /// harvested, or the run only produced a changeset); errors if the run is
 /// still live.
-fn harvest_run(root: &Path, run: &str, overrides: &[PolicyRule]) -> Result<Vec<String>> {
+fn harvest_run(
+    root: &Path,
+    run: &str,
+    overrides: &[PolicyRule],
+    revisions_keep: u32,
+) -> Result<Vec<String>> {
     let inst = instances_root(root).join(run);
     if !inst.exists() {
         return Ok(Vec::new());
@@ -1217,7 +2210,7 @@ fn harvest_run(root: &Path, run: &str, overrides: &[PolicyRule]) -> Result<Vec<S
             "run {run} is still running — cannot merge a live run"
         ));
     }
-    if harvest_instance(root, &inst, overrides)? {
+    if harvest_instance(root, &inst, overrides, revisions_keep)? {
         Ok(vec![run.to_string()])
     } else {
         Ok(Vec::new()) // concurrently harvested by another process
@@ -1259,8 +2252,238 @@ fn select_entries(entries: &[Entry], paths: &[String]) -> Result<Vec<Entry>> {
 }
 
 // ---------------------------------------------------------------------------
+// Instance & inbox lifecycle (FR-9): ls, rm, gc
+// ---------------------------------------------------------------------------
+
+/// An instance's liveness as `ls` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstanceStatus {
+    /// The forking `pall8t run` is still alive.
+    Running,
+    /// The forker has exited; awaiting lazy or explicit harvest.
+    Finished,
+}
+
+impl std::fmt::Display for InstanceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            InstanceStatus::Running => "running",
+            InstanceStatus::Finished => "finished",
+        })
+    }
+}
+
+/// One row of `pall8t home ls`.
+#[derive(Serialize)]
+pub struct InstanceSummary {
+    pub run: String,
+    pub workspace: String,
+    pub created: u64,
+    pub status: InstanceStatus,
+    pub age_secs: u64,
+    /// A `running` instance old enough that a real foreground run is
+    /// implausible — more likely the forker pid was recycled by an
+    /// unrelated process after the actual run crashed (the FR-9 stall
+    /// residual), leaving the instance stuck as seemingly-live forever.
+    /// Surfaced, not auto-resolved: `rm --force` is the user's call.
+    pub suspicious: bool,
+}
+
+/// Lists live/finished instances (FR-9 `ls`), newest fork first.
+pub fn list_instances() -> Result<Vec<InstanceSummary>> {
+    list_instances_at(&crate::config::pall8t_root()?)
+}
+
+fn list_instances_at(root: &Path) -> Result<Vec<InstanceSummary>> {
+    let dir = instances_root(root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let now = now_secs();
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_dir() || name.ends_with(".partial") || name.ends_with(".discard")
+        {
+            // `.partial`/`.discard` are transient litter, not instances —
+            // `gc` (or the lazy sweep in harvest) is what clears them.
+            continue;
+        }
+        let meta = match read_meta(&entry.path()) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("pall8t: warning: skipping instance {name}: {e:#}");
+                continue;
+            }
+        };
+        let age_secs = now.saturating_sub(meta.created);
+        let running = is_forker_alive(meta.forker_pid);
+        out.push(InstanceSummary {
+            run: meta.run,
+            workspace: meta.workspace,
+            created: meta.created,
+            status: if running {
+                InstanceStatus::Running
+            } else {
+                InstanceStatus::Finished
+            },
+            age_secs,
+            suspicious: running && age_secs > SUSPICIOUS_RUNNING_SECS,
+        });
+    }
+    out.sort_by(|a, b| b.created.cmp(&a.created).then(a.run.cmp(&b.run)));
+    Ok(out)
+}
+
+/// Removes an instance without harvesting it (FR-9 `rm`) — the escape hatch
+/// when harvest can never happen, e.g. the pid-recycling stall (`ls` shows
+/// `suspicious`) or a run the user simply wants to abandon. Refuses a run
+/// whose forker pid looks alive unless `force`, since that discards whatever
+/// the run produced with no chance to harvest it first.
+pub fn rm(run: &str, force: bool) -> Result<()> {
+    rm_at(&crate::config::pall8t_root()?, run, force)
+}
+
+fn rm_at(root: &Path, run: &str, force: bool) -> Result<()> {
+    // Under the base lock: `rm` and a concurrent `harvest` must not both act
+    // on the same instance (harvest drains-then-retires it under this same
+    // lock; `rm` deletes it outright).
+    let _lock = lock_base(root)?;
+    let inst = instances_root(root).join(run);
+    if !inst.exists() {
+        return Err(anyhow!("no instance named {run} (see `pall8t home ls`)"));
+    }
+    let meta = read_meta(&inst)?;
+    if is_forker_alive(meta.forker_pid) && !force {
+        return Err(anyhow!(
+            "run {run}'s forker (pid {}) appears to still be running — pass --force to \
+             remove it anyway. If the pid was recycled by an unrelated process after the \
+             real run ended (see `pall8t home ls`), that's exactly what --force is for and \
+             this just discards the run's unharvested changes. But if the run IS still \
+             live, its instance root may be bind-mounted as /home/dev inside a running \
+             container right now — removing it out from under that container corrupts \
+             the live agent's home, not just its unharvested changes.",
+            meta.forker_pid
+        ));
+    }
+    std::fs::remove_dir_all(&inst)
+        .with_context(|| format!("cannot remove instance {}", inst.display()))?;
+    Ok(())
+}
+
+/// A pending changeset older than the configured TTL — surfaced by `gc` as a
+/// warning, never auto-deleted (FR-9: dropping unreviewed knowledge is a
+/// user decision).
+#[derive(Serialize)]
+pub struct StaleChangeset {
+    pub run: String,
+    pub age_days: u64,
+}
+
+/// Result of `pall8t home gc` (FR-9).
+#[derive(Serialize)]
+pub struct GcReport {
+    pub removed_partials: usize,
+    pub removed_discards: usize,
+    /// Orphaned `revisions/pending-*.partial` snapshots (a `kill -9` between
+    /// [`begin_revision_snapshot`] and [`finalize_revision`]/
+    /// [`discard_revision_snapshot`] — the in-process [`PendingRevisionGuard`]
+    /// can't help against a signal that skips `Drop`, so this is the actual
+    /// crash-safety net for that window, per spec acceptance #7).
+    pub removed_revision_snapshots: usize,
+    pub revisions_pruned: usize,
+    pub stale_changesets: Vec<StaleChangeset>,
+}
+
+/// Removes stray `revisions/pending-*.partial` directories: a
+/// [`begin_revision_snapshot`] whose caller was killed before
+/// [`finalize_revision`] or [`discard_revision_snapshot`] ran. Always safe
+/// to remove once found — a pending snapshot is only ever created inside a
+/// `lock_base` critical section, and this function is only ever called
+/// inside one too, so nothing else can still be writing one.
+fn sweep_revision_partials(root: &Path) -> Result<usize> {
+    let dir = revisions_root(root);
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_dir() && name.starts_with("pending-") && name.ends_with(".partial")
+        {
+            std::fs::remove_dir_all(entry.path())
+                .with_context(|| format!("cannot remove stray revision snapshot {name}"))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Cleans up (FR-9 `gc`): orphaned `.partial`/`.discard` instance
+/// tombstones, orphaned revision snapshots, revisions beyond
+/// `revisions_keep`, and warns (never deletes) about inbox changesets older
+/// than `inbox_ttl_days`.
+pub fn gc(revisions_keep: u32, inbox_ttl_days: u32) -> Result<GcReport> {
+    gc_at(
+        &crate::config::pall8t_root()?,
+        revisions_keep,
+        inbox_ttl_days,
+    )
+}
+
+fn gc_at(root: &Path, revisions_keep: u32, inbox_ttl_days: u32) -> Result<GcReport> {
+    let (removed_partials, removed_discards) = sweep_tombstones(root)?;
+    let (removed_revision_snapshots, revisions_pruned) = {
+        // Both read/delete under `revisions/`; serialize with any concurrent
+        // finalize (which also prunes) and with a fork/harvest/promote/
+        // rollback that might be mid-way through its own pending snapshot.
+        let _lock = lock_base(root)?;
+        let swept = sweep_revision_partials(root)?;
+        let pruned = prune_revisions(root, revisions_keep)?;
+        (swept, pruned)
+    };
+    let ttl_secs = u64::from(inbox_ttl_days) * 86_400;
+    let now = now_secs();
+    let mut stale_changesets = Vec::new();
+    for cs in list_changesets_at(root)? {
+        let age_secs = now.saturating_sub(cs.created);
+        if age_secs > ttl_secs {
+            stale_changesets.push(StaleChangeset {
+                run: cs.run,
+                age_days: age_secs / 86_400,
+            });
+        }
+    }
+    Ok(GcReport {
+        removed_partials,
+        removed_discards,
+        removed_revision_snapshots,
+        revisions_pruned,
+        stale_changesets,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/// Removes a directory tree, tolerating it already being gone: a concurrent
+/// process (`gc`'s sweep, another `promote`/`drop`, …) can legitimately win
+/// the exact same removal race once the caller's own critical section
+/// already made the removal safe and desired — that must not fail an
+/// operation which, from the caller's perspective, already succeeded. Any
+/// OTHER error still fails normally. `what` names the thing being removed,
+/// for the error message.
+fn remove_dir_all_tolerant(path: &Path, what: &str) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow!(e).context(format!("cannot remove {what} {}", path.display()))),
+    }
+}
 
 /// Sorted union of the relative file paths under `theirs` and `ancestor` —
 /// every path that could have been added, modified, or deleted by the run.
@@ -1322,6 +2545,29 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Writes `bytes` to `path` only if they differ from what's already there,
+/// returning whether it actually wrote. A merge/write-back whose result
+/// happens to be byte-identical to the current content (e.g. two runs
+/// concurrently refreshing a secret to the same token, or a union merge
+/// whose new lines were already present) must not count as a "wrote" for
+/// revision-recording purposes — FR-7 says a revision corresponds to an
+/// actual mutation, not merely an attempted one.
+///
+/// Callers that don't already have the current content in hand (the Secret
+/// write-back here, and `write_or_conflict`'s union path, which has no
+/// caller-side read to reuse) should call this. A caller that already read
+/// the current bytes for its own merge logic (the State branches just
+/// below; `merge_entry`'s 3-way-text-merge branch) should compare directly
+/// against what it already has instead — same "skip if unchanged" rule,
+/// without paying for a second read of the same file.
+fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if read_opt(path).as_deref() == Some(bytes) {
+        return Ok(false);
+    }
+    write_atomic(path, bytes)?;
+    Ok(true)
+}
+
 /// `path` with `suffix` appended to its final component (same parent).
 fn sibling_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
@@ -1368,8 +2614,9 @@ fn change_label(c: Change) -> &'static str {
 }
 
 /// UTC `YYYY-MM-DD HH:MM:SSZ` from a Unix timestamp, without pulling in a
-/// date crate (Howard Hinnant's days-from-civil, inverted).
-fn fmt_epoch(secs: u64) -> String {
+/// date crate (Howard Hinnant's days-from-civil, inverted). `pub` so the CLI
+/// can render `log`/`ls` timestamps consistently with `show`'s.
+pub fn fmt_epoch(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);

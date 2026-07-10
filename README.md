@@ -90,7 +90,7 @@ then, inside the container (one-time, persists in the container home), add `"tea
 
 ## Known limitations (v1)
 
-- **Shared home under parallel runs.** All containers share `~/.pall8t/home` rw; Claude Code has known `~/.claude.json` corruption issues under concurrent sessions — the same conditions as parallel agents on the host. Accepted for v1 (per-run home clones are roadmap item 1).
+- **Shared home under parallel runs (default mode only).** The default `[home] mode = "shared"` has all containers share `~/.pall8t/home` rw; Claude Code has known `~/.claude.json` corruption issues under concurrent sessions — the same conditions as parallel agents on the host. Set `mode = "isolated"` to opt in to per-run home forks with automatic harvest and explicit promote/merge (`pall8t home inbox|show|promote|drop|merge`), plus revision history and lifecycle management (`pall8t home log|diff|rollback|ls|rm|gc`) — see [docs/specs/home-compositor.md](docs/specs/home-compositor.md). Still off by default in v1; only the pluggable local-Claude merge resolver and the non-APFS fork fallback remain on the roadmap.
 - **No read-only mounts** (apple/container limitation) — reference repos are protected by `git clone --local` duplication instead.
 - **Workspace isolation is the caller's responsibility.** Two agents in the same directory will step on each other; use worktrees.
 
