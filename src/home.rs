@@ -124,7 +124,7 @@ pub enum Change {
 // ---------------------------------------------------------------------------
 
 /// Built-in classification for Claude Code homes, embedded at compile time
-/// from `policies/claude.toml` so the rule set is reviewed and edited as
+/// from `rules/claude.toml` so the rule set is reviewed and edited as
 /// data, not Rust code. The file uses the same rule format as a project's
 /// `[[home.policy]]` and documents its own ordering constraints (first
 /// match wins). Parsed once, on first use; the unit tests reject an
@@ -137,8 +137,8 @@ pub fn default_rules() -> &'static [PolicyRule] {
         rules: Vec<PolicyRule>,
     }
     static RULES: std::sync::LazyLock<Vec<PolicyRule>> = std::sync::LazyLock::new(|| {
-        let file: PolicyFile = toml::from_str(include_str!("../policies/claude.toml"))
-            .expect("embedded policies/claude.toml must parse (pinned by unit test)");
+        let file: PolicyFile = toml::from_str(include_str!("../rules/claude.toml"))
+            .expect("embedded rules/claude.toml must parse (pinned by unit test)");
         file.rules
     });
     &RULES
