@@ -653,6 +653,11 @@ fn begin_revision_snapshot(root: &Path) -> Result<PathBuf> {
         std::process::id(),
         next_seq()
     ));
+    // `clone_tree`'s destination leaf must not exist, but its parent must —
+    // create `partial` itself (the fresh pid+seq name guarantees `snapshot`
+    // beneath it doesn't exist yet), mirroring `fork_instance`'s
+    // partial/root split.
+    std::fs::create_dir_all(&partial)?;
     let base = base_dir(root);
     if base.exists() {
         clone_tree(&base, &partial.join("snapshot"))?;
