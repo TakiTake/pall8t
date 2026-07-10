@@ -31,11 +31,14 @@ pub fn host_ids() -> (u32, u32) {
 /// between them.
 pub(crate) fn sha256_hex_prefix(bytes: &[u8], n: usize) -> String {
     use sha2::{Digest, Sha256};
+    use std::fmt::Write;
     Sha256::digest(bytes)
         .iter()
         .take(n)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// pall8t-<path key of cwd>-<pid> (see [`crate::repos::path_key`]). The

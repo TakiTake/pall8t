@@ -1,0 +1,11 @@
+#!/bin/sh
+# pall8t pre-commit lint gate. Enable once per clone with:
+#   git config core.hooksPath .githooks    (or: mise run setup-hooks)
+# Delegates to the shared lint script so it stays in lockstep with
+# `mise run lint` and CI. Skip for a single commit with `git commit --no-verify`.
+#
+# Deliberately lints the working tree, not the staged index: no
+# `git stash --keep-index` dance (its own failure modes outweigh the benefit
+# for this repo). A partial-stage commit is thus checked against the working
+# copy, not exactly what's committed — CI is the authoritative gate.
+exec "$(git rev-parse --show-toplevel)/scripts/lint.sh"

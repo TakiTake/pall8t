@@ -163,7 +163,7 @@ fn run() -> Result<()> {
         Cmd::Run { command } => cmd_run(command),
         Cmd::Build => cmd_build(),
         Cmd::Ls { json } => cmd_ls(json),
-        Cmd::Exec { id, command } => cmd_exec(&id, command),
+        Cmd::Exec { id, command } => cmd_exec(&id, &command),
         Cmd::Stop { id } => cmd_stop(&id),
         Cmd::Home { cmd } => cmd_home(cmd),
     }
@@ -214,9 +214,9 @@ fn workspace_image(
 /// TTY passthrough — the kernel delivers signals straight to the
 /// `container` CLI and the exit code needs no forwarding, because pall8t
 /// is no longer there (NFR-4).
-fn exec_container(argv: Vec<String>) -> Result<()> {
+fn exec_container(argv: &[String]) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let err = std::process::Command::new("container").args(&argv).exec();
+    let err = std::process::Command::new("container").args(argv).exec();
     Err(anyhow!(err).context("failed to exec `container`"))
 }
 
@@ -275,7 +275,7 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
         tty: stdin_is_tty(),
         command,
     };
-    exec_container(container::run_argv(&spec))
+    exec_container(&container::run_argv(&spec))
 }
 
 fn cmd_build() -> Result<()> {
@@ -301,7 +301,7 @@ fn cmd_ls(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_exec(id: &str, command: Vec<String>) -> Result<()> {
+fn cmd_exec(id: &str, command: &[String]) -> Result<()> {
     if command.is_empty() {
         return Err(anyhow!(
             "no command given — usage: pall8t exec <id> -- <cmd>…"
@@ -311,9 +311,9 @@ fn cmd_exec(id: &str, command: Vec<String>) -> Result<()> {
     // The container's own initial workdir (the workspace) — best-effort;
     // without it the command runs in the image WORKDIR.
     let workdir = container::workdir(id);
-    exec_container(container::exec_argv(
+    exec_container(&container::exec_argv(
         id,
-        &command,
+        command,
         stdin_is_tty(),
         workdir.as_deref(),
     ))
@@ -441,7 +441,7 @@ fn cmd_home(cmd: HomeCmd) -> Result<()> {
             println!("dropped {run}");
             Ok(())
         }
-        HomeCmd::Merge { run } => cmd_home_merge(run),
+        HomeCmd::Merge { run } => cmd_home_merge(run.as_deref()),
         HomeCmd::Log { json } => cmd_home_log(json),
         HomeCmd::Diff { seq } => {
             print!("{}", home::diff(seq, &cwd_home_config().policy)?);
@@ -463,9 +463,9 @@ fn cmd_home(cmd: HomeCmd) -> Result<()> {
     }
 }
 
-fn cmd_home_merge(run: Option<String>) -> Result<()> {
+fn cmd_home_merge(run: Option<&str>) -> Result<()> {
     let cfg = cwd_home_config();
-    let report = home::merge(run.as_deref(), &cfg.policy, cfg.revisions_keep)?;
+    let report = home::merge(run, &cfg.policy, cfg.revisions_keep)?;
     if report.steps.is_empty() {
         // Harvest may still have had side effects (secret/state write-back)
         // even with no knowledge changeset to promote — say so honestly.

@@ -5,3 +5,6 @@
 # .claude/settings.json and .claude/skills/ ARE tracked; only these are not.
 .claude/worktrees/
 .claude/settings.local.json
+
+# Serena (LSP MCP server) writes per-project config/memories here on activation.
+.serena/

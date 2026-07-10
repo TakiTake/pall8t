@@ -30,10 +30,10 @@ pub fn slug(name: &str) -> String {
 /// the key readable. Shared by container names, image tag bases, and
 /// reference-repo clone dirs so the derivation can't drift between them.
 pub(crate) fn path_key(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "workspace".to_string());
+    let name = path.file_name().map_or_else(
+        || "workspace".to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
     format!(
         "{}-{}",
         slug(&name),
@@ -42,7 +42,7 @@ pub(crate) fn path_key(path: &Path) -> String {
 }
 
 fn git(args: &[&str]) -> Result<String> {
-    let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let argv: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
     crate::util::run_ok("git", &argv)
 }
 

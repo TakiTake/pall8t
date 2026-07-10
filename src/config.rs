@@ -287,11 +287,11 @@ mod tests {
     #[test]
     fn revisions_keep_and_inbox_ttl_merge_per_field() {
         let global = parse(
-            r#"
+            r"
             [home]
             revisions_keep = 5
             inbox_ttl_days = 3
-            "#,
+            ",
         );
         // Project overrides only one of the two.
         let project = parse("[home]\nrevisions_keep = 50\n");
@@ -385,10 +385,10 @@ mod tests {
             "#,
         );
         let project = parse(
-            r#"
+            r"
             [container]
             cpus = 2
-            "#,
+            ",
         );
         let cfg = merge(global, project);
         assert_eq!(cfg.cpus, 2, "project field wins");

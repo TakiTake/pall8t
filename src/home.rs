@@ -43,6 +43,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -94,6 +95,9 @@ pub enum MergeStrategy {
 }
 
 impl MergeStrategy {
+    // `&self`, not `self`: serde's `skip_serializing_if` calls this by
+    // reference, so the trivially-copy-by-ref suggestion doesn't apply.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn is_inherit(&self) -> bool {
         matches!(self, MergeStrategy::Inherit)
     }
@@ -534,7 +538,7 @@ fn clone_tree(src: &Path, dst: &Path) -> Result<()> {
         // that's exactly what sent a prior ENOENT regression down the
         // wrong debugging path (see `clone_into`'s regression test).
         let hint = match err.raw_os_error() {
-            Some(libc::EXDEV) | Some(libc::ENOTSUP) => {
+            Some(libc::EXDEV | libc::ENOTSUP) => {
                 " (src/dst must be on the same APFS volume — Phase 1 has no \
                  cross-volume fallback; that's Phase 3)"
             }
@@ -734,7 +738,7 @@ impl Drop for PendingRevisionGuard {
 /// explicit `gc` catches. Must be called with the base lock held.
 fn finalize_revision(
     root: &Path,
-    partial: PathBuf,
+    partial: &Path,
     op: RevisionOp,
     runs: Vec<String>,
     paths: Vec<String>,
@@ -752,7 +756,7 @@ fn finalize_revision(
     };
     std::fs::write(partial.join("meta.toml"), toml::to_string(&meta)?)?;
     let dest = revisions_root(root).join(seq_name(seq));
-    std::fs::rename(&partial, &dest).with_context(|| format!("cannot publish revision {seq}"))?;
+    std::fs::rename(partial, &dest).with_context(|| format!("cannot publish revision {seq}"))?;
     prune_revisions(root, keep)?;
     Ok(seq)
 }
@@ -769,7 +773,7 @@ fn finalize_revision(
 /// [`finalize_revision`] directly instead of through this helper.
 fn finalize_or_discard(
     root: &Path,
-    pending: PathBuf,
+    pending: &Path,
     written: Vec<String>,
     op: RevisionOp,
     runs: Vec<String>,
@@ -777,7 +781,7 @@ fn finalize_or_discard(
     keep: u32,
 ) -> Result<()> {
     if written.is_empty() {
-        discard_revision_snapshot(&pending);
+        discard_revision_snapshot(pending);
     } else {
         finalize_revision(root, pending, op, runs, written, policy, keep)?;
     }
@@ -923,7 +927,7 @@ fn diff_entries(
         };
         out.push(DiffEntry {
             path: rel,
-            change: classify_change(&b, &a),
+            change: classify_change(b.as_ref(), a.as_ref()),
             secret,
             text_diff,
         });
@@ -969,7 +973,7 @@ fn text_diff(before: &Path, after: &Path) -> Option<String> {
     // exit 0 = identical (shouldn't happen, caller already filtered), 1 =
     // differences rendered, >1 = error (e.g. binary content) — don't render.
     match out.status.code() {
-        Some(0) | Some(1) => String::from_utf8(out.stdout).ok(),
+        Some(0 | 1) => String::from_utf8(out.stdout).ok(),
         _ => None,
     }
 }
@@ -1036,20 +1040,21 @@ fn diff_at(root: &Path, seq: u64, overrides: &[PolicyRule]) -> Result<String> {
     let mut s = format!("revision {seq}: {} path(s) changed\n", entries.len());
     for e in &entries {
         if e.secret {
-            s.push_str(&format!(
-                "  {:<8} {}  [secret — content not shown]\n",
+            let _ = writeln!(
+                s,
+                "  {:<8} {}  [secret — content not shown]",
                 change_label(e.change),
                 e.path
-            ));
+            );
         } else if let Some(d) = &e.text_diff {
-            s.push_str(&format!("  {:<8} {}\n", change_label(e.change), e.path));
+            let _ = writeln!(s, "  {:<8} {}", change_label(e.change), e.path);
             for line in d.lines() {
                 s.push_str("    ");
                 s.push_str(line);
                 s.push('\n');
             }
         } else {
-            s.push_str(&format!("  {:<8} {}\n", change_label(e.change), e.path));
+            let _ = writeln!(s, "  {:<8} {}", change_label(e.change), e.path);
         }
     }
     Ok(s)
@@ -1139,7 +1144,7 @@ fn rollback_at(root: &Path, seq: u64, overrides: &[PolicyRule], revisions_keep: 
     let pending = pending.disarm().expect("armed above");
     finalize_revision(
         root,
-        pending,
+        &pending,
         RevisionOp::Rollback,
         Vec::new(),
         touched,
@@ -1240,7 +1245,7 @@ fn is_forker_alive(pid: u32) -> bool {
     }
     // SAFETY: `kill` with signal 0 performs only permission/existence checks
     // and has no memory preconditions.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+    if unsafe { libc::kill(pid.cast_signed(), 0) } == 0 {
         return true;
     }
     !matches!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
@@ -1371,7 +1376,7 @@ fn harvest_instance(
         if let Some(pending) = pending_revision {
             finalize_or_discard(
                 root,
-                pending,
+                &pending,
                 actually_written,
                 RevisionOp::Harvest,
                 vec![meta.run.clone()],
@@ -1495,8 +1500,8 @@ fn apply_harvest_changes(
                 }
             }
             Class::Knowledge => {
-                let change = classify_change(&ancestor, &theirs);
-                stage_path(root, run, &rel, &ancestor, &theirs)?;
+                let change = classify_change(ancestor.as_ref(), theirs.as_ref());
+                stage_path(root, run, &rel, ancestor.as_ref(), theirs.as_ref())?;
                 staged.push(Entry {
                     path: rel,
                     class: cls.class,
@@ -1613,7 +1618,7 @@ fn state_merge_bytes(
                 serde_json::from_slice(cur).context("base state is not valid JSON")?;
             let anc_val: Value = ancestor
                 .and_then(|b| serde_json::from_slice(b).ok())
-                .unwrap_or_else(|| Value::Object(Default::default()));
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
             merge3_json(&anc_val, &base_val, &theirs_val)
         }
     };
@@ -1662,8 +1667,8 @@ fn stage_path(
     root: &Path,
     run: &str,
     rel: &str,
-    ancestor: &Option<Vec<u8>>,
-    theirs: &Option<Vec<u8>>,
+    ancestor: Option<&Vec<u8>>,
+    theirs: Option<&Vec<u8>>,
 ) -> Result<()> {
     let cs = inbox_root(root).join(run);
     if let Some(a) = ancestor {
@@ -1675,7 +1680,7 @@ fn stage_path(
     Ok(())
 }
 
-fn classify_change(ancestor: &Option<Vec<u8>>, theirs: &Option<Vec<u8>>) -> Change {
+fn classify_change(ancestor: Option<&Vec<u8>>, theirs: Option<&Vec<u8>>) -> Change {
     match (ancestor, theirs) {
         (None, _) => Change::Added,
         (Some(_), None) => Change::Deleted,
@@ -1810,13 +1815,14 @@ fn show_at(root: &Path, run: &str) -> Result<String> {
     );
     for e in &m.entries {
         let flag = if e.explicit { "" } else { " (unclassified)" };
-        s.push_str(&format!(
-            "    {:<8} {:<9} {}{}\n",
+        let _ = writeln!(
+            s,
+            "    {:<8} {:<9} {}{}",
             change_label(e.change),
             class_label(e.class),
             e.path,
             flag
-        ));
+        );
     }
     Ok(s)
 }
@@ -1882,7 +1888,7 @@ fn promote_at(
     // `promoted`), but recording it as part of a revision would snapshot a
     // mutation that never happened.
     let mut written = Vec::new();
-    let _lock = lock_base(root)?;
+    let lock = lock_base(root)?;
     // Speculative: this promote may land nothing (every entry conflicts or
     // is a no-op), in which case the snapshot is discarded rather than
     // becoming a phantom revision (FR-7). Guarded so a `merge_entry` error
@@ -1903,14 +1909,14 @@ fn promote_at(
     let pending = pending.disarm().expect("armed above");
     finalize_or_discard(
         root,
-        pending,
+        &pending,
         written,
         RevisionOp::Promote,
         vec![run.to_string()],
         overrides,
         revisions_keep,
     )?;
-    drop(_lock);
+    drop(lock);
 
     // Drop the promoted paths from the changeset; conflicted ones stay staged.
     prune_changeset(&cs, &mut manifest, &promoted)?;
@@ -2592,8 +2598,7 @@ fn next_seq() -> u64 {
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn class_label(c: Class) -> &'static str {
@@ -2616,8 +2621,12 @@ fn change_label(c: Change) -> &'static str {
 /// UTC `YYYY-MM-DD HH:MM:SSZ` from a Unix timestamp, without pulling in a
 /// date crate (Howard Hinnant's days-from-civil, inverted). `pub` so the CLI
 /// can render `log`/`ls` timestamps consistently with `show`'s.
+// The single-letter bindings (y/m/d, z, h/mi/s) mirror Howard Hinnant's
+// days-from-civil reference algorithm; renaming them would only obscure the
+// correspondence with the source.
+#[allow(clippy::many_single_char_names)]
 pub fn fmt_epoch(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
+    let days = (secs / 86_400).cast_signed();
     let rem = secs % 86_400;
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     // days since 1970-01-01 -> civil date

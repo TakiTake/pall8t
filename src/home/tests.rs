@@ -129,6 +129,10 @@ fn embedded_claude_policy_is_well_formed() {
         // would interleave both sides into invalid JSON, and neither the
         // parse nor validate_policy would object. Built-ins may only union
         // append-only line formats.
+        // `r.glob` is a glob pattern (e.g. `**/*.jsonl`), not a filesystem
+        // path, so `ends_with` is a literal suffix check — Path::extension
+        // would misread the pattern.
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
         if r.strategy == Some(MergeStrategy::Union) {
             assert!(
                 r.glob.ends_with(".jsonl"),
@@ -964,7 +968,7 @@ fn backdate_changeset(root: &TempRoot, run: &str, days_ago: u64) {
 fn set_mtime_seconds_ago(path: &Path, secs_ago: u64) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    let epoch = now_secs().saturating_sub(secs_ago) as libc::time_t;
+    let epoch = now_secs().saturating_sub(secs_ago).cast_signed();
     let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
     let times = [
         libc::timeval {

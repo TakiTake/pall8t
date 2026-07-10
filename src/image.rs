@@ -25,29 +25,26 @@ pub struct ResolvedImage {
 /// builds); the shared default gets `pall8t-base`, so every project on
 /// the default image reuses one build.
 pub fn resolve(cwd: &Path, cfg: &Config, uid: u32, gid: u32) -> Result<ResolvedImage> {
-    let (containerfile, base) = match &cfg.containerfile {
-        Some(p) => {
-            let p = repos::expand_tilde(p);
-            let p = if p.is_absolute() { p } else { cwd.join(p) };
-            if !p.is_file() {
-                return Err(anyhow!(
-                    "configured containerfile {} does not exist",
-                    p.display()
-                ));
-            }
-            (p, project_base(cwd))
+    let (containerfile, base) = if let Some(p) = &cfg.containerfile {
+        let p = repos::expand_tilde(p);
+        let p = if p.is_absolute() { p } else { cwd.join(p) };
+        if !p.is_file() {
+            return Err(anyhow!(
+                "configured containerfile {} does not exist",
+                p.display()
+            ));
         }
-        None => {
-            let local = cwd.join("Containerfile");
-            if local.is_file() {
-                (local, project_base(cwd))
-            } else {
-                (
-                    container::default_containerfile_path()
-                        .context("cannot write the default Containerfile")?,
-                    "pall8t-base".to_string(),
-                )
-            }
+        (p, project_base(cwd))
+    } else {
+        let local = cwd.join("Containerfile");
+        if local.is_file() {
+            (local, project_base(cwd))
+        } else {
+            (
+                container::default_containerfile_path()
+                    .context("cannot write the default Containerfile")?,
+                "pall8t-base".to_string(),
+            )
         }
     };
     let hash = hash_with_retry(&containerfile)
@@ -213,7 +210,7 @@ fn prune_superseded(resolved: &ResolvedImage, uid: u32, gid: u32) {
                 match container::image_delete(&old) {
                     Ok(()) => eprintln!("pall8t: pruned superseded image {old}"),
                     Err(e) => {
-                        eprintln!("pall8t: warning: could not prune superseded image {old}: {e:#}")
+                        eprintln!("pall8t: warning: could not prune superseded image {old}: {e:#}");
                     }
                 }
             }

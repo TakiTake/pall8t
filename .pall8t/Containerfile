@@ -10,7 +10,7 @@ ARG GID=501
 # without an interactive host-key prompt.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git sudo ripgrep less vim openssh-client tmux jq \
-      build-essential pkg-config && \
+      build-essential pkg-config mold && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -35,16 +35,51 @@ RUN printf '%s\n' \
 # Rust goes to /usr/local, NOT /home/dev: pall8t mounts a persistent home
 # over /home/dev at runtime, which would shadow a ~/.cargo install. The
 # aarch64-apple-darwin target is added for the cross-target clippy gate on
-# cfg(target_os = "macos") code (the build host is Linux).
+# cfg(target_os = "macos") code (the build host is Linux). rust-analyzer (the
+# LSP) plus rust-src (which it needs to resolve std) are added on top of the
+# default profile's rustc/cargo/rustfmt/clippy for editor/IDE tooling. mold is
+# wired in as the default linker for the Linux host targets only via a global
+# cargo config in CARGO_HOME (not shadowed by the persistent /home/dev mount);
+# the darwin cross-target is left on the default linker since mold can't emit
+# Mach-O. Caveat: `target.<triple>.rustflags` and `build.rustflags` are
+# mutually exclusive in cargo — a project that sets its own `build.rustflags`
+# would have it silently ignored under this config. That's a non-issue here:
+# this is pall8t's *own* dev image and pall8t sets no `build.rustflags`; the
+# image shipped to arbitrary user projects is the repo-root Containerfile,
+# which carries none of this.
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | \
       sh -s -- -y --no-modify-path --default-toolchain 1.96 --profile default && \
     rustup target add aarch64-apple-darwin && \
+    rustup component add rust-analyzer rust-src && \
+    printf '%s\n' \
+      '[target.x86_64-unknown-linux-gnu]' \
+      'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
+      '[target.aarch64-unknown-linux-gnu]' \
+      'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
+      > /usr/local/cargo/config.toml && \
     chown -R ${UID}:${GID} /usr/local/rustup /usr/local/cargo && \
     echo 'export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH' \
       > /etc/profile.d/rust.sh
+
+# Serena: an MCP server that gives the agent LSP-powered semantic code tools
+# (find_symbol, find_referencing_symbols, ...) so it navigates by symbols
+# instead of grepping files each time. Wired up in the repo's .mcp.json. Like
+# Rust, everything lands under /usr/local (uv itself, its managed Python, the
+# tool venv, and the cache) so the persistent /home/dev mount can't shadow it;
+# the whole tree is chowned to dev so the server can write its cache at runtime.
+# Serena's Rust backend is rust-analyzer; it uses the one installed above when
+# it honors $PATH, and otherwise self-provisions its own copy at runtime.
+ENV UV_INSTALL_DIR=/usr/local/bin \
+    UV_TOOL_DIR=/usr/local/uv/tools \
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_PYTHON_INSTALL_DIR=/usr/local/uv/python \
+    UV_CACHE_DIR=/usr/local/uv/cache
+RUN curl -LsSf https://astral.sh/uv/install.sh | env INSTALLER_NO_MODIFY_PATH=1 sh && \
+    uv tool install -p 3.13 serena-agent && \
+    chown -R ${UID}:${GID} /usr/local/uv
 
 USER dev
 WORKDIR /work

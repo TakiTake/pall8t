@@ -2,6 +2,10 @@
 name = "pall8t"
 version = "0.4.0"
 edition = "2021"
+# Also clippy's MSRV (read from package.rust-version since clippy 1.72), so
+# lints won't suggest APIs newer than this. Keep in sync with the toolchain
+# pins in mise.toml and .pall8t/Containerfile.
+rust-version = "1.96"
 description = "Run AI coding agents in apple/container sandboxes — a headless sandbox runner"
 license = "MIT"
 repository = "https://github.com/TakiTake/pall8t"
@@ -13,6 +17,17 @@ path = "src/main.rs"
 [lib]
 name = "pall8t"
 path = "src/lib.rs"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Noisy, low-value pedantic lints for an internal binary crate: documenting an
+# `# Errors` section on every Result-returning fn and tagging every getter
+# `#[must_use]` is busywork here, and `args`/`argv`-style pairs trip
+# `similar_names` without being genuinely confusable. Everything else in
+# `pedantic` stays on.
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
 
 [dependencies]
 anyhow = "1"
