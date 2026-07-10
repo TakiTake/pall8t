@@ -4,3 +4,6 @@
 
 [container]
 containerfile = ".pall8t/Containerfile"
+
+[home]
+mode = "isolated"
