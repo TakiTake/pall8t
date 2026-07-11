@@ -83,6 +83,15 @@ where
     crate::util::run_ok("container", &argv)
 }
 
+fn run_streaming<I, S>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let argv: Vec<String> = args.into_iter().map(Into::into).collect();
+    crate::util::run_streaming("container", &argv)
+}
+
 pub enum SystemStatus {
     Running,
     Stopped,
@@ -402,6 +411,10 @@ pub fn image_delete(tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// Runs `container build`, streaming its output to stderr live (issue #13:
+/// a silent multi-minute build looks hung). Unlike most calls in this
+/// module, this doesn't go through [`run_ok`] — there's nothing here to
+/// parse, only progress to show.
 pub fn build_image(
     containerfile: &Path,
     ctx_dir: &Path,
@@ -409,7 +422,7 @@ pub fn build_image(
     uid: u32,
     gid: u32,
 ) -> Result<()> {
-    run_ok([
+    run_streaming([
         "build".to_string(),
         "-f".to_string(),
         containerfile.to_string_lossy().into_owned(),

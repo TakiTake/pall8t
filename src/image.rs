@@ -145,7 +145,7 @@ enum BuildAttempt {
 fn try_build(resolved: &ResolvedImage, uid: u32, gid: u32) -> Result<BuildAttempt> {
     let ctx_dir = resolved.containerfile.parent().unwrap_or(Path::new("."));
     eprintln!(
-        "pall8t: building {} from {} (this can take a few minutes)…",
+        "pall8t: building {} from {} (this can take a few minutes):",
         resolved.tag,
         resolved.containerfile.display()
     );
