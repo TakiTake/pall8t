@@ -80,7 +80,7 @@ Adding a TUI, attach/detach, and other session-management features was turning p
 ### FR-6: Initialization (`pall8t init`)
 
 - Generate `~/.pall8t/home` and a `~/.pall8t/config.toml` skeleton
-- Generate a project `pall8t.toml` skeleton and a minimal example Containerfile (never overwrite existing files)
+- Generate a project `.pall8t/config.toml` skeleton (never overwrite existing files); the example Containerfile is materialized once at `~/.pall8t/Containerfile`, not inside the project — see FR-2
 - Inform the user that the agent must be logged in once inside the container on first use
 
 ## 4. CLI Design
@@ -98,13 +98,13 @@ Design principle: from the caller's perspective (tmux / herdr / shell scripts), 
 
 ## 5. Configuration
 
-Two layers: global `~/.pall8t/config.toml` and per-project `pall8t.toml`. Project settings win.
+Two layers: global `~/.pall8t/config.toml` and per-project `.pall8t/config.toml`. Project settings win.
 
 ```toml
 [container]
 cpus = 4
 memory = "8g"
-containerfile = "Containerfile"
+# containerfile = "path/to/other/Containerfile"   # default: .pall8t/Containerfile
 
 [run]
 command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.

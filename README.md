@@ -24,7 +24,7 @@ Run AI coding agents inside [apple/container](https://github.com/apple/container
 cargo install --path .
 
 cd ~/src/my-project
-pall8t init     # one-time: ~/.pall8t/home, config skeletons, default Containerfile
+pall8t init     # one-time: ~/.pall8t/home, .pall8t/config.toml skeleton, default Containerfile
 pall8t run      # build if needed, then run the agent (default: claude) in the sandbox
 ```
 
@@ -35,7 +35,7 @@ The agent session is a plain foreground process: run it under tmux or herdr for 
 ## CLI
 
 ```
-pall8t init              # generate ~/.pall8t/home, config skeletons, default Containerfile
+pall8t init              # generate ~/.pall8t/home, .pall8t/config.toml skeleton, default Containerfile
 pall8t run [-- cmd...]   # hash check → build if needed → run (TTY passthrough)
 pall8t build             # explicit (unconditional) build
 pall8t ls [--json]       # list pall8t containers (--json for herdr etc.)
@@ -46,13 +46,13 @@ pall8t herdr doctor [--json]  # check herdr env/socket/binary reachability
 
 ## Config
 
-Two layers, merged per field with the project winning: global `~/.pall8t/config.toml`, per-project `./pall8t.toml`.
+Two layers, merged per field with the project winning: global `~/.pall8t/config.toml`, per-project `.pall8t/config.toml` — the project-scope mirror of `~/.pall8t`.
 
 ```toml
 [container]
 cpus = 4
 memory = "8g"
-containerfile = "Containerfile"   # relative to the project dir
+# containerfile = "path/to/other/Containerfile"   # relative to the project dir; default: .pall8t/Containerfile
 
 [run]
 command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
@@ -62,7 +62,7 @@ command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
 source = "~/src/other-lib"   # the copy is mounted at this same path
 ```
 
-Containerfile resolution: explicit `containerfile` config → `./Containerfile` if present → the built-in default image (node + claude CLI + gh; materialized once at `~/.pall8t/Containerfile` and never overwritten — edit it to customize the shared default, delete it to restore the shipped one). Custom toolchains must live outside `/home/dev` — the persistent home mount shadows it.
+Containerfile resolution: explicit `containerfile` config → `.pall8t/Containerfile` if present → the built-in default image (node + claude CLI + gh; materialized once at `~/.pall8t/Containerfile` and never overwritten — edit it to customize the shared default, delete it to restore the shipped one). There is no fallback to a root `./Containerfile` — that file usually belongs to the project's own app image, so pall8t never picks it up implicitly; point `containerfile` at it explicitly if you really want that. The build context is always the resolved Containerfile's own directory, so a `.pall8t/Containerfile` can only `COPY` files that live under `.pall8t/`. Custom toolchains must live outside `/home/dev` — the persistent home mount shadows it.
 
 The image tag embeds the Containerfile's content hash, so any edit — no commit required — triggers a rebuild on the next `run`, and superseded images are pruned automatically after a successful build (images still used by a running container are kept). Only the Containerfile itself is hashed, not files it `COPY`s in; use `pall8t build` to force a rebuild the hash can't see (e.g. updated base image or packages).
 

@@ -3,11 +3,17 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Per-project config file name, looked up in the current directory.
-pub const PROJECT_FILE: &str = "pall8t.toml";
+/// Project-level config directory, rooted at the project directory — the
+/// project-scope mirror of `~/.pall8t` ([`pall8t_root`]).
+pub const PROJECT_DIR: &str = ".pall8t";
+
+/// `<project_dir>/.pall8t/config.toml`, mirroring [`global_path`].
+pub fn project_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(PROJECT_DIR).join("config.toml")
+}
 
 /// Merged, fully-defaulted configuration for one invocation: the global
-/// `~/.pall8t/config.toml` overlaid by the project's `pall8t.toml`
+/// `~/.pall8t/config.toml` overlaid by the project's `.pall8t/config.toml`
 /// (requirements §5). Merging is per-field: a field the project file sets
 /// wins, one it omits falls through to the global file, then to the
 /// built-in default. `repos` is treated as one field — a project that
@@ -143,7 +149,7 @@ fn read_raw(path: &Path) -> Result<Option<Raw>> {
 /// Loads the merged config for a project rooted at `project_dir`.
 pub fn load(project_dir: &Path) -> Result<Config> {
     let global = read_raw(&global_path()?)?.unwrap_or_default();
-    let project = read_raw(&project_dir.join(PROJECT_FILE))?.unwrap_or_default();
+    let project = read_raw(&project_path(project_dir))?.unwrap_or_default();
     Ok(merge(global, project))
 }
 
@@ -195,8 +201,8 @@ fn merge(global: Raw, project: Raw) -> Config {
 }
 
 /// Skeleton written by `pall8t init` as `~/.pall8t/config.toml`.
-pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project pall8t.toml overrides these
-# values field by field.
+pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project .pall8t/config.toml overrides
+# these values field by field.
 
 [container]
 # cpus = 4
@@ -235,16 +241,18 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # inbox_ttl_days = 14
 "#;
 
-/// Skeleton written by `pall8t init` as `./pall8t.toml`.
+/// Skeleton written by `pall8t init` as `.pall8t/config.toml`.
 pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set here override
 # ~/.pall8t/config.toml.
 
 [container]
 # cpus = 4
 # memory = "8g"
-# Containerfile used for this project's image. Default: ./Containerfile
-# if present, else the built-in default image.
-# containerfile = "Containerfile"
+# Containerfile used for this project's image. Default (usually no need to
+# set this): .pall8t/Containerfile if present, else the built-in default
+# image. Only set this to point somewhere else — relative to the project
+# dir (absolute paths and ~ also work):
+# containerfile = "path/to/other/Containerfile"
 
 [run]
 # command = ["claude"]
@@ -256,9 +264,60 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn parse(s: &str) -> Raw {
         toml::from_str(s).unwrap()
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("pall8t-test-config-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn project_path_is_dot_pall8t_config_toml() {
+        let project_dir = Path::new("/some/project");
+        assert_eq!(
+            project_path(project_dir),
+            project_dir.join(".pall8t").join("config.toml")
+        );
+    }
+
+    #[test]
+    fn project_config_is_read_from_dot_pall8t_dir() {
+        // Exercises the exact path `load()` reads from, without `load()`
+        // itself (which also reads the real ~/.pall8t/config.toml and so
+        // isn't safe to assert on in a test).
+        let project_dir = tmp_dir("project-config");
+        let pall8t_dir = project_dir.join(PROJECT_DIR);
+        fs::create_dir_all(&pall8t_dir).unwrap();
+        fs::write(pall8t_dir.join("config.toml"), "[container]\ncpus = 2\n").unwrap();
+
+        let raw = read_raw(&project_path(&project_dir)).unwrap().unwrap();
+        assert_eq!(raw.container.cpus, Some(2));
+
+        let _ = fs::remove_dir_all(&project_dir);
+    }
+
+    #[test]
+    fn project_config_ignores_root_pall8t_toml() {
+        // The pre-issue-24 path must no longer be read at all: a root
+        // pall8t.toml sitting next to (a missing) .pall8t/ is invisible —
+        // hard switch, no fallback.
+        let project_dir = tmp_dir("legacy-root-file");
+        fs::write(project_dir.join("pall8t.toml"), "[container]\ncpus = 2\n").unwrap();
+
+        let raw = read_raw(&project_path(&project_dir)).unwrap();
+        assert!(
+            raw.is_none(),
+            "no .pall8t/config.toml exists at this project_dir"
+        );
+
+        let _ = fs::remove_dir_all(&project_dir);
     }
 
     #[test]

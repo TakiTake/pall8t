@@ -1,4 +1,7 @@
-use crate::{config::Config, container, repos};
+use crate::{
+    config::{self, Config},
+    container, repos,
+};
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -18,34 +21,24 @@ pub struct ResolvedImage {
 
 /// Resolves the Containerfile and image tag for `cwd`. Priority: explicit
 /// `container.containerfile` config (relative to `cwd`; must exist) >
-/// `<cwd>/Containerfile` if present > the embedded default written to
-/// `~/.pall8t/Containerfile`. A project Containerfile gets a
-/// per-workspace tag base (`pall8t-<slug>-<hash(cwd)>` — the cwd hash
-/// keeps two directories that share a basename from pruning each other's
-/// builds); the shared default gets `pall8t-base`, so every project on
-/// the default image reuses one build.
+/// `<cwd>/.pall8t/Containerfile` if present > the embedded default written
+/// to `~/.pall8t/Containerfile`. Note there is no fallback to a root
+/// `<cwd>/Containerfile` — that file usually belongs to the project's own
+/// app image, and pall8t silently building it as the sandbox image would
+/// be a footgun; a project that wants it anyway can still set
+/// `container.containerfile = "Containerfile"`. A project Containerfile
+/// gets a per-workspace tag base (`pall8t-<slug>-<hash(cwd)>` — the cwd
+/// hash keeps two directories that share a basename from pruning each
+/// other's builds); the shared default gets `pall8t-base`, so every
+/// project on the default image reuses one build.
 pub fn resolve(cwd: &Path, cfg: &Config, uid: u32, gid: u32) -> Result<ResolvedImage> {
-    let (containerfile, base) = if let Some(p) = &cfg.containerfile {
-        let p = repos::expand_tilde(p);
-        let p = if p.is_absolute() { p } else { cwd.join(p) };
-        if !p.is_file() {
-            return Err(anyhow!(
-                "configured containerfile {} does not exist",
-                p.display()
-            ));
-        }
-        (p, project_base(cwd))
-    } else {
-        let local = cwd.join("Containerfile");
-        if local.is_file() {
-            (local, project_base(cwd))
-        } else {
-            (
-                container::default_containerfile_path()
-                    .context("cannot write the default Containerfile")?,
-                "pall8t-base".to_string(),
-            )
-        }
+    let (containerfile, base) = match probe_containerfile(cwd, cfg)? {
+        Some(found) => found,
+        None => (
+            container::default_containerfile_path()
+                .context("cannot write the default Containerfile")?,
+            "pall8t-base".to_string(),
+        ),
     };
     let hash = hash_with_retry(&containerfile)
         .ok_or_else(|| anyhow!("cannot read {}", containerfile.display()))?;
@@ -55,6 +48,29 @@ pub fn resolve(cwd: &Path, cfg: &Config, uid: u32, gid: u32) -> Result<ResolvedI
         containerfile,
         hash,
     })
+}
+
+/// The explicit-config and project-local halves of [`resolve`]'s priority
+/// order — everything before the embedded-default fallback. `Ok(None)`
+/// means neither applies and the caller should fall through to the shared
+/// default image.
+fn probe_containerfile(cwd: &Path, cfg: &Config) -> Result<Option<(PathBuf, String)>> {
+    if let Some(p) = &cfg.containerfile {
+        let p = repos::expand_tilde(p);
+        let p = if p.is_absolute() { p } else { cwd.join(p) };
+        if !p.is_file() {
+            return Err(anyhow!(
+                "configured containerfile {} does not exist",
+                p.display()
+            ));
+        }
+        return Ok(Some((p, project_base(cwd))));
+    }
+    let local = cwd.join(config::PROJECT_DIR).join("Containerfile");
+    if local.is_file() {
+        return Ok(Some((local, project_base(cwd))));
+    }
+    Ok(None)
 }
 
 /// [`container::containerfile_content_hash`], retried briefly: editors
@@ -219,5 +235,89 @@ fn prune_superseded(resolved: &ResolvedImage, uid: u32, gid: u32) {
             "pall8t: warning: could not list images to prune under {}: {e:#}",
             resolved.base
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::HomeConfig;
+    use std::fs;
+
+    fn test_cfg(containerfile: Option<PathBuf>) -> Config {
+        Config {
+            cpus: 4,
+            memory: "8g".to_string(),
+            containerfile,
+            command: vec!["claude".to_string()],
+            repos: vec![],
+            home: HomeConfig::default(),
+        }
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("pall8t-test-image-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn probe_picks_up_dot_pall8t_containerfile() {
+        let cwd = tmp_dir("dot-pall8t");
+        let dot_pall8t = cwd.join(".pall8t");
+        fs::create_dir_all(&dot_pall8t).unwrap();
+        fs::write(dot_pall8t.join("Containerfile"), "FROM scratch\n").unwrap();
+
+        let (containerfile, base) = probe_containerfile(&cwd, &test_cfg(None))
+            .unwrap()
+            .expect("a .pall8t/Containerfile must be found");
+        assert_eq!(containerfile, dot_pall8t.join("Containerfile"));
+        assert_eq!(base, project_base(&cwd));
+
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn probe_ignores_root_containerfile_and_falls_through() {
+        // The pre-issue-24 `<cwd>/Containerfile` probe is gone: a root
+        // Containerfile with no `.pall8t/Containerfile` must not be picked
+        // up, leaving `resolve` to fall through to the embedded default.
+        let cwd = tmp_dir("root-containerfile");
+        fs::write(cwd.join("Containerfile"), "FROM scratch\n").unwrap();
+
+        let found = probe_containerfile(&cwd, &test_cfg(None)).unwrap();
+        assert!(
+            found.is_none(),
+            "a root Containerfile without .pall8t/Containerfile must not be probed"
+        );
+
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn probe_prefers_explicit_config_over_dot_pall8t() {
+        let cwd = tmp_dir("explicit-config");
+        let dot_pall8t = cwd.join(".pall8t");
+        fs::create_dir_all(&dot_pall8t).unwrap();
+        fs::write(dot_pall8t.join("Containerfile"), "FROM scratch\n").unwrap();
+        fs::write(cwd.join("Custom.containerfile"), "FROM scratch\n").unwrap();
+
+        let cfg = test_cfg(Some(PathBuf::from("Custom.containerfile")));
+        let (containerfile, base) = probe_containerfile(&cwd, &cfg).unwrap().unwrap();
+        assert_eq!(containerfile, cwd.join("Custom.containerfile"));
+        assert_eq!(base, project_base(&cwd));
+
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn probe_errors_when_explicit_config_missing() {
+        let cwd = tmp_dir("missing-explicit-config");
+        let cfg = test_cfg(Some(PathBuf::from("does-not-exist")));
+        assert!(probe_containerfile(&cwd, &cfg).is_err());
+
+        let _ = fs::remove_dir_all(&cwd);
     }
 }
