@@ -129,6 +129,12 @@ pub struct ContainerInfo {
 /// Parsed defensively (schema is pre-1.0, see ADR-0001).
 pub fn list_all() -> Result<Vec<ContainerInfo>> {
     let stdout = run_ok(["list", "--all", "--format", "json"])?;
+    parse_list_all(&stdout)
+}
+
+/// Pure core of [`list_all`], factored out for testability against literal
+/// `container list --all --format json` output.
+fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
@@ -142,9 +148,16 @@ pub fn list_all() -> Result<Vec<ContainerInfo>> {
                 .and_then(Value::as_str)
                 .or_else(|| item.get("id").and_then(Value::as_str))
                 .or_else(|| item.get("name").and_then(Value::as_str));
+            // `status` is a nested object (`{state, networks, startedDate}`)
+            // on current apple/container, but the schema is pre-1.0 (ADR-0001)
+            // — fall back to a bare string in case an older/other CLI build
+            // reports it directly. Getting this wrong silently misreports
+            // every running container as stopped (`unwrap_or_default` below
+            // never matches "running"), so the nested lookup comes first.
             let status = item
-                .get("status")
+                .pointer("/status/state")
                 .and_then(Value::as_str)
+                .or_else(|| item.get("status").and_then(Value::as_str))
                 .unwrap_or_default();
             let image = item
                 .pointer("/configuration/image/reference")
@@ -542,6 +555,65 @@ pub fn default_containerfile_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Real shape from `container list --all --format json` (apple/container
+    /// 1.0.0): `status` is a nested object, not a bare string. Regression
+    /// test for the bug where every container was misreported `stopped`
+    /// because the parser looked for a top-level string that never existed.
+    #[test]
+    fn parse_list_all_reads_nested_status_state() {
+        let json = r#"[
+            {
+                "id": "pall8t-x-1",
+                "configuration": {
+                    "id": "pall8t-x-1",
+                    "image": { "reference": "pall8t-x:501-20-abc123" }
+                },
+                "status": {
+                    "state": "running",
+                    "networks": [],
+                    "startedDate": "2026-07-11T02:33:10Z"
+                }
+            },
+            {
+                "id": "pall8t-x-2",
+                "configuration": {
+                    "id": "pall8t-x-2",
+                    "image": { "reference": "pall8t-x:501-20-def456" }
+                },
+                "status": { "state": "stopped", "networks": [] }
+            }
+        ]"#;
+        let items = parse_list_all(json).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "pall8t-x-1");
+        assert_eq!(items[0].state, State::Running);
+        assert_eq!(items[0].image.as_deref(), Some("pall8t-x:501-20-abc123"));
+        assert_eq!(items[1].name, "pall8t-x-2");
+        assert_eq!(items[1].state, State::Stopped);
+    }
+
+    /// Defensive fallback (schema is pre-1.0, ADR-0001): a bare top-level
+    /// `status` string, in case a different apple/container build reports
+    /// it that way, still parses correctly.
+    #[test]
+    fn parse_list_all_falls_back_to_bare_status_string() {
+        let json = r#"[
+            {
+                "id": "pall8t-x-1",
+                "configuration": { "id": "pall8t-x-1" },
+                "status": "running"
+            }
+        ]"#;
+        let items = parse_list_all(json).unwrap();
+        assert_eq!(items[0].state, State::Running);
+    }
+
+    #[test]
+    fn parse_list_all_empty_output_is_empty() {
+        assert!(parse_list_all("").unwrap().is_empty());
+        assert!(parse_list_all("   ").unwrap().is_empty());
+    }
 
     #[test]
     fn normalize_ref_table() {
