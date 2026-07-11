@@ -41,6 +41,7 @@ pall8t build             # explicit (unconditional) build
 pall8t ls [--json]       # list pall8t containers (--json for herdr etc.)
 pall8t exec <id> -- cmd  # run a command inside a running container
 pall8t stop <id>         # stop a container
+pall8t herdr doctor [--json]  # check herdr env/socket/binary reachability
 ```
 
 ## Config
@@ -76,6 +77,16 @@ pall8t run
 ```
 
 pall8t detects that cwd's `.git` is a worktree pointer and identity-mounts the main repository's `.git` alongside, so `status`/`commit`/`diff` inside the container behave exactly as on the host.
+
+## herdr integration
+
+Launch `pall8t run` via `herdr agent start` — e.g. a shell function like `p8() { herdr agent start claude --cwd "$PWD" -- env HERDR_AGENT=claude pall8t run "$@" }` — and pall8t bridges the sandbox boundary for you. herdr injects `HERDR_ENV`/`HERDR_PANE_ID`/`HERDR_SOCKET_PATH`/`HERDR_BIN_PATH` into `pall8t` itself (the host process), not into the sandboxed `claude`, so pall8t acts on them before it execs into the container. **`herdr agent start` isn't optional**: it's what gives the pane an agent identity at all (`herdr`'s own `set_agent_name`, at pane-creation time) — plain `pall8t run` typed into an ordinary pane gets no herdr-visible identity whatsoever, sandboxed or not, since herdr's fallback detection (`identify_agent_in_job`) only inspects the **host** process tree and only ever sees the `container` client process, never the sandboxed `claude` inside the VM:
+
+- **Sidebar identity.** pall8t reports the pane's display name to herdr (`herdr pane report-metadata … --display-agent "claude (pall8t)"`), which takes priority over the plain `claude` name `agent start` gave the pane — verified live end-to-end (agent pane shows "claude (pall8t)"). Deliberately sent *without* `--agent`: herdr only surfaces `display_agent` when it matches `effective_agent_label()` (host-process-derived, per above), so passing `--agent claude` — the issue's original literal example — would silently and permanently block the display. Best-effort either way: a missing `herdr` binary or unreachable socket just prints a warning and the run continues.
+- **No redundant tmux wrapper.** If `[run] command` is the [Claude Code agent-teams tmux wrapper](#claude-code-agent-teams-split-panes) below and pall8t detects it's running inside a herdr pane, it runs plain `claude` instead — herdr already supplies persistence/multiplexing, so the wrapper (and its status bar) is redundant chrome. An explicit `pall8t run -- <cmd>` override always wins over this.
+- **`pall8t herdr doctor`** checks whether pall8t can see and reach the herdr pane it's running under (env vars present, socket reachable, `herdr` binary resolvable). Read-only, diagnostic only; `--json` for scripting.
+
+**herdr cannot detect agent *state* (idle/working/blocked) for a pall8t-sandboxed pane at all**, not just session identity — confirmed by reading herdr's `detect` module: identity assignment (which then gates its screen-content state rules) is purely host-process-name-based (`identify_agent_in_job`), and it only ever sees `container`, never the sandboxed `claude`. This contradicts [ADR-0003](docs/adr/0003-multiplexer-pivot.md)'s original assumption that "screen detection works... regardless of the sandbox," and is exactly the gap [ADR-0006](docs/adr/0006-drop-tui.md)'s revisit triggers anticipated ("herdr or tmux integration proves insufficient for agent-status awareness"). Native session resume/restore (`pall8t resume`, live session-id reporting via `herdr pane report-agent-session`) also isn't implemented yet: it needs a change to pall8t's foreground/exec-replace process model, and, upstream, a way for herdr to let a custom source supply its own resume command instead of its current hardcoded `claude --resume <id>` table. Tracked in [issue #18](https://github.com/TakiTake/pall8t/issues/18).
 
 ## Claude Code agent teams (split panes)
 
