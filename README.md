@@ -66,6 +66,8 @@ Containerfile resolution: explicit `containerfile` config → `.pall8t/Container
 
 The image tag embeds the Containerfile's content hash, so any edit — no commit required — triggers a rebuild on the next `run`, and superseded images are pruned automatically after a successful build (images still used by a running container are kept). Only the Containerfile itself is hashed, not files it `COPY`s in; use `pall8t build` to force a rebuild the hash can't see (e.g. updated base image or packages).
 
+A build streams `container build`'s own output live to stderr — no `-v` flag, this is always on, since a silent multi-minute build looks hung. Deliberately kept off pall8t's own stdout, which `pall8t build`'s final `built <tag>` line and `pall8t ls --json` need to stay machine-readable.
+
 ## Working with git worktrees
 
 Cutting worktrees is the caller's business — you or herdr — but pall8t makes them work inside the sandbox:

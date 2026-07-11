@@ -59,6 +59,7 @@ Adding a TUI, attach/detach, and other session-management features was turning p
 - On `run`, compare the Containerfile hash against the last build; if it changed, build before launching
 - On build failure, do not launch the agent; exit non-zero
 - `pall8t build` performs an explicit build
+- Build output streams live to stderr by default (not captured/hidden), kept off pall8t's own stdout so `built <tag>` and `ls --json` stay machine-readable
 
 ### FR-3: git worktree support
 
