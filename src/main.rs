@@ -17,7 +17,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Generate ~/.pall8t (home, config skeleton, default Containerfile)
-    /// and the project's pall8t.toml skeleton
+    /// and the project's .pall8t/config.toml skeleton
     Init,
     /// Rebuild the image if the Containerfile changed, then run the agent
     /// in the sandbox (foreground, cwd mounted as the workspace)
@@ -640,11 +640,13 @@ fn cmd_home_gc(json: bool) -> Result<()> {
 }
 
 /// FR-6: create `~/.pall8t/home`, config skeletons, and the default
-/// Containerfile (in `~/.pall8t`, NOT the project — a `./Containerfile`
-/// would flip [`image::resolve`]'s priority to a per-project base and give
-/// every init'ed project its own byte-identical image; copy
-/// `~/.pall8t/Containerfile` into the project only to actually customize
-/// it). Never overwrites an existing file.
+/// Containerfile. The default Containerfile is written to
+/// `~/.pall8t/Containerfile`, NOT the project's `.pall8t/Containerfile` —
+/// that path is [`image::resolve`]'s per-project probe, so writing one
+/// there on every `init` would opt every project into its own image build
+/// instead of sharing the default; copy `~/.pall8t/Containerfile` into
+/// `.pall8t/Containerfile` only to actually customize it for a project.
+/// Never overwrites an existing file.
 fn cmd_init() -> Result<()> {
     let home = container::home_mount()?;
     println!("container home:  {}", home.display());
@@ -657,7 +659,7 @@ fn cmd_init() -> Result<()> {
     )?;
 
     let cwd = std::env::current_dir()?;
-    write_if_missing(&cwd.join(config::PROJECT_FILE), config::PROJECT_SKELETON)?;
+    write_if_missing(&config::project_path(&cwd), config::PROJECT_SKELETON)?;
 
     println!(
         "\nFirst use: the agent must log in once inside the container, e.g.\n\

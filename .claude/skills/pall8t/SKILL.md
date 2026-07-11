@@ -13,12 +13,12 @@ You are running inside a Linux VM (apple/container) launched by **pall8t**, a he
 - Files you create are owned by the host user (your UID matches theirs). `sudo` works, but grants root only inside this VM.
 - Your `$HOME` is `/home/dev`, backed by the host's `~/.pall8t/home` — **persistent across runs and rebuilds** (login state, shell history, dotfiles) and **shared by all pall8t sandboxes**.
 - If the workspace is a git worktree, the main repository's `.git` is also mounted, so `git status`/`commit`/`diff` work exactly as on the host.
-- **Reference repos** (from `pall8t.toml [[repos]]`) appear at their usual host paths, but you are looking at a disposable `git clone --local` copy — writes never reach the original, and your changes there may be discarded.
+- **Reference repos** (from `.pall8t/config.toml [[repos]]`) appear at their usual host paths, but you are looking at a disposable `git clone --local` copy — writes never reach the original, and your changes there may be discarded.
 - The `container` CLI does **not** exist here; you are inside the container. Do not try to run pall8t or docker/container commands.
 
 ## Developing pall8t itself
 
-The pall8t repo's `pall8t.toml` points at `.pall8t/Containerfile`, so a sandbox launched in that repo already has Rust (`cargo`, `clippy`, `rustfmt` at `/usr/local/cargo/bin`). Build checks:
+The pall8t repo ships `.pall8t/Containerfile` — the default probe pall8t resolves to for its own sandbox — so a sandbox launched in that repo already has Rust (`cargo`, `clippy`, `rustfmt` at `/usr/local/cargo/bin`). Build checks:
 
 ```sh
 cargo check

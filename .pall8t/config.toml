@@ -1,0 +1,7 @@
+# pall8t project config for developing pall8t itself. The root Containerfile
+# is the embedded default sandbox image (no Rust toolchain); this project's
+# sandbox needs Rust, which comes from .pall8t/Containerfile — the default
+# probe, so it doesn't need to be named here explicitly.
+
+[home]
+mode = "isolated"
