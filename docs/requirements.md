@@ -104,7 +104,7 @@ Two layers: global `~/.pall8t/config.toml` and per-project `.pall8t/config.toml`
 [container]
 cpus = 4
 memory = "8g"
-containerfile = "Containerfile"
+# containerfile = "path/to/other/Containerfile"   # default: .pall8t/Containerfile
 
 [run]
 command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.

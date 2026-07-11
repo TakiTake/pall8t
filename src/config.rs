@@ -248,11 +248,11 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 [container]
 # cpus = 4
 # memory = "8g"
-# Containerfile used for this project's image. Default (no need to set this):
-# .pall8t/Containerfile if present, else the built-in default image. Set this
-# only to point somewhere else, e.g. a project-root Containerfile you
-# deliberately want used as the sandbox image instead:
-# containerfile = "Containerfile"
+# Containerfile used for this project's image. Default (usually no need to
+# set this): .pall8t/Containerfile if present, else the built-in default
+# image. Only set this to point somewhere else — relative to the project
+# dir (absolute paths and ~ also work):
+# containerfile = "path/to/other/Containerfile"
 
 [run]
 # command = ["claude"]

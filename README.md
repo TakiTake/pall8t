@@ -52,8 +52,7 @@ Two layers, merged per field with the project winning: global `~/.pall8t/config.
 [container]
 cpus = 4
 memory = "8g"
-containerfile = "Containerfile"   # relative to the project dir; only needed to
-                                  # point somewhere other than .pall8t/Containerfile
+# containerfile = "path/to/other/Containerfile"   # relative to the project dir; default: .pall8t/Containerfile
 
 [run]
 command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
