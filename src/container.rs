@@ -1,7 +1,8 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::Value;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub const DEFAULT_CONTAINERFILE: &str = include_str!("../Containerfile");
 
@@ -83,13 +84,13 @@ where
     crate::util::run_ok("container", &argv)
 }
 
-fn run_streaming<I, S>(args: I) -> Result<()>
+fn run_streaming<I, S>(args: I, stdin: Stdio) -> Result<()>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
     let argv: Vec<String> = args.into_iter().map(Into::into).collect();
-    crate::util::run_streaming("container", &argv)
+    crate::util::run_streaming("container", &argv, stdin)
 }
 
 pub enum SystemStatus {
@@ -112,17 +113,25 @@ pub fn system_status() -> SystemStatus {
     }
 }
 
-/// Starts the apple/container system service (`container system start`),
-/// inheriting stdio so its progress is visible.
+/// Starts the apple/container system service (`container system start`).
+/// Streams its progress live to stderr rather than inheriting stdout
+/// outright — `ensure_container_system` calls this from `pall8t ls`'s path
+/// too, and `ls --json`'s stdout must stay clean JSON even on a first run
+/// right after a reboot, when the service is still stopped. Stdin is
+/// inherited only when it's actually a TTY (unlike [`build_image`]'s use
+/// of the same [`run_streaming`], which always closes it): on a fresh
+/// machine this can prompt for the default-kernel install, and a TTY is
+/// the only case where that prompt is answerable — piping pall8t's own
+/// stdin through unconditionally would instead hand the prompt someone
+/// else's data (e.g. `echo prompt | pall8t run`), so a non-TTY stdin stays
+/// closed exactly like `build_image`'s.
 pub fn system_start() -> Result<()> {
-    let status = Command::new("container")
-        .args(["system", "start"])
-        .status()
-        .context("failed to run: container system start")?;
-    if !status.success() {
-        return Err(anyhow!("`container system start` failed"));
-    }
-    Ok(())
+    let stdin = if std::io::stdin().is_terminal() {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    };
+    run_streaming(["system", "start"], stdin)
 }
 
 /// One row of `container list --all`.
@@ -414,7 +423,9 @@ pub fn image_delete(tag: &str) -> Result<()> {
 /// Runs `container build`, streaming its output to stderr live (issue #13:
 /// a silent multi-minute build looks hung). Unlike most calls in this
 /// module, this doesn't go through [`run_ok`] — there's nothing here to
-/// parse, only progress to show.
+/// parse, only progress to show. Stdin is always closed: a build has no
+/// business reading it (contrast [`system_start`], the other
+/// [`run_streaming`] caller, which conditionally inherits it).
 pub fn build_image(
     containerfile: &Path,
     ctx_dir: &Path,
@@ -422,18 +433,21 @@ pub fn build_image(
     uid: u32,
     gid: u32,
 ) -> Result<()> {
-    run_streaming([
-        "build".to_string(),
-        "-f".to_string(),
-        containerfile.to_string_lossy().into_owned(),
-        "-t".to_string(),
-        tag.to_string(),
-        "--build-arg".to_string(),
-        format!("UID={uid}"),
-        "--build-arg".to_string(),
-        format!("GID={gid}"),
-        ctx_dir.to_string_lossy().into_owned(),
-    ])?;
+    run_streaming(
+        [
+            "build".to_string(),
+            "-f".to_string(),
+            containerfile.to_string_lossy().into_owned(),
+            "-t".to_string(),
+            tag.to_string(),
+            "--build-arg".to_string(),
+            format!("UID={uid}"),
+            "--build-arg".to_string(),
+            format!("GID={gid}"),
+            ctx_dir.to_string_lossy().into_owned(),
+        ],
+        Stdio::null(),
+    )?;
     Ok(())
 }
 
