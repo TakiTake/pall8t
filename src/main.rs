@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use pall8t::{config, container, home, image, repos, worktree};
+use pall8t::{config, container, herdr, home, image, repos, worktree};
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -47,6 +47,23 @@ enum Cmd {
     Home {
         #[command(subcommand)]
         cmd: HomeCmd,
+    },
+    /// herdr (the terminal agent multiplexer) integration helpers
+    Herdr {
+        #[command(subcommand)]
+        cmd: HerdrCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum HerdrCmd {
+    /// Check whether pall8t can see and reach the herdr pane it's running
+    /// under (env vars, socket, `herdr` binary) — read-only, never mutates
+    /// anything
+    Doctor {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -166,6 +183,7 @@ fn run() -> Result<()> {
         Cmd::Exec { id, command } => cmd_exec(&id, &command),
         Cmd::Stop { id } => cmd_stop(&id),
         Cmd::Home { cmd } => cmd_home(cmd),
+        Cmd::Herdr { cmd } => cmd_herdr(&cmd),
     }
 }
 
@@ -258,11 +276,21 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
         dest: "/home/dev".into(),
     });
 
+    let herdr_env = herdr::detect();
+    // An explicit `-- <cmd>` override is user intent and bypasses the
+    // configured command entirely, so herdr's tmux-wrapper override only
+    // ever applies to the configured default.
     let command = if cli_command.is_empty() {
-        cfg.command.clone()
+        herdr::maybe_override_for_herdr(cfg.command.clone(), herdr_env.is_some())
     } else {
         cli_command
     };
+    if let Some(env) = &herdr_env {
+        // Cosmetic sidebar identity — never worth failing the run over.
+        if let Err(e) = herdr::report_metadata(env) {
+            eprintln!("pall8t: warning: could not report herdr pane metadata: {e:#}");
+        }
+    }
     let spec = container::RunSpec {
         name: run_name,
         image: resolved.tag,
@@ -324,6 +352,35 @@ fn cmd_stop(id: &str) -> Result<()> {
     container::stop(id)?;
     println!("stopped {id}");
     Ok(())
+}
+
+/// Connect-only probe (no request sent — `doctor` must not have side
+/// effects): true if something is listening on `path`.
+fn herdr_socket_reachable(path: &str) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+fn cmd_herdr(cmd: &HerdrCmd) -> Result<()> {
+    match cmd {
+        HerdrCmd::Doctor { json } => {
+            let snap = herdr::DoctorSnapshot::from_process_env();
+            let socket_reachable = snap
+                .socket_path
+                .as_deref()
+                .is_some_and(herdr_socket_reachable);
+            let bin_resolvable = herdr::bin_resolvable(snap.herdr_bin());
+            let checks = herdr::doctor_checks(&snap, socket_reachable, bin_resolvable);
+            if *json {
+                print_json(&checks)?;
+            } else {
+                for c in &checks {
+                    let mark = if c.ok { "✓" } else { "✗" };
+                    println!("{mark} {:<16} {}", c.name, c.detail);
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// The host path to mount at `/home/dev`. `shared` mode is byte-for-byte
