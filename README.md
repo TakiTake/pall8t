@@ -16,13 +16,17 @@ Run AI coding agents inside [apple/container](https://github.com/apple/container
 ## Requirements
 
 - macOS on Apple silicon, [apple/container](https://github.com/apple/container) installed
-- git, Rust toolchain (build from source for now)
+- git
 
 ## Install & quickstart
 
 ```sh
-cargo install --path .
+brew install TakiTake/tap/pall8t
+```
 
+(published together with the v0.1.0 release; until then, or to build from source, use `cargo install --path .` — this needs the Rust toolchain.)
+
+```sh
 cd ~/src/my-project
 pall8t init     # one-time: ~/.pall8t/home, .pall8t/config.toml skeleton, default Containerfile
 pall8t run      # build if needed, then run the agent (default: claude) in the sandbox
@@ -108,4 +112,4 @@ then, inside the container (one-time, persists in the container home), add `"tea
 - **No read-only mounts** (apple/container limitation) — reference repos are protected by `git clone --local` duplication instead.
 - **Workspace isolation is the caller's responsibility.** Two agents in the same directory will step on each other; use worktrees.
 
-Full requirements in [docs/requirements.md](docs/requirements.md); architecture decisions in [docs/adr/](docs/adr/).
+Full requirements in [docs/requirements.md](docs/requirements.md); architecture decisions in [docs/adr/](docs/adr/); release process in [docs/release.md](docs/release.md).
