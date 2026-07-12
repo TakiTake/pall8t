@@ -231,10 +231,29 @@ fn workspace_image(
 /// Replaces this process with `container <argv>`: the cleanest possible
 /// TTY passthrough — the kernel delivers signals straight to the
 /// `container` CLI and the exit code needs no forwarding, because pall8t
-/// is no longer there (NFR-4).
-fn exec_container(argv: &[String]) -> Result<()> {
+/// is no longer there (NFR-4). `arg0` overrides only argv[0]: herdr
+/// identifies a pane's agent from the host process tree by argv0 basename,
+/// so naming the process after the sandboxed agent is what lets herdr
+/// track its state (see `herdr::agent_hint`). With an arg0 set, the exec
+/// target is resolved through any Homebrew wrapper script first — the
+/// wrapper's inner `exec` would otherwise rewrite argv[0] and destroy the
+/// hint (see `container::client_exec_target`) — and `HERDR_AGENT` is set
+/// on the process so a future herdr macOS env hint can pick the name up
+/// even where argv0 can't survive.
+fn exec_container(argv: &[String], arg0: Option<&str>) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let err = std::process::Command::new("container").args(argv).exec();
+    let mut cmd = match arg0 {
+        Some(arg0) => {
+            let (target, env) = container::client_exec_target();
+            let mut cmd = std::process::Command::new(target);
+            cmd.arg0(arg0);
+            cmd.envs(env);
+            cmd.env("HERDR_AGENT", arg0);
+            cmd
+        }
+        None => std::process::Command::new("container"),
+    };
+    let err = cmd.args(argv).exec();
     Err(anyhow!(err).context("failed to exec `container`"))
 }
 
@@ -285,12 +304,9 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
     } else {
         cli_command
     };
-    if let Some(env) = &herdr_env {
-        // Cosmetic sidebar identity — never worth failing the run over.
-        if let Err(e) = herdr::report_metadata(env) {
-            eprintln!("pall8t: warning: could not report herdr pane metadata: {e:#}");
-        }
-    }
+    let herdr_agent = herdr_env
+        .as_ref()
+        .and_then(|env| herdr::announce_pane_identity(env, &command));
     let spec = container::RunSpec {
         name: run_name,
         image: resolved.tag,
@@ -303,7 +319,7 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
         tty: stdin_is_tty(),
         command,
     };
-    exec_container(&container::run_argv(&spec))
+    exec_container(&container::run_argv(&spec), herdr_agent.as_deref())
 }
 
 fn cmd_build() -> Result<()> {
@@ -339,12 +355,12 @@ fn cmd_exec(id: &str, command: &[String]) -> Result<()> {
     // The container's own initial workdir (the workspace) — best-effort;
     // without it the command runs in the image WORKDIR.
     let workdir = container::workdir(id);
-    exec_container(&container::exec_argv(
-        id,
-        command,
-        stdin_is_tty(),
-        workdir.as_deref(),
-    ))
+    // No herdr argv0 hint here: `exec` is the one-off/debug path, and an
+    // ambient HERDR_AGENT would mislabel e.g. a plain `bash` as the agent.
+    exec_container(
+        &container::exec_argv(id, command, stdin_is_tty(), workdir.as_deref()),
+        None,
+    )
 }
 
 fn cmd_stop(id: &str) -> Result<()> {

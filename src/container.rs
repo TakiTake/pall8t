@@ -555,6 +555,122 @@ pub fn workdir(name: &str) -> Option<String> {
     inspect_str(name, "/0/configuration/initProcess/workingDirectory")
 }
 
+/// What to exec for the `container` CLI when argv[0] matters, plus env
+/// assignments to carry over. Homebrew installs `container` as a bash
+/// wrapper (`VAR="…" exec "<cellar>/libexec/container" "$@"`), and that
+/// inner `exec` rewrites argv[0] to the full target path — silently
+/// destroying the herdr agent hint one hop after pall8t set it (observed
+/// live: `ps` shows the Cellar path, herdr never identifies the pane). So
+/// when the PATH-resolved `container` is such a wrapper, exec its target
+/// binary directly, keeping the wrapper's env assignments
+/// (`CONTAINER_INSTALL_ROOT` — the CLI locates its helpers through it).
+/// Anything unparseable falls back to plain `container`: argv[0] is then
+/// lost, but the run still works.
+pub fn client_exec_target() -> (PathBuf, Vec<(String, String)>) {
+    let fallback = (PathBuf::from("container"), Vec::new());
+    let Some(path) = find_in_path("container") else {
+        return fallback;
+    };
+    // Bounded read: a direct-binary install puts a multi-megabyte Mach-O
+    // here, and a wrapper script fits in the first kilobyte.
+    let Some(head) = read_head_utf8(&path, 1024) else {
+        return fallback;
+    };
+    match parse_exec_wrapper(&head) {
+        Some((target, env)) if is_executable_file(Path::new(&target)) => {
+            (PathBuf::from(target), env)
+        }
+        _ => fallback,
+    }
+}
+
+/// First `limit` bytes of `path`, lossily decoded. Binary content (a
+/// Mach-O) decodes to replacement-character soup that
+/// [`parse_exec_wrapper`] rejects at its `#!` check, so no UTF-8
+/// validation is needed here.
+fn read_head_utf8(path: &Path, limit: u64) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(limit)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn find_in_path(bin: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(bin))
+        .find(|p| is_executable_file(p))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .is_ok_and(|x| x)
+}
+
+/// Parses a Homebrew-style exec wrapper script: a `#!` script whose one
+/// action line is `[VAR=VAL ...] exec "<target>" "$@"`. Returns the target
+/// and the env assignments, or `None` for anything else (including a real
+/// binary, whose content won't start with `#!`). Deliberately strict — a
+/// shape this parser doesn't recognize must fall back to the wrapper
+/// itself rather than exec a misparsed path.
+fn parse_exec_wrapper(script: &str) -> Option<(String, Vec<(String, String)>)> {
+    script.strip_prefix("#!")?;
+    for line in script.lines().skip(1) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut tokens = shell_tokens(line).into_iter();
+        let mut env = Vec::new();
+        let mut token = tokens.next()?;
+        while token != "exec" {
+            let (var, val) = token.split_once('=')?;
+            if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return None;
+            }
+            env.push((var.to_string(), val.to_string()));
+            token = tokens.next()?;
+        }
+        let target = tokens.next()?;
+        // "$@" must follow, or the wrapper isn't a pure pass-through and
+        // exec'ing its target directly would change behavior.
+        if tokens.next().as_deref() != Some("$@") || tokens.next().is_some() {
+            return None;
+        }
+        return Some((target, env));
+    }
+    None
+}
+
+/// Whitespace tokenizer with double-quote grouping — just enough for the
+/// one-line Homebrew wrapper shape; no escapes, no single quotes.
+fn shell_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for c in line.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// Persistent container-side $HOME (claude auth, shell history, dotfiles).
 pub fn home_mount() -> Result<PathBuf> {
     let home = crate::config::pall8t_root()?.join("home");
@@ -582,6 +698,63 @@ pub fn default_containerfile_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn parse_exec_wrapper_homebrew_shape() {
+        // Verbatim from a live Homebrew install of apple/container 1.0.0_1.
+        let script = "#!/bin/bash\nCONTAINER_INSTALL_ROOT=\"/opt/homebrew/opt/container\" exec \"/opt/homebrew/Cellar/container/1.0.0_1/libexec/container\"  \"$@\"\n";
+        let (target, env) = parse_exec_wrapper(script).unwrap();
+        assert_eq!(
+            target,
+            "/opt/homebrew/Cellar/container/1.0.0_1/libexec/container"
+        );
+        assert_eq!(
+            env,
+            vec![(
+                "CONTAINER_INSTALL_ROOT".to_string(),
+                "/opt/homebrew/opt/container".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_exec_wrapper_no_assignments() {
+        let script = "#!/bin/sh\nexec \"/usr/local/libexec/container\" \"$@\"\n";
+        let (target, env) = parse_exec_wrapper(script).unwrap();
+        assert_eq!(target, "/usr/local/libexec/container");
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn parse_exec_wrapper_rejects_non_passthrough_shapes() {
+        // A real Mach-O/ELF binary: no shebang.
+        assert_eq!(parse_exec_wrapper("\u{7f}ELF\u{2}..."), None);
+        // Extra args after "$@" — not a pure pass-through.
+        assert_eq!(
+            parse_exec_wrapper("#!/bin/sh\nexec \"/x/container\" \"$@\" --extra\n"),
+            None,
+            "a wrapper that adds arguments must be exec'd as-is"
+        );
+        // Arbitrary logic before the exec token.
+        assert_eq!(
+            parse_exec_wrapper("#!/bin/sh\nif true; then exec \"/x/container\" \"$@\"; fi\n"),
+            None
+        );
+        // A target using a shell variable parses to the literal string —
+        // the parser is syntax-only. client_exec_target's
+        // is_executable_file guard is what rejects it (no such path), so
+        // this pins the contract that the guard is load-bearing.
+        let (target, _) =
+            parse_exec_wrapper("#!/bin/sh\nROOT=\"/opt/x\" exec \"$ROOT/container\" \"$@\"\n")
+                .unwrap();
+        assert_eq!(target, "$ROOT/container");
+        assert!(!is_executable_file(Path::new(&target)));
+        // Missing "$@" entirely.
+        assert_eq!(
+            parse_exec_wrapper("#!/bin/sh\nexec \"/x/container\"\n"),
+            None
+        );
+    }
 
     /// Real shape from `container list --all --format json` (apple/container
     /// 1.0.0): `status` is a nested object, not a bare string. Regression
