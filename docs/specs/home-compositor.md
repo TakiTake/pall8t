@@ -16,7 +16,7 @@ selected in the existing two-layer config, defaulting to today's shared home:
 ```toml
 [home]
 # mode = "shared"    # default: every run mounts ~/.pall8t/home rw (v1 behavior)
-# mode = "isolated"  # per-run fork + harvest/promote, per this spec
+# mode = "isolated"  # per-run fork + harvest/promote, per this spec (experimental in v1)
 ```
 
 Because the config merges per field with the project winning, one project can opt into

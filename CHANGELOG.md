@@ -47,10 +47,10 @@ container home.
   state detection works on the sandboxed agent; sidebar display-name
   reporting (`<agent> (pall8t)`); automatic skip of the tmux wrapper when
   already running inside a herdr pane.
-- Home compositor isolated mode (`[home] mode = "isolated"`) for per-run home
-  forks with harvest/promote/merge (`pall8t home inbox|show|promote|drop|merge`)
-  and revision history/lifecycle management
-  (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in favor of the
-  shared-home mode.
+- Home compositor isolated mode (`[home] mode = "isolated"`, **experimental**)
+  for per-run home forks with harvest/promote/merge
+  (`pall8t home inbox|show|promote|drop|merge`) and revision history/lifecycle
+  management (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in
+  favor of the shared-home mode.
 
 [0.1.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.1.0
