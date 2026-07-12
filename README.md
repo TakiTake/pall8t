@@ -66,7 +66,14 @@ command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
 source = "~/src/other-lib"   # the copy is mounted at this same path
 ```
 
-Containerfile resolution: explicit `containerfile` config → `.pall8t/Containerfile` if present → the built-in default image (node + claude CLI + gh; materialized once at `~/.pall8t/Containerfile` and never overwritten — edit it to customize the shared default, delete it to restore the shipped one). There is no fallback to a root `./Containerfile` — that file usually belongs to the project's own app image, so pall8t never picks it up implicitly; point `containerfile` at it explicitly if you really want that. The build context is always the resolved Containerfile's own directory, so a `.pall8t/Containerfile` can only `COPY` files that live under `.pall8t/`. Custom toolchains must live outside `/home/dev` — the persistent home mount shadows it.
+### Customizing the Containerfile
+
+Resolution priority: explicit `containerfile` config (relative to the project dir) → `.pall8t/Containerfile` if present → the built-in default image (node + claude CLI + gh).
+
+- **User-level default.** The shipped default is materialized once at `~/.pall8t/Containerfile` by `pall8t init` and never overwritten — edit it to customize the default shared by all projects; delete it to restore the shipped one.
+- **Project-level.** Create `.pall8t/Containerfile` to opt a project into its own image instead of the shared default; it always wins over the user-level default. Copying `~/.pall8t/Containerfile` as a starting point is the easy path.
+
+A few caveats apply either way: there is no fallback to a root `./Containerfile` — that file usually belongs to the project's own app image, so pall8t never picks it up implicitly; point `containerfile` at it explicitly if you really want that. The build context is always the resolved Containerfile's own directory, so a `.pall8t/Containerfile` can only `COPY` files that live under `.pall8t/`. Custom toolchains must live outside `/home/dev` — the persistent home mount shadows it.
 
 The image tag embeds the Containerfile's content hash, so any edit — no commit required — triggers a rebuild on the next `run`, and superseded images are pruned automatically after a successful build (images still used by a running container are kept). Only the Containerfile itself is hashed, not files it `COPY`s in; use `pall8t build` to force a rebuild the hash can't see (e.g. updated base image or packages).
 
