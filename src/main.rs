@@ -231,17 +231,28 @@ fn workspace_image(
 /// Replaces this process with `container <argv>`: the cleanest possible
 /// TTY passthrough — the kernel delivers signals straight to the
 /// `container` CLI and the exit code needs no forwarding, because pall8t
-/// is no longer there (NFR-4). `arg0` overrides only argv[0] (binary
-/// resolution still finds `container` on PATH): herdr identifies a pane's
-/// agent from the host process tree by argv0 basename, so naming the
-/// process after the sandboxed agent is what lets herdr track its state
-/// (see `herdr::agent_hint`).
+/// is no longer there (NFR-4). `arg0` overrides only argv[0]: herdr
+/// identifies a pane's agent from the host process tree by argv0 basename,
+/// so naming the process after the sandboxed agent is what lets herdr
+/// track its state (see `herdr::agent_hint`). With an arg0 set, the exec
+/// target is resolved through any Homebrew wrapper script first — the
+/// wrapper's inner `exec` would otherwise rewrite argv[0] and destroy the
+/// hint (see `container::client_exec_target`) — and `HERDR_AGENT` is set
+/// on the process so a future herdr macOS env hint can pick the name up
+/// even where argv0 can't survive.
 fn exec_container(argv: &[String], arg0: Option<&str>) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new("container");
-    if let Some(arg0) = arg0 {
-        cmd.arg0(arg0);
-    }
+    let mut cmd = match arg0 {
+        Some(arg0) => {
+            let (target, env) = container::client_exec_target();
+            let mut cmd = std::process::Command::new(target);
+            cmd.arg0(arg0);
+            cmd.envs(env);
+            cmd.env("HERDR_AGENT", arg0);
+            cmd
+        }
+        None => std::process::Command::new("container"),
+    };
     let err = cmd.args(argv).exec();
     Err(anyhow!(err).context("failed to exec `container`"))
 }
