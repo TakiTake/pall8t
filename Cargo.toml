@@ -1,6 +1,6 @@
 [package]
 name = "pall8t"
-version = "0.4.0"
+version = "0.1.0"
 edition = "2021"
 # Also clippy's MSRV (read from package.rust-version since clippy 1.72), so
 # lints won't suggest APIs newer than this. Keep in sync with the toolchain

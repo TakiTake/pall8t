@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # macos-latest runners are Apple silicon, so a plain native build already
+    # targets aarch64-apple-darwin — no cross-compilation needed.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          set -eu
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(cargo pkgid | sed 's/.*[@#]//')"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (version $TAG_VERSION) does not match Cargo.toml version $CARGO_VERSION" >&2
+            exit 1
+          fi
+          echo "VERSION=$CARGO_VERSION" >> "$GITHUB_ENV"
+
+      # Runs before the costly build/package steps so a missing CHANGELOG
+      # section fails the job fast instead of after a full release build.
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          set -eu
+          NOTES="$(awk -v verline="## [$VERSION] -" '
+            /^## \[/ { if (found) exit; if (index($0, verline) == 1) { found=1; next } }
+            found { print }
+          ' CHANGELOG.md | sed -e '/^\[.*\]: http/d' -e '/./,$!d')"
+          if [ -z "$NOTES" ]; then
+            echo "::error::no CHANGELOG.md section found for version $VERSION" >&2
+            exit 1
+          fi
+          {
+            echo "NOTES<<RELEASE_NOTES_EOF"
+            echo "$NOTES"
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Sanity-check binary version
+        run: |
+          set -eu
+          ACTUAL="$(./target/release/pall8t --version)"
+          case "$ACTUAL" in
+            *"$VERSION"*) ;;
+            *)
+              echo "::error::pall8t --version output '$ACTUAL' does not contain expected version $VERSION" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Package release archive
+        run: |
+          set -eu
+          ARCHIVE="pall8t-v${VERSION}-aarch64-apple-darwin.tar.gz"
+          STAGE="$(mktemp -d)/pall8t-v${VERSION}-aarch64-apple-darwin"
+          mkdir -p "$STAGE"
+          cp target/release/pall8t LICENSE README.md "$STAGE/"
+          tar -czf "$ARCHIVE" -C "$(dirname "$STAGE")" "$(basename "$STAGE")"
+          shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "$GITHUB_REF_NAME" \
+            --title "pall8t v${VERSION}" \
+            --notes "$NOTES" \
+            "$ARCHIVE" \
+            "$ARCHIVE.sha256"

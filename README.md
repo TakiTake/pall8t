@@ -7,7 +7,7 @@ Run AI coding agents inside [apple/container](https://github.com/apple/container
 ## Why
 
 - **Sandboxed by construction.** Agents run in a per-container VM, never on the host. Files land as *your* UID, never root.
-- **No Docker Desktop.** apple/container is macOS-native and boots fast, but its CLI is docker-incompatible; pall8t abstracts it into exactly what running an agent needs.
+- **No Docker Desktop.** apple/container is macOS-native and boots fast, but its CLI is docker-incompatible; pall8t abstracts it into exactly what running an agent needs. apple/container is the only supported runtime — there's no Docker, OrbStack, or podman backend.
 - **Host non-pollution.** `~/.pall8t/home` is mounted as the container home — the agent's login and config live there, and your host `~/.claude` is never touched.
 - **Automatic rebuilds, no daemon.** At `run` time the Containerfile's content hash picks the image tag; a change means a rebuild before launch. No watch process, no state file.
 - **Worktree-aware.** If your cwd is a git worktree, the main repository's `.git` is mounted too, so git inside the container works exactly as on the host.
@@ -16,13 +16,17 @@ Run AI coding agents inside [apple/container](https://github.com/apple/container
 ## Requirements
 
 - macOS on Apple silicon, [apple/container](https://github.com/apple/container) installed
-- git, Rust toolchain (build from source for now)
+- git
 
 ## Install & quickstart
 
 ```sh
-cargo install --path .
+brew install TakiTake/tap/pall8t
+```
 
+(published together with the v0.1.0 release; until then, or to build from source, use `cargo install --path .` — this needs the Rust toolchain.)
+
+```sh
 cd ~/src/my-project
 pall8t init     # one-time: ~/.pall8t/home, .pall8t/config.toml skeleton, default Containerfile
 pall8t run      # build if needed, then run the agent (default: claude) in the sandbox
@@ -104,8 +108,8 @@ then, inside the container (one-time, persists in the container home), add `"tea
 
 ## Known limitations (v1)
 
-- **Shared home under parallel runs (default mode only).** The default `[home] mode = "shared"` has all containers share `~/.pall8t/home` rw; Claude Code has known `~/.claude.json` corruption issues under concurrent sessions — the same conditions as parallel agents on the host. Set `mode = "isolated"` to opt in to per-run home forks with automatic harvest and explicit promote/merge (`pall8t home inbox|show|promote|drop|merge`), plus revision history and lifecycle management (`pall8t home log|diff|rollback|ls|rm|gc`) — see [docs/specs/home-compositor.md](docs/specs/home-compositor.md). Still off by default in v1; only the pluggable local-Claude merge resolver and the non-APFS fork fallback remain on the roadmap.
+- **Shared home under parallel runs (default mode only).** The default `[home] mode = "shared"` has all containers share `~/.pall8t/home` rw; Claude Code has known `~/.claude.json` corruption issues under concurrent sessions — the same conditions as parallel agents on the host. Set `mode = "isolated"` (**experimental**) to opt in to per-run home forks with automatic harvest and explicit promote/merge (`pall8t home inbox|show|promote|drop|merge`), plus revision history and lifecycle management (`pall8t home log|diff|rollback|ls|rm|gc`) — see [docs/specs/home-compositor.md](docs/specs/home-compositor.md). Off by default and experimental in v1; only the pluggable local-Claude merge resolver and the non-APFS fork fallback remain on the roadmap.
 - **No read-only mounts** (apple/container limitation) — reference repos are protected by `git clone --local` duplication instead.
 - **Workspace isolation is the caller's responsibility.** Two agents in the same directory will step on each other; use worktrees.
 
-Full requirements in [docs/requirements.md](docs/requirements.md); architecture decisions in [docs/adr/](docs/adr/).
+Full requirements in [docs/requirements.md](docs/requirements.md); architecture decisions in [docs/adr/](docs/adr/); release process in [docs/release.md](docs/release.md).
