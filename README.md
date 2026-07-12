@@ -24,7 +24,7 @@ Run AI coding agents inside [apple/container](https://github.com/apple/container
 brew install TakiTake/tap/pall8t
 ```
 
-(published together with the v0.1.0 release; until then, or to build from source, use `cargo install --path .` — this needs the Rust toolchain.)
+(or build from source with `cargo install --path .` — this needs the Rust toolchain.)
 
 ```sh
 cd ~/src/my-project
