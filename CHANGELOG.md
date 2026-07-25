@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-25
+
+### Added
+
+- `[container] watch = [...]` config: extra project files (e.g. a lockfile
+  such as `flake.nix`/`flake.lock`) whose path and contents fold into the
+  same image-tag hash as the Containerfile, so editing one of them now
+  triggers a rebuild too instead of silently reusing a stale image
+  ([#35](https://github.com/TakiTake/pall8t/issues/35)). Requires a project
+  Containerfile (`container.containerfile` or `.pall8t/Containerfile`);
+  literal paths only (no globs), capped at 100 files / 4 MiB combined, and
+  a missing or non-regular listed file is a hard error rather than being
+  silently skipped.
+
+### Changed
+
+- README: documented Containerfile customization as its own subsection,
+  corrected herdr integration guidance (plain `pall8t run` is recognized
+  directly — no `herdr agent start` wrapper needed), and trimmed a stale
+  pre-release Homebrew install caveat.
+
 ## [0.1.0] - 2026-07-12
 
 Initial public release.
@@ -53,4 +74,5 @@ container home.
   management (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in
   favor of the shared-home mode.
 
+[0.2.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.2.0
 [0.1.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.1.0
