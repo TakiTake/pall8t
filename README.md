@@ -57,6 +57,7 @@ Two layers, merged per field with the project winning: global `~/.pall8t/config.
 cpus = 4
 memory = "8g"
 # containerfile = "path/to/other/Containerfile"   # relative to the project dir; default: .pall8t/Containerfile
+# watch = ["flake.nix", "flake.lock"]   # extra files whose content also decides whether to rebuild
 
 [run]
 command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
@@ -75,7 +76,7 @@ Resolution priority: explicit `containerfile` config (relative to the project di
 
 A few caveats apply either way: there is no fallback to a root `./Containerfile` — that file usually belongs to the project's own app image, so pall8t never picks it up implicitly; point `containerfile` at it explicitly if you really want that. The build context is always the resolved Containerfile's own directory, so a `.pall8t/Containerfile` can only `COPY` files that live under `.pall8t/`. Custom toolchains must live outside `/home/dev` — the persistent home mount shadows it.
 
-The image tag embeds the Containerfile's content hash, so any edit — no commit required — triggers a rebuild on the next `run`, and superseded images are pruned automatically after a successful build (images still used by a running container are kept). Only the Containerfile itself is hashed, not files it `COPY`s in; use `pall8t build` to force a rebuild the hash can't see (e.g. updated base image or packages).
+The image tag embeds the Containerfile's content hash, so any edit — no commit required — triggers a rebuild on the next `run`, and superseded images are pruned automatically after a successful build (images still used by a running container are kept). Only the Containerfile itself is hashed by default, not files it `COPY`s in — set `container.watch` to fold specific extra files into the same hash (e.g. a lockfile the Containerfile builds the toolchain from), so editing one of them also triggers a rebuild instead of silently reusing a stale image. Constraints: literal paths only (no globs), relative to the project dir, must already exist as regular files (a missing entry, or one that isn't a regular file, is a hard error, never silently skipped), capped at 100 files / 4 MiB combined, and only usable with a project Containerfile (`containerfile` or `.pall8t/Containerfile`) — the built-in default image builds from `~/.pall8t` and can't depend on per-project files. `pall8t build` remains the escape hatch for what no hash can see (e.g. updated base image or packages).
 
 A build streams `container build`'s own output live to stderr — no `-v` flag, this is always on, since a silent multi-minute build looks hung. Deliberately kept off pall8t's own stdout, which `pall8t build`'s final `built <tag>` line and `pall8t ls --json` need to stay machine-readable.
 
