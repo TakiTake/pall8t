@@ -28,6 +28,12 @@ pub struct Config {
     /// file actually built (including the local/default probing when this
     /// is `None`) happens in [`crate::image::resolve`].
     pub containerfile: Option<PathBuf>,
+    /// Extra project files whose path+contents fold into the image tag hash
+    /// alongside the Containerfile (issue #35), so editing a lockfile the
+    /// Containerfile `COPY`s in triggers a rebuild instead of silently
+    /// reusing a stale image. See [`crate::image::resolve_watch_paths`] for
+    /// path validation and [`crate::image::combined_hash`] for the hash.
+    pub watch: Vec<PathBuf>,
     pub command: Vec<String>,
     pub repos: Vec<RepoEntry>,
     /// `[home]` — how the container home is materialized and how a run's
@@ -91,7 +97,7 @@ pub struct PolicyRule {
     pub strategy: Option<MergeStrategy>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct Raw {
     #[serde(default)]
     container: RawContainer,
@@ -102,7 +108,7 @@ struct Raw {
     home: RawHome,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct RawHome {
     mode: Option<HomeMode>,
     policy: Option<Vec<PolicyRule>>,
@@ -110,14 +116,15 @@ struct RawHome {
     inbox_ttl_days: Option<u32>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct RawContainer {
     cpus: Option<u32>,
     memory: Option<String>,
     containerfile: Option<PathBuf>,
+    watch: Option<Vec<PathBuf>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct RawRun {
     command: Option<Vec<String>>,
 }
@@ -169,6 +176,15 @@ fn merge(global: Raw, project: Raw) -> Config {
             .container
             .containerfile
             .or(global.container.containerfile),
+        // Replace, not append — like `repos`/`home.policy`: a project's
+        // watch list fully controls what folds into its own image hash
+        // rather than inheriting entries a global config can't guarantee
+        // exist in every project.
+        watch: project
+            .container
+            .watch
+            .or(global.container.watch)
+            .unwrap_or_default(),
         command: project
             .run
             .command
@@ -253,6 +269,13 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 # image. Only set this to point somewhere else — relative to the project
 # dir (absolute paths and ~ also work):
 # containerfile = "path/to/other/Containerfile"
+#
+# Extra project files whose contents also decide whether to rebuild the
+# image — e.g. a lockfile the Containerfile COPYs in and builds from, so
+# editing it doesn't silently reuse a stale image. Requires a project
+# Containerfile (containerfile above or .pall8t/Containerfile); paths are
+# relative to the project dir and must exist.
+# watch = ["flake.nix", "flake.lock"]
 
 [run]
 # command = ["claude"]
@@ -326,6 +349,7 @@ mod tests {
         assert_eq!(cfg.cpus, 4);
         assert_eq!(cfg.memory, "8g");
         assert_eq!(cfg.containerfile, None);
+        assert!(cfg.watch.is_empty());
         assert_eq!(cfg.command, vec!["claude".to_string()]);
         assert!(cfg.repos.is_empty());
         assert_eq!(
@@ -475,6 +499,25 @@ mod tests {
                 source: "~/src/a".into()
             }],
             "global repos apply when the project declares none"
+        );
+    }
+
+    #[test]
+    fn watch_merges_project_replaces_global() {
+        let global = parse("[container]\nwatch = [\"a.lock\"]\n");
+        let project = parse("[container]\nwatch = [\"b.lock\", \"c.lock\"]\n");
+        let cfg = merge(global.clone(), project);
+        assert_eq!(
+            cfg.watch,
+            vec![PathBuf::from("b.lock"), PathBuf::from("c.lock")],
+            "project watch list replaces global rather than appending"
+        );
+
+        let cfg = merge(global, Raw::default());
+        assert_eq!(
+            cfg.watch,
+            vec![PathBuf::from("a.lock")],
+            "global watch applies when the project declares none"
         );
     }
 

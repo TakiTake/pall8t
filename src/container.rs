@@ -57,22 +57,16 @@ pub fn image_tag(base: &str, uid: u32, gid: u32) -> String {
     format!("{base}:{uid}-{gid}")
 }
 
-/// Like [`image_tag`], but suffixed with a Containerfile content hash (see
-/// [`containerfile_content_hash`]) so a change to its contents resolves to
-/// a new tag.
+/// Like [`image_tag`], but suffixed with a content hash (see
+/// [`crate::image::combined_hash`]) of the Containerfile — and, if
+/// `container.watch` lists any, those files too — so a change to any of
+/// their contents resolves to a new tag. Hashing the working-tree contents
+/// (rather than, say, the last commit that touched a file) means
+/// uncommitted edits are detected too, and a rebuild can never poison a
+/// tag: the same content always resolves to the same tag, so the tag
+/// always corresponds to the image built from it.
 pub fn image_tag_hashed(base: &str, uid: u32, gid: u32, hash: &str) -> String {
     format!("{base}:{uid}-{gid}-{hash}")
-}
-
-/// First 12 hex chars of the sha256 of `containerfile`'s current bytes.
-/// Hashing the working-tree contents (rather than, say, the last commit
-/// that touched the file) means uncommitted edits are detected too, and a
-/// rebuild can never poison a tag: the same content always resolves to the
-/// same tag, so the tag always corresponds to the image built from it.
-/// `None` if the file can't be read.
-pub fn containerfile_content_hash(containerfile: &Path) -> Option<String> {
-    let bytes = std::fs::read(containerfile).ok()?;
-    Some(sha256_hex_prefix(&bytes, 6))
 }
 
 fn run_ok<I, S>(args: I) -> Result<String>
@@ -697,7 +691,6 @@ pub fn default_containerfile_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn parse_exec_wrapper_homebrew_shape() {
@@ -1117,48 +1110,5 @@ mod tests {
             !scripted.contains(&"-w".to_string()),
             "unknown workdir is omitted"
         );
-    }
-
-    #[test]
-    fn containerfile_content_hash_is_stable_and_12_chars() {
-        let dir = std::env::temp_dir().join(format!("pall8t-test-hash-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("Containerfile");
-        fs::write(&file, "FROM scratch\n").unwrap();
-
-        let first = containerfile_content_hash(&file).expect("hash");
-        let second = containerfile_content_hash(&file).expect("hash");
-        assert_eq!(first.len(), 12);
-        assert_eq!(first, second);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn containerfile_content_hash_changes_with_content() {
-        let dir =
-            std::env::temp_dir().join(format!("pall8t-test-hash-diff-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("Containerfile");
-
-        fs::write(&file, "FROM scratch\n").unwrap();
-        let a = containerfile_content_hash(&file).unwrap();
-        fs::write(&file, "FROM scratch\nRUN true\n").unwrap();
-        let b = containerfile_content_hash(&file).unwrap();
-
-        assert_ne!(a, b);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn containerfile_content_hash_none_when_missing() {
-        let dir =
-            std::env::temp_dir().join(format!("pall8t-test-hash-missing-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let file = dir.join("Containerfile");
-
-        assert_eq!(containerfile_content_hash(&file), None);
     }
 }
