@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-01
 
 ### Added
 
@@ -14,13 +14,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`HERDR_ENV`, workspace/tab/pane ids), a host-side relay to `herdr.sock`
   (apple/container mounts can't forward Unix sockets), an in-container
   socat bridge, and a version-matched Linux `herdr` binary auto-downloaded
-  to `~/.pall8t/tools/` and mounted on `PATH`. Governed by the new
-  `[herdr] sandbox` config: `"full"` (default; host-admin methods such as
-  `server stop`/`integration install` are always denied), `"readonly"`,
-  or `"off"`. Every relayed request is peer-pinned to the sandbox
-  container's IP and audit-logged under `~/.pall8t/logs/`.
+  once to `~/.pall8t/tools/herdr/<version>/` (integrity-verified against a
+  sha256 sidecar on every use) and copied per-run into
+  `~/.pall8t/tools/herdr-run/<container>/`, which is mounted on `PATH` — so
+  one sandbox can never tamper with the binary another executes. Governed
+  by the new `[herdr] sandbox` config: `"full"` (default; host-admin
+  methods such as `server stop`/`integration install` are always denied by
+  namespace), `"readonly"`, or `"off"`. Every relayed request is
+  peer-pinned to the sandbox container's IP and audit-logged under
+  `~/.pall8t/logs/`.
 - The default image now installs `socat` (required by the in-container
   bridge; its absence degrades with a warning, never a failed run).
+
+### Development
+
+- Review-environment tooling: `.coderabbit.yaml` (CodeRabbit config, free
+  for this public repo), a dormant Codex PR-review workflow
+  (`codex-review.yml`, needs an `OPENAI_API_KEY` secret), weekly
+  report-only mutation-testing (`mutants.yml`) and duplication/unused-deps
+  (`hygiene.yml`) workflows, the `local-review`/`review-loop` skills, and
+  `docs/testing.md`. None gate the build.
 
 ## [0.2.0] - 2026-07-25
 
@@ -91,5 +104,6 @@ container home.
   management (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in
   favor of the shared-home mode.
 
+[0.3.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.3.0
 [0.2.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.2.0
 [0.1.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.1.0
