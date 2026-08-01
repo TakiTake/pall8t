@@ -9,7 +9,7 @@ ARG GID=501
 # authenticated api.github.com/meta (not ssh-keyscan/TOFU) so git-over-SSH works
 # without an interactive host-key prompt.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git sudo ripgrep less vim openssh-client tmux jq \
+      ca-certificates curl git sudo ripgrep less vim openssh-client tmux jq socat \
       build-essential pkg-config mold && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \

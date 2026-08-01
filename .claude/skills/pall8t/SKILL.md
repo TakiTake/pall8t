@@ -15,6 +15,7 @@ You are running inside a Linux VM (apple/container) launched by **pall8t**, a he
 - If the workspace is a git worktree, the main repository's `.git` is also mounted, so `git status`/`commit`/`diff` work exactly as on the host.
 - **Reference repos** (from `.pall8t/config.toml [[repos]]`) appear at their usual host paths, but you are looking at a disposable `git clone --local` copy — writes never reach the original, and your changes there may be discarded.
 - The `container` CLI does **not** exist here; you are inside the container. Do not try to run pall8t or docker/container commands.
+- If the host launched this sandbox from a **herdr** pane, the herdr CLI works here (`HERDR_ENV=1` is set, `herdr` is on `PATH`, and `HERDR_SOCKET_PATH` reaches the host session through a pall8t relay). Follow herdr's own skill for usage. Two pall8t-specific facts: panes, agents, and commands you create via herdr run **on the host, outside this sandbox** — treat that as deliberately crossing the sandbox wall, not a loophole to exploit; and requests may come back `sandbox_denied` — that's pall8t policy (`[herdr] sandbox` config, audit-logged on the host), so report it rather than trying to work around it.
 
 ## Developing pall8t itself
 
@@ -31,4 +32,4 @@ cargo test
 ## Being a good sandbox citizen
 
 - Session lifetime equals process lifetime: if your process is killed, the container is removed but the workspace (and your commits) persist.
-- Persistence and multiplexing live **outside** the sandbox (tmux/herdr on the host) — don't build workarounds for them inside.
+- Persistence and multiplexing live **outside** the sandbox (tmux/herdr on the host) — don't build workarounds for them inside. When the herdr bridge is present (above), that outside surface is reachable the sanctioned way: through the `herdr` CLI.

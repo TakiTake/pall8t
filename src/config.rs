@@ -39,6 +39,40 @@ pub struct Config {
     /// `[home]` — how the container home is materialized and how a run's
     /// changes to it are classified (see [`crate::home`]).
     pub home: HomeConfig,
+    /// `[herdr]` — how much of the host herdr session a sandboxed agent
+    /// may reach through the relay bridge (see [`crate::relay`]).
+    pub herdr: HerdrConfig,
+}
+
+/// Merged `[herdr]` configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HerdrConfig {
+    pub sandbox: HerdrSandbox,
+}
+
+/// What the sandboxed agent may do to the host herdr session over the
+/// bridge. `full` is the default: transparent passthrough of the whole
+/// herdr CLI surface except host-admin methods (see
+/// [`crate::relay::classify`]) — pall8t is a guardrail, not a blocker.
+/// `readonly` permits only inspection (list/get/read/wait); `off` disables
+/// the bridge entirely (v1 behavior: the sandbox can't see herdr at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HerdrSandbox {
+    #[default]
+    Full,
+    Readonly,
+    Off,
+}
+
+impl HerdrSandbox {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HerdrSandbox::Full => "full",
+            HerdrSandbox::Readonly => "readonly",
+            HerdrSandbox::Off => "off",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -106,6 +140,13 @@ struct Raw {
     repos: Option<Vec<RepoEntry>>,
     #[serde(default)]
     home: RawHome,
+    #[serde(default)]
+    herdr: RawHerdr,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawHerdr {
+    sandbox: Option<HerdrSandbox>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -213,6 +254,13 @@ fn merge(global: Raw, project: Raw) -> Config {
                 .or(global.home.inbox_ttl_days)
                 .unwrap_or(crate::home::DEFAULT_INBOX_TTL_DAYS),
         },
+        herdr: HerdrConfig {
+            sandbox: project
+                .herdr
+                .sandbox
+                .or(global.herdr.sandbox)
+                .unwrap_or_default(),
+        },
     }
 }
 
@@ -255,6 +303,17 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # `pall8t home gc` warns (never deletes) about inbox changesets older than
 # this many days — dropping unreviewed knowledge is always a user decision.
 # inbox_ttl_days = 14
+
+[herdr]
+# What a sandboxed agent may do to the host herdr session when pall8t runs
+# inside a herdr pane (the bridge is inert outside herdr):
+#   "full"     (default) transparent herdr CLI passthrough, except host-admin
+#              methods (server stop/handoff/reload, integration/plugin
+#              installs) which are always blocked
+#   "readonly" inspection only (list/get/read/wait) — no panes, prompts,
+#              or input from inside the sandbox
+#   "off"      the sandbox can't see herdr at all
+# sandbox = "full"
 "#;
 
 /// Skeleton written by `pall8t init` as `.pall8t/config.toml`.
@@ -282,6 +341,9 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 
 [home]
 # mode = "isolated"  # per-run home fork + harvest/promote (default: shared)
+
+[herdr]
+# sandbox = "full"   # or "readonly" / "off" — see ~/.pall8t/config.toml
 "#;
 
 #[cfg(test)]
@@ -364,6 +426,27 @@ mod tests {
             cfg.home,
             HomeConfig::default(),
             "Default matches merge()'s defaults"
+        );
+        assert_eq!(
+            cfg.herdr.sandbox,
+            HerdrSandbox::Full,
+            "full herdr passthrough is the default"
+        );
+    }
+
+    #[test]
+    fn herdr_sandbox_merges_per_field_and_rejects_unknown_values() {
+        let global = parse("[herdr]\nsandbox = \"readonly\"\n");
+        let cfg = merge(global.clone(), Raw::default());
+        assert_eq!(cfg.herdr.sandbox, HerdrSandbox::Readonly);
+
+        let project = parse("[herdr]\nsandbox = \"off\"\n");
+        let cfg = merge(global, project);
+        assert_eq!(cfg.herdr.sandbox, HerdrSandbox::Off, "project wins");
+
+        assert!(
+            toml::from_str::<Raw>("[herdr]\nsandbox = \"bogus\"\n").is_err(),
+            "an unknown sandbox value must fail to parse"
         );
     }
 
