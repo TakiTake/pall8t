@@ -378,12 +378,28 @@ fn spawn_relay(socket: &str, container_name: &str, mode: crate::relay::Mode) -> 
 /// `herdr --version` → `"0.7.5"`. The version pin matters: herdr's CLI
 /// refuses to talk across any protocol-version difference, so the Linux
 /// binary in the sandbox must come from exactly the host's release.
+/// Goes through [`crate::util::run_ok`] like every other parsed-output CLI
+/// call in the crate; `herdr --version` exits 0, and a nonzero exit
+/// wouldn't yield a `parse_herdr_version`-acceptable token anyway.
 pub fn host_herdr_version(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .ok()?;
-    parse_herdr_version(&String::from_utf8_lossy(&out.stdout))
+    let out = crate::util::run_ok(bin, &["--version".to_string()]).ok()?;
+    parse_herdr_version(&out)
+}
+
+/// The cache layout for the host's herdr `version`: `(dir, bin, sidecar)`.
+/// The sidecar sits in the parent of `dir` on purpose — `dir` is what gets
+/// mounted rw into sandboxes, so the integrity record must live outside it
+/// (see [`cache_verified`]). One definition so [`ensure_linux_herdr`] and
+/// [`cached_linux_herdr`] can never disagree on where "verified" is
+/// recorded.
+fn cache_paths(
+    version: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let root = crate::config::pall8t_root()?.join("tools").join("herdr");
+    let dir = root.join(version);
+    let bin = dir.join("herdr");
+    let sidecar = root.join(format!("{version}.sha256"));
+    Ok((dir, bin, sidecar))
 }
 
 fn parse_herdr_version(stdout: &str) -> Option<String> {
@@ -440,10 +456,7 @@ fn cache_verified(bin: &std::path::Path, sidecar: &std::path::Path) -> bool {
 fn ensure_linux_herdr(host_bin: &str) -> Result<std::path::PathBuf> {
     let version = host_herdr_version(host_bin)
         .ok_or_else(|| anyhow::anyhow!("cannot determine the host herdr version"))?;
-    let root = crate::config::pall8t_root()?.join("tools").join("herdr");
-    let dir = root.join(&version);
-    let bin = dir.join("herdr");
-    let sidecar = root.join(format!("{version}.sha256"));
+    let (dir, bin, sidecar) = cache_paths(&version)?;
     if bin.exists() {
         if cache_verified(&bin, &sidecar) {
             return Ok(dir);
@@ -480,7 +493,8 @@ fn ensure_linux_herdr(host_bin: &str) -> Result<std::path::PathBuf> {
     // verification failure and re-downloads — never a trusted-but-wrong
     // state.
     let digest = sha256_file(&tmp)?;
-    let sidecar_tmp = root.join(format!(".{version}.sha256.{}", std::process::id()));
+    // Temp beside the sidecar (same dir) so the publish is an atomic rename.
+    let sidecar_tmp = sidecar.with_extension(format!("sha256.{}", std::process::id()));
     std::fs::write(&sidecar_tmp, &digest)?;
     std::fs::rename(&sidecar_tmp, &sidecar)?;
     std::fs::rename(&tmp, &bin)?;
@@ -521,13 +535,10 @@ impl DoctorSnapshot {
 /// [`ensure_linux_herdr`]) — for `doctor`.
 pub fn cached_linux_herdr(host_bin: &str) -> Option<std::path::PathBuf> {
     let version = host_herdr_version(host_bin)?;
-    let root = crate::config::pall8t_root()
-        .ok()?
-        .join("tools")
-        .join("herdr");
-    let bin = root.join(&version).join("herdr");
-    let sidecar = root.join(format!("{version}.sha256"));
-    (bin.exists() && cache_verified(&bin, &sidecar)).then_some(bin)
+    let (_, bin, sidecar) = cache_paths(&version).ok()?;
+    // No separate `bin.exists()`: cache_verified already returns false when
+    // the binary can't be read (see `cache_verified_table`).
+    cache_verified(&bin, &sidecar).then_some(bin)
 }
 
 /// Bridge-prerequisite lines appended to `doctor`'s report. Both are

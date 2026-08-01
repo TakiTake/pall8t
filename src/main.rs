@@ -334,10 +334,7 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
                 eprintln!(
                     "pall8t: herdr bridge active ({}) — the sandboxed agent can reach \
                      this herdr session; audit log in ~/.pall8t/logs/",
-                    match cfg.herdr.sandbox {
-                        config::HerdrSandbox::Readonly => "readonly",
-                        _ => "full",
-                    }
+                    cfg.herdr.sandbox.as_str()
                 );
                 mounts.extend(bridge.mounts);
                 env_vars = bridge.env;

@@ -31,7 +31,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Relay-side view of [`crate::config::HerdrSandbox`]: `Off` never reaches
 /// the relay (no relay is spawned at all), so only the two serving modes
@@ -174,6 +174,20 @@ fn deny_response(id: &str, method: &str, mode: Mode) -> String {
 /// than this is not a herdr request.
 const MAX_REQUEST_LINE: u64 = 1024 * 1024;
 
+/// Just the two fields the relay's policy check reads out of a request
+/// line. Deserializing only these skips materializing `params` (up to
+/// [`MAX_REQUEST_LINE`]: agent.prompt bodies, graphics payloads) per
+/// connection. `Cow` borrows straight out of the request line for the
+/// common unescaped case and only allocates for a value needing
+/// unescaping, so this parses any id/method the whole-`Value` path did.
+#[derive(serde::Deserialize)]
+struct ReqHead<'a> {
+    #[serde(default, borrow)]
+    method: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    id: Option<std::borrow::Cow<'a, str>>,
+}
+
 /// How the relay decides whether a connection's peer is the sandbox.
 /// The container's address is resolved lazily (the container doesn't
 /// exist yet when the relay starts) and cached once found.
@@ -188,10 +202,7 @@ impl PeerGate {
             PeerPolicy::AllowAll => return true,
             PeerPolicy::Container(name) => name,
         };
-        let mut cached = self
-            .cached
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cached = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
         if cached.is_none() {
             *cached = crate::container::ip_address(name).and_then(|s| s.parse::<IpAddr>().ok());
         }
@@ -243,20 +254,21 @@ pub fn run(socket: &Path, container: &str, mode: Mode, log_path: &Path) -> Resul
     // before spawning this relay; if resolving it still fails, fall back
     // to 0.0.0.0, where the peer-IP gate remains the (audited) control.
     let gateway = crate::container::default_gateway().and_then(|s| s.parse::<IpAddr>().ok());
-    let listener = match gateway {
-        Some(ip) => TcpListener::bind((ip, 0))
-            .or_else(|_| TcpListener::bind(("0.0.0.0", 0)))
-            .context("cannot bind the relay TCP listener")?,
-        None => TcpListener::bind(("0.0.0.0", 0)).context("cannot bind the relay TCP listener")?,
-    };
-    let port = listener.local_addr()?.port();
+    let listener = gateway
+        .and_then(|ip| TcpListener::bind((ip, 0)).ok())
+        .map_or_else(
+            || TcpListener::bind(("0.0.0.0", 0)).context("cannot bind the relay TCP listener"),
+            Ok,
+        )?;
+    let addr = listener.local_addr()?;
+    let port = addr.port();
     println!("{port}");
     // The port line is the whole stdout contract; anything later would
     // land in a pipe nobody reads (the parent execs away).
     drop(std::io::stdout().flush());
 
     watch_parent();
-    let gate = std::sync::Arc::new(PeerGate {
+    let gate = Arc::new(PeerGate {
         policy: PeerPolicy::Container(container.to_string()),
         cached: Mutex::new(None),
     });
@@ -264,7 +276,7 @@ pub fn run(socket: &Path, container: &str, mode: Mode, log_path: &Path) -> Resul
         log_path,
         &serde_json::json!({
             "ts": epoch_secs(), "event": "start",
-            "bind": listener.local_addr().map_or_else(|_| "?".into(), |a| a.ip().to_string()),
+            "bind": addr.ip().to_string(),
             "port": port, "mode": mode.as_str(), "container": container,
             "socket": socket.display().to_string(),
         }),
@@ -275,17 +287,11 @@ pub fn run(socket: &Path, container: &str, mode: Mode, log_path: &Path) -> Resul
 
 /// Accept loop, factored from [`run`] so tests can drive it on a listener
 /// and peer policy they control.
-fn serve(
-    listener: &TcpListener,
-    socket: &Path,
-    mode: Mode,
-    gate: &std::sync::Arc<PeerGate>,
-    log_path: &Path,
-) {
+fn serve(listener: &TcpListener, socket: &Path, mode: Mode, gate: &Arc<PeerGate>, log_path: &Path) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let socket = socket.to_path_buf();
-        let gate = std::sync::Arc::clone(gate);
+        let gate = Arc::clone(gate);
         let log_path = log_path.to_path_buf();
         std::thread::spawn(move || {
             if let Err(e) = handle(conn, &socket, mode, &gate, &log_path) {
@@ -305,7 +311,7 @@ fn serve(
 /// forward to the herdr socket and pump bytes both ways until either side
 /// closes (streaming methods like `events.subscribe` hold the connection).
 fn handle(
-    conn: TcpStream,
+    mut conn: TcpStream,
     socket: &Path,
     mode: Mode,
     gate: &PeerGate,
@@ -323,7 +329,6 @@ fn handle(
         return Ok(());
     }
 
-    let mut conn = conn;
     let mut reader = BufReader::new(conn.try_clone()?).take(MAX_REQUEST_LINE);
     let mut line = String::new();
     reader
@@ -333,17 +338,14 @@ fn handle(
         return Ok(());
     }
 
-    let parsed: Option<serde_json::Value> = serde_json::from_str(line.trim()).ok();
-    let method = parsed
+    // Deserialize only the two fields policy needs (see [`ReqHead`]), not
+    // the whole request — `params` can be up to MAX_REQUEST_LINE.
+    let head: Option<ReqHead> = serde_json::from_str(line.trim()).ok();
+    let method = head
         .as_ref()
-        .and_then(|v| v.get("method"))
-        .and_then(|m| m.as_str())
+        .and_then(|h| h.method.as_deref())
         .unwrap_or("");
-    let id = parsed
-        .as_ref()
-        .and_then(|v| v.get("id"))
-        .and_then(|i| i.as_str())
-        .unwrap_or("");
+    let id = head.as_ref().and_then(|h| h.id.as_deref()).unwrap_or("");
 
     // An unparseable line has no method to check: in full mode it is
     // forwarded (herdr answers `invalid_request` itself — staying out of
@@ -501,7 +503,7 @@ mod tests {
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let gate = std::sync::Arc::new(PeerGate {
+        let gate = Arc::new(PeerGate {
             policy: PeerPolicy::AllowAll,
             cached: Mutex::new(None),
         });
@@ -589,7 +591,7 @@ mod tests {
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let gate = std::sync::Arc::new(PeerGate {
+        let gate = Arc::new(PeerGate {
             policy: PeerPolicy::AllowAll,
             cached: Mutex::new(None),
         });
