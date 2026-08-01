@@ -5,11 +5,16 @@
 //! run` execs into the sandboxed container, so any herdr-facing action has
 //! to happen here, before the exec (see `main.rs::exec_container`).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// A herdr pane's identity, as seen by the host-side `pall8t` process.
 pub struct HerdrEnv {
     pub pane_id: String,
+    /// `HERDR_WORKSPACE_ID`/`HERDR_TAB_ID` — forwarded into the sandbox so
+    /// the herdr CLI's `--current`/caller-context conventions keep working
+    /// there (see [`crate::relay`]); nothing host-side reads them.
+    pub workspace_id: Option<String>,
+    pub tab_id: Option<String>,
     pub socket_path: Option<String>,
     pub bin_path: Option<String>,
     /// `HERDR_AGENT` — herdr's own agent-hint convention. herdr itself only
@@ -36,6 +41,8 @@ pub fn detect() -> Option<HerdrEnv> {
     }
     Some(HerdrEnv {
         pane_id: non_empty_env("HERDR_PANE_ID")?,
+        workspace_id: non_empty_env("HERDR_WORKSPACE_ID"),
+        tab_id: non_empty_env("HERDR_TAB_ID"),
         socket_path: non_empty_env("HERDR_SOCKET_PATH"),
         bin_path: non_empty_env("HERDR_BIN_PATH"),
         agent: non_empty_env("HERDR_AGENT"),
@@ -205,6 +212,376 @@ fn report_metadata(env: &HerdrEnv, agent: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Sandbox bridge (ADR-0007): make the herdr CLI work *inside* the container.
+// ---------------------------------------------------------------------------
+
+/// Where the in-container Unix socket for the herdr CLI lives. Under /tmp
+/// (container-local tmpfs): per-container, never persisted, writable by
+/// `dev`, and short enough for `sun_path`.
+pub const CONTAINER_SOCKET_PATH: &str = "/tmp/pall8t/herdr.sock";
+
+/// Mount destination for the version-matched Linux `herdr` binary; the
+/// bootstrap prepends it to `PATH`.
+pub const CONTAINER_BIN_DIR: &str = "/opt/pall8t/bin";
+
+/// In-container bootstrap, run as the command's `sh -c` prologue. Bridges
+/// `HERDR_SOCKET_PATH` (a Unix socket the stock herdr CLI expects) to the
+/// host relay's TCP port via socat, then execs the real command. The vmnet
+/// gateway — the host — is read from /proc/net/route; the hex→decimal
+/// conversion is done in portable awk because dash's printf isn't
+/// guaranteed to accept 0x literals. Everything is best-effort: a missing
+/// socat or route degrades to "no herdr CLI in this sandbox" with a
+/// warning, never a failed run.
+const BOOTSTRAP: &str = r#"
+if [ -n "${PALL8T_HERDR_PORT:-}" ] && [ -n "${HERDR_SOCKET_PATH:-}" ]; then
+  if command -v socat >/dev/null 2>&1; then
+    gw=$(awk 'function hex(s,  n,i){n=0;for(i=1;i<=length(s);i++)n=n*16+index("0123456789abcdef",tolower(substr(s,i,1)))-1;return n}
+      $2=="00000000"{h=$3;print hex(substr(h,7,2)) "." hex(substr(h,5,2)) "." hex(substr(h,3,2)) "." hex(substr(h,1,2));exit}' /proc/net/route)
+    if [ -n "$gw" ]; then
+      mkdir -p "$(dirname "$HERDR_SOCKET_PATH")"
+      rm -f "$HERDR_SOCKET_PATH"
+      socat "UNIX-LISTEN:$HERDR_SOCKET_PATH,fork" "TCP:$gw:$PALL8T_HERDR_PORT" >/dev/null 2>&1 &
+    else
+      echo 'pall8t: herdr bridge: no default route in /proc/net/route' >&2
+    fi
+  else
+    echo 'pall8t: herdr bridge: socat not in the image (add it to your Containerfile) - the herdr CLI will not work here' >&2
+  fi
+fi
+if [ -d /opt/pall8t/bin ]; then
+  PATH="/opt/pall8t/bin:$PATH"
+  export PATH
+fi
+exec "$@"
+"#;
+
+/// Env + mounts the bridge adds to the `container run` invocation.
+pub struct SandboxBridge {
+    pub env: Vec<(String, String)>,
+    pub mounts: Vec<crate::container::Mount>,
+}
+
+/// Assembles the herdr bridge for one `pall8t run`: spawns the host-side
+/// relay (see [`crate::relay`]), provisions the version-matched Linux
+/// `herdr` binary (best-effort), and returns the env/mounts to add.
+/// `Ok(None)` means the bridge is off by configuration; `Err` means it was
+/// wanted but couldn't be set up (callers warn and run without it —
+/// the bridge must never break a sandbox launch).
+pub fn prepare_bridge(
+    env: &HerdrEnv,
+    mode: crate::config::HerdrSandbox,
+    container_name: &str,
+) -> Result<Option<SandboxBridge>> {
+    use crate::config::HerdrSandbox;
+    let relay_mode = match mode {
+        HerdrSandbox::Off => return Ok(None),
+        HerdrSandbox::Full => crate::relay::Mode::Full,
+        HerdrSandbox::Readonly => crate::relay::Mode::Readonly,
+    };
+    let socket = env
+        .socket_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("herdr did not provide HERDR_SOCKET_PATH for this pane"))?;
+
+    let mut mounts = Vec::new();
+    match ensure_linux_herdr(env.herdr_bin())
+        .and_then(|source_dir| stage_run_local_herdr(&source_dir, container_name))
+    {
+        Ok(dir) => mounts.push(crate::container::Mount {
+            host: dir,
+            dest: CONTAINER_BIN_DIR.into(),
+        }),
+        // Env + relay still work without the CLI (raw socket clients, e.g.
+        // herdr's own agent-state integration hooks) — degrade, don't fail.
+        Err(e) => eprintln!(
+            "pall8t: warning: no Linux herdr binary for the sandbox ({e:#}) — \
+             the bridge is up, but the `herdr` CLI won't be on PATH inside"
+        ),
+    }
+
+    let port = spawn_relay(socket, container_name, relay_mode)?;
+    let mut vars = vec![
+        ("HERDR_ENV".to_string(), "1".to_string()),
+        ("HERDR_PANE_ID".to_string(), env.pane_id.clone()),
+        (
+            "HERDR_SOCKET_PATH".to_string(),
+            CONTAINER_SOCKET_PATH.to_string(),
+        ),
+        (
+            "HERDR_BIN_PATH".to_string(),
+            format!("{CONTAINER_BIN_DIR}/herdr"),
+        ),
+        ("PALL8T_HERDR_PORT".to_string(), port.to_string()),
+    ];
+    if let Some(w) = &env.workspace_id {
+        vars.push(("HERDR_WORKSPACE_ID".to_string(), w.clone()));
+    }
+    if let Some(t) = &env.tab_id {
+        vars.push(("HERDR_TAB_ID".to_string(), t.clone()));
+    }
+    Ok(Some(SandboxBridge { env: vars, mounts }))
+}
+
+/// Wraps the run command in the [`BOOTSTRAP`] prologue. Applied after
+/// [`agent_hint`] derivation (the hint must see the user's own command);
+/// the original tokens survive as `sh` arguments, so herdr's token scan
+/// would still find the agent name either way.
+pub fn wrap_command_for_bridge(command: Vec<String>) -> Vec<String> {
+    let mut argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        BOOTSTRAP.to_string(),
+        "pall8t-bootstrap".to_string(), // $0 for the -c script
+    ];
+    argv.extend(command);
+    argv
+}
+
+/// Spawns `pall8t herdr relay …` (the hidden serving loop) and reads the
+/// ephemeral port it prints. The child outlives the coming exec and
+/// watches its parent to exit with the session.
+fn spawn_relay(socket: &str, container_name: &str, mode: crate::relay::Mode) -> Result<u16> {
+    use std::io::BufRead;
+    let exe = std::env::current_exe().context("cannot locate the pall8t binary")?;
+    let log_dir = crate::config::pall8t_root()?.join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+    let log = log_dir.join(format!("herdr-relay-{container_name}.log"));
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "herdr",
+            "relay",
+            "--socket",
+            socket,
+            "--container",
+            container_name,
+            "--mode",
+            mode.as_str(),
+            "--log",
+            &log.to_string_lossy(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("cannot spawn the herdr relay")?;
+    let stdout = child.stdout.take().context("relay stdout not piped")?;
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .context("cannot read the relay port")?;
+    let port: u16 = line
+        .trim()
+        .parse()
+        .with_context(|| format!("unexpected relay port line {line:?}"))?;
+    Ok(port)
+}
+
+/// `herdr --version` → `"0.7.5"`. The version pin matters: herdr's CLI
+/// refuses to talk across any protocol-version difference, so the Linux
+/// binary in the sandbox must come from exactly the host's release.
+/// Goes through [`crate::util::run_ok`] like every other parsed-output CLI
+/// call in the crate; `herdr --version` exits 0, and a nonzero exit
+/// wouldn't yield a `parse_herdr_version`-acceptable token anyway.
+pub fn host_herdr_version(bin: &str) -> Option<String> {
+    let out = crate::util::run_ok(bin, &["--version".to_string()]).ok()?;
+    parse_herdr_version(&out)
+}
+
+/// The cache layout for the host's herdr `version`: `(dir, bin, sidecar)`.
+/// The sidecar sits in the parent of `dir` on purpose — `dir` is what gets
+/// mounted rw into sandboxes, so the integrity record must live outside it
+/// (see [`cache_verified`]). One definition so [`ensure_linux_herdr`] and
+/// [`cached_linux_herdr`] can never disagree on where "verified" is
+/// recorded.
+fn cache_paths(
+    version: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let root = crate::config::pall8t_root()?.join("tools").join("herdr");
+    let dir = root.join(version);
+    let bin = dir.join("herdr");
+    let sidecar = root.join(format!("{version}.sha256"));
+    Ok((dir, bin, sidecar))
+}
+
+fn parse_herdr_version(stdout: &str) -> Option<String> {
+    let token = stdout.split_whitespace().nth(1)?;
+    // Guard against surprising output shapes: accept only digits-and-dots.
+    token
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.')
+        .then(|| token.to_string())
+}
+
+/// The herdr release asset for a Linux container of the host's CPU
+/// architecture (apple/container runs native-arch VMs; the musl-static
+/// builds have no libc coupling to worry about).
+fn linux_asset_name() -> Result<&'static str> {
+    match std::env::consts::ARCH {
+        "aarch64" => Ok("herdr-linux-aarch64"),
+        "x86_64" => Ok("herdr-linux-x86_64"),
+        other => Err(anyhow::anyhow!("no herdr Linux build for {other}")),
+    }
+}
+
+/// Full sha256 of a file, lowercase hex.
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    Ok(crate::container::sha256_hex_prefix(&bytes, 32))
+}
+
+/// True if `bin`'s content matches the hash recorded in `sidecar`.
+/// The sidecar lives OUTSIDE the directory that gets mounted into
+/// sandboxes, so a sandboxed process (which shares the host uid and gets
+/// the mount rw — apple/container has no read-only mounts) can tamper
+/// with the binary but not with the record used to check it.
+fn cache_verified(bin: &std::path::Path, sidecar: &std::path::Path) -> bool {
+    let Ok(recorded) = std::fs::read_to_string(sidecar) else {
+        return false;
+    };
+    sha256_file(bin).is_ok_and(|actual| actual == recorded.trim())
+}
+
+/// Ensures a verified `~/.pall8t/tools/herdr/<version>/herdr` exists and
+/// returns its directory — the mount source for [`CONTAINER_BIN_DIR`].
+///
+/// Integrity model (review findings on PR #38): herdr's releases publish
+/// no checksums, so the first download trusts TLS to github.com —
+/// trust-on-first-use, recorded as a sha256 sidecar stored outside the
+/// mounted directory. Every later run re-verifies the cached binary
+/// against that record before mounting it: a sandbox that tampered with
+/// the binary through the rw mount poisons only its own already-running
+/// session, and the next run detects the mismatch and re-downloads. The
+/// download uses a per-pid temp name so two cold-cache runs racing each
+/// other both publish complete files via atomic rename (same asset, so
+/// whichever rename lands last is equivalent).
+fn ensure_linux_herdr(host_bin: &str) -> Result<std::path::PathBuf> {
+    let version = host_herdr_version(host_bin)
+        .ok_or_else(|| anyhow::anyhow!("cannot determine the host herdr version"))?;
+    let (dir, bin, sidecar) = cache_paths(&version)?;
+    if bin.exists() {
+        if cache_verified(&bin, &sidecar) {
+            return Ok(dir);
+        }
+        eprintln!(
+            "pall8t: cached herdr binary failed integrity verification — re-downloading \
+             (a sandbox may have modified it through the mount)"
+        );
+        std::fs::remove_file(&bin).ok();
+    }
+    let asset = linux_asset_name()?;
+    let url = format!("https://github.com/ogulcancelik/herdr/releases/download/v{version}/{asset}");
+    eprintln!("pall8t: downloading {asset} v{version} for the sandbox…");
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!(".herdr.partial.{}", std::process::id()));
+    crate::util::run_ok(
+        "curl",
+        &[
+            "-fsSL".to_string(),
+            "--retry".to_string(),
+            "2".to_string(),
+            "-o".to_string(),
+            tmp.to_string_lossy().into_owned(),
+            url.clone(),
+        ],
+    )
+    .with_context(|| format!("download failed: {url}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    // Sidecar first, then the binary: a crash between the two leaves a
+    // sidecar without a matching binary, which the next run treats as a
+    // verification failure and re-downloads — never a trusted-but-wrong
+    // state.
+    let digest = sha256_file(&tmp)?;
+    // Temp beside the sidecar (same dir) so the publish is an atomic rename.
+    let sidecar_tmp = sidecar.with_extension(format!("sha256.{}", std::process::id()));
+    std::fs::write(&sidecar_tmp, &digest)?;
+    std::fs::rename(&sidecar_tmp, &sidecar)?;
+    std::fs::rename(&tmp, &bin)?;
+    Ok(dir)
+}
+
+/// Root for per-run private copies of the herdr CLI (see
+/// [`stage_run_local_herdr`]).
+fn run_bin_root() -> Result<std::path::PathBuf> {
+    Ok(crate::config::pall8t_root()?
+        .join("tools")
+        .join("herdr-run"))
+}
+
+/// Copies the verified herdr binary from the shared cache into a private
+/// per-run directory and returns that directory — the mount source, in
+/// place of the shared cache dir itself.
+///
+/// Why the copy (review finding on PR #38): apple/container has no
+/// read-only mounts, so whatever directory is mounted is writable by the
+/// sandbox (same host uid). Mounting the shared cache directly let one
+/// sandbox overwrite the binary that a *concurrently running* sandbox
+/// executes. With a per-run copy, the verified source in
+/// [`ensure_linux_herdr`]'s cache is NEVER mounted — a sandbox can only
+/// corrupt its own throwaway copy, which breaks nothing but its own herdr
+/// CLI. Stale copies from exited (`--rm`'d) runs are pruned best-effort.
+fn stage_run_local_herdr(
+    source_dir: &std::path::Path,
+    container_name: &str,
+) -> Result<std::path::PathBuf> {
+    let root = run_bin_root()?;
+    prune_stale_run_bins(&root, container_name);
+    let dir = root.join(container_name);
+    std::fs::create_dir_all(&dir)?;
+    let dst = dir.join("herdr");
+    std::fs::copy(source_dir.join("herdr"), &dst)
+        .with_context(|| format!("cannot stage herdr binary into {}", dir.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(dir)
+}
+
+/// Grace window shielding a per-run copy from being reaped between its
+/// creation and its container appearing in `container list` — a
+/// concurrently launching run's copy is fresh, so the age guard keeps it.
+const RUN_BIN_REAP_GRACE: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// Best-effort removal of per-run herdr copies left by exited runs. Only
+/// the pure decision is factored out (see [`should_reap_run_bin`]); this
+/// walks the directory, reads live container names once, and applies it.
+fn prune_stale_run_bins(root: &std::path::Path, current: &str) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let live: std::collections::HashSet<String> = crate::container::list_pall8t()
+        .map(|cs| cs.into_iter().map(|c| c.name).collect())
+        .unwrap_or_default();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok());
+        if should_reap_run_bin(&name, current, &live, age, RUN_BIN_REAP_GRACE) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Whether a per-run herdr copy directory named `name` should be removed:
+/// it is neither the current run nor a live container, and it is older
+/// than `grace` (an unknown age never reaps — err toward keeping).
+fn should_reap_run_bin(
+    name: &str,
+    current: &str,
+    live: &std::collections::HashSet<String>,
+    age: Option<std::time::Duration>,
+    grace: std::time::Duration,
+) -> bool {
+    name != current && !live.contains(name) && age.is_some_and(|a| a > grace)
+}
+
 /// Raw env-var snapshot for `pall8t herdr doctor`, kept separate from the
 /// live probes (socket connect, binary resolution) so the check logic below
 /// is pure and testable without touching the real process env (tests run in
@@ -232,6 +609,38 @@ impl DoctorSnapshot {
     pub fn herdr_bin(&self) -> &str {
         self.bin_path.as_deref().unwrap_or("herdr")
     }
+}
+
+/// The cached Linux herdr CLI matching the host's version, if it has been
+/// downloaded already AND still passes integrity verification (see
+/// [`ensure_linux_herdr`]) — for `doctor`.
+pub fn cached_linux_herdr(host_bin: &str) -> Option<std::path::PathBuf> {
+    let version = host_herdr_version(host_bin)?;
+    let (_, bin, sidecar) = cache_paths(&version).ok()?;
+    // No separate `bin.exists()`: cache_verified already returns false when
+    // the binary can't be read (see `cache_verified_table`).
+    cache_verified(&bin, &sidecar).then_some(bin)
+}
+
+/// Bridge-prerequisite lines appended to `doctor`'s report. Both are
+/// informational (`ok: true` regardless): a mode is never wrong, and a
+/// missing cached CLI just downloads on the next bridged run.
+pub fn bridge_checks(mode: &str, cached: Option<&std::path::Path>) -> Vec<DoctorCheck> {
+    vec![
+        DoctorCheck {
+            name: "bridge mode",
+            ok: true,
+            detail: format!("[herdr] sandbox = \"{mode}\" (full | readonly | off)"),
+        },
+        DoctorCheck {
+            name: "linux herdr CLI",
+            ok: true,
+            detail: match cached {
+                Some(p) => format!("cached at {}", p.display()),
+                None => "not cached yet (downloads on the first bridged run)".to_string(),
+            },
+        },
+    ]
 }
 
 /// True if `bin` can be spawned at all (`--version`), regardless of exit
@@ -386,6 +795,8 @@ mod tests {
     fn env_with_agent(agent: Option<&str>) -> HerdrEnv {
         HerdrEnv {
             pane_id: "p1".to_string(),
+            workspace_id: None,
+            tab_id: None,
             socket_path: None,
             bin_path: None,
             agent: agent.map(str::to_string),
@@ -519,6 +930,70 @@ mod tests {
             agent_hint(&env_with_agent(None), &cmd(&["env", "FOO=1"])),
             None,
             "no recognized token -> no hint"
+        );
+    }
+
+    #[test]
+    fn cache_verified_table() {
+        let dir = std::env::temp_dir().join(format!("pall8t-test-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("herdr");
+        let sidecar = dir.join("v.sha256");
+        std::fs::write(&bin, b"binary-content").unwrap();
+
+        assert!(
+            !cache_verified(&bin, &sidecar),
+            "no sidecar record -> unverified (a bare cached file is never trusted)"
+        );
+
+        std::fs::write(&sidecar, sha256_file(&bin).unwrap()).unwrap();
+        assert!(cache_verified(&bin, &sidecar), "matching record verifies");
+
+        std::fs::write(&sidecar, format!("{}\n", sha256_file(&bin).unwrap())).unwrap();
+        assert!(
+            cache_verified(&bin, &sidecar),
+            "a trailing newline in the record must not break verification"
+        );
+
+        std::fs::write(&bin, b"tampered-by-sandbox").unwrap();
+        assert!(
+            !cache_verified(&bin, &sidecar),
+            "content drift (e.g. tampering through the rw mount) is detected"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_reap_run_bin_table() {
+        use std::collections::HashSet;
+        let grace = std::time::Duration::from_mins(5);
+        let old = Some(std::time::Duration::from_mins(10));
+        let young = Some(std::time::Duration::from_secs(10));
+        let mut live = HashSet::new();
+        live.insert("pall8t-x-1".to_string());
+
+        assert!(
+            should_reap_run_bin("pall8t-x-2", "pall8t-x-9", &live, old, grace),
+            "an old copy for a container no longer running is reaped"
+        );
+        assert!(
+            !should_reap_run_bin("pall8t-x-9", "pall8t-x-9", &live, old, grace),
+            "the current run's own copy is never reaped"
+        );
+        assert!(
+            !should_reap_run_bin("pall8t-x-1", "pall8t-x-9", &live, old, grace),
+            "a live container's copy is never reaped even if old"
+        );
+        assert!(
+            !should_reap_run_bin("pall8t-x-2", "pall8t-x-9", &live, young, grace),
+            "a fresh copy (concurrently launching run, not yet in the \
+             container list) is protected by the grace window"
+        );
+        assert!(
+            !should_reap_run_bin("pall8t-x-2", "pall8t-x-9", &live, None, grace),
+            "an unreadable age never reaps — err toward keeping"
         );
     }
 

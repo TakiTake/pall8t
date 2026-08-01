@@ -508,6 +508,7 @@ mod tests {
             command: vec!["claude".to_string()],
             repos: vec![],
             home: HomeConfig::default(),
+            herdr: crate::config::HerdrConfig::default(),
         }
     }
 

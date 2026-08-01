@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- herdr bridge (ADR-0007): when `pall8t run` starts inside a herdr pane,
+  the herdr CLI now works *inside* the sandbox — env passthrough
+  (`HERDR_ENV`, workspace/tab/pane ids), a host-side relay to `herdr.sock`
+  (apple/container mounts can't forward Unix sockets), an in-container
+  socat bridge, and a version-matched Linux `herdr` binary auto-downloaded
+  to `~/.pall8t/tools/` and mounted on `PATH`. Governed by the new
+  `[herdr] sandbox` config: `"full"` (default; host-admin methods such as
+  `server stop`/`integration install` are always denied), `"readonly"`,
+  or `"off"`. Every relayed request is peer-pinned to the sandbox
+  container's IP and audit-logged under `~/.pall8t/logs/`.
+- The default image now installs `socat` (required by the in-container
+  bridge; its absence degrades with a warning, never a failed run).
+
 ## [0.2.0] - 2026-07-25
 
 ### Added

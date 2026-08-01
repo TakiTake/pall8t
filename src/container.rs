@@ -476,6 +476,11 @@ pub struct RunSpec {
     /// terminal: apple/container 1.0.0 fails outright when `-t` is
     /// requested without one, which would break scripted callers.
     pub tty: bool,
+    /// `-e KEY=VALUE` environment for the container process. pall8t
+    /// forwards nothing from the host environment by default; the only
+    /// producer today is the herdr bridge (`HERDR_*` identity plus the
+    /// relay port — see [`crate::herdr`]).
+    pub env: Vec<(String, String)>,
     pub command: Vec<String>,
 }
 
@@ -491,6 +496,10 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
     for m in &spec.mounts {
         argv.push("-v".into());
         argv.push(format!("{}:{}", m.host.display(), m.dest.display()));
+    }
+    for (k, v) in &spec.env {
+        argv.push("-e".into());
+        argv.push(format!("{k}={v}"));
     }
     argv.extend([
         "-w".into(),
@@ -547,6 +556,27 @@ fn inspect_str(name: &str, pointer: &str) -> Option<String> {
 /// inspect`) — for `pall8t run` containers, the workspace it mounted.
 pub fn workdir(name: &str) -> Option<String> {
     inspect_str(name, "/0/configuration/initProcess/workingDirectory")
+}
+
+/// A running container's vmnet IPv4 address (via `container inspect`),
+/// without the CIDR suffix — e.g. `"192.168.64.5/24"` → `"192.168.64.5"`.
+/// The herdr relay pins accepted peers to this (see [`crate::relay`]).
+pub fn ip_address(name: &str) -> Option<String> {
+    let cidr = inspect_str(name, "/0/status/networks/0/ipv4Address")?;
+    Some(cidr.split('/').next().unwrap_or(&cidr).to_string())
+}
+
+/// The default network's host-side gateway address (`container network
+/// inspect default` → `status.ipv4Gateway`) — the one host address
+/// containers can reach, so the relay binds to it rather than `0.0.0.0`
+/// (see [`crate::relay`]). Available as soon as the container system is
+/// up, before any container exists.
+pub fn default_gateway() -> Option<String> {
+    let out = run_ok(["network", "inspect", "default"]).ok()?;
+    let v: Value = serde_json::from_str(out.trim()).ok()?;
+    v.pointer("/0/status/ipv4Gateway")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// What to exec for the `container` CLI when argv[0] matters, plus env
@@ -1054,9 +1084,16 @@ mod tests {
             uid: 501,
             gid: 20,
             tty: true,
+            env: vec![("HERDR_ENV".into(), "1".into())],
             command: vec!["claude".into()],
         };
         let argv = run_argv(&spec);
+        let e = argv.iter().position(|a| a == "-e").unwrap();
+        assert_eq!(
+            argv[e + 1],
+            "HERDR_ENV=1",
+            "env entries emit as -e KEY=VALUE"
+        );
         assert_eq!(argv[0], "run");
         assert!(argv.contains(&"-i".to_string()));
         assert!(argv.contains(&"-t".to_string()), "tty: true requests -t");

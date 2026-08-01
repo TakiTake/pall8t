@@ -65,6 +65,23 @@ enum HerdrCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Host-side relay serving the sandbox herdr bridge (spawned by
+    /// `pall8t run`, never by hand — see ADR-0007)
+    #[command(hide = true)]
+    Relay {
+        /// Host herdr API socket to forward to
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        /// Sandbox container whose IP is the only accepted peer
+        #[arg(long)]
+        container: String,
+        /// Policy mode: full | readonly
+        #[arg(long)]
+        mode: String,
+        /// Audit log file
+        #[arg(long)]
+        log: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -299,7 +316,7 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
     // An explicit `-- <cmd>` override is user intent and bypasses the
     // configured command entirely, so herdr's tmux-wrapper override only
     // ever applies to the configured default.
-    let command = if cli_command.is_empty() {
+    let mut command = if cli_command.is_empty() {
         herdr::maybe_override_for_herdr(cfg.command.clone(), herdr_env.is_some())
     } else {
         cli_command
@@ -307,6 +324,26 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
     let herdr_agent = herdr_env
         .as_ref()
         .and_then(|env| herdr::announce_pane_identity(env, &command));
+    // The bridge (ADR-0007) makes the herdr CLI work inside the sandbox:
+    // relay + env + Linux binary mount + bootstrap wrap. Best-effort — a
+    // bridge failure warns and the run proceeds without it.
+    let mut env_vars = Vec::new();
+    if let Some(env) = &herdr_env {
+        match herdr::prepare_bridge(env, cfg.herdr.sandbox, &run_name) {
+            Ok(Some(bridge)) => {
+                eprintln!(
+                    "pall8t: herdr bridge active ({}) — the sandboxed agent can reach \
+                     this herdr session; audit log in ~/.pall8t/logs/",
+                    cfg.herdr.sandbox.as_str()
+                );
+                mounts.extend(bridge.mounts);
+                env_vars = bridge.env;
+                command = herdr::wrap_command_for_bridge(command);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("pall8t: warning: herdr bridge disabled: {e:#}"),
+        }
+    }
     let spec = container::RunSpec {
         name: run_name,
         image: resolved.tag,
@@ -317,6 +354,7 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
         uid,
         gid,
         tty: stdin_is_tty(),
+        env: env_vars,
         command,
     };
     exec_container(&container::run_argv(&spec), herdr_agent.as_deref())
@@ -378,6 +416,12 @@ fn herdr_socket_reachable(path: &str) -> bool {
 
 fn cmd_herdr(cmd: &HerdrCmd) -> Result<()> {
     match cmd {
+        HerdrCmd::Relay {
+            socket,
+            container,
+            mode,
+            log,
+        } => pall8t::relay::run(socket, container, pall8t::relay::Mode::parse(mode)?, log),
         HerdrCmd::Doctor { json } => {
             let snap = herdr::DoctorSnapshot::from_process_env();
             let socket_reachable = snap
@@ -385,7 +429,13 @@ fn cmd_herdr(cmd: &HerdrCmd) -> Result<()> {
                 .as_deref()
                 .is_some_and(herdr_socket_reachable);
             let bin_resolvable = herdr::bin_resolvable(snap.herdr_bin());
-            let checks = herdr::doctor_checks(&snap, socket_reachable, bin_resolvable);
+            let mut checks = herdr::doctor_checks(&snap, socket_reachable, bin_resolvable);
+            let mode = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| config::load(&cwd).ok())
+                .map_or(config::HerdrSandbox::default(), |c| c.herdr.sandbox);
+            let cached = herdr::cached_linux_herdr(snap.herdr_bin());
+            checks.extend(herdr::bridge_checks(mode.as_str(), cached.as_deref()));
             if *json {
                 print_json(&checks)?;
             } else {

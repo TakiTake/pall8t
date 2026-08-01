@@ -5,7 +5,7 @@ ARG GID=501
 
 # node + claude CLI + gh + common tools; dev user with host UID/GID
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git sudo ripgrep less vim openssh-client tmux && \
+      ca-certificates curl git sudo ripgrep less vim openssh-client tmux socat && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \

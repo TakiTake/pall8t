@@ -3,6 +3,7 @@ pub mod container;
 pub mod herdr;
 pub mod home;
 pub mod image;
+pub mod relay;
 pub mod repos;
 pub mod util;
 pub mod worktree;

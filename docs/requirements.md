@@ -32,6 +32,7 @@ Adding a TUI, attach/detach, and other session-management features was turning p
 - Customization via TOML config (CPU/memory allocation, reference repositories, default command, etc.)
 - Duplicate reference repositories with `git clone --local` (hardlinked objects) before mounting, protecting the originals
 - TTY passthrough and signal forwarding (behave well under tmux / herdr)
+- herdr bridge: inside a herdr pane, expose the host herdr session to the sandboxed agent (env passthrough, socket relay with policy + audit, version-matched Linux CLI) — ADR-0007
 
 ### 2.2 Out of Scope
 
@@ -119,7 +120,7 @@ source = "~/src/other-lib"
 ## 6. Non-Functional Requirements
 
 - **NFR-1 Startup overhead**: when no build is needed, added latency between `run` and agent launch must be minimal (leverage apple/container's boot speed)
-- **NFR-2 Zero resident processes**: pall8t itself runs no daemon
+- **NFR-2 Zero resident processes**: pall8t itself runs no daemon. (The herdr-bridge relay, ADR-0007, is session-scoped, not resident: spawned per `run`, it watches its parent and exits with the session)
 - **NFR-3 Host non-pollution**: never touch the host's existing agent configuration such as `~/.claude`
 - **NFR-4 tmux / herdr affinity**: achieved not through special integration features but through correct TTY passthrough, signal handling, and exit codes
 
