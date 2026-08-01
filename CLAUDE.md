@@ -40,10 +40,14 @@ tests with reasoned assertions, regression pins).
 - Merge style is merge commits ("Merge pull request #N from ...").
 - Only merge a PR once it's been declared ready for review and merge — don't
   merge speculatively.
+- Before opening or updating a PR, run the `local-review` skill on the
+  branch diff — the external reviewers should come back empty-handed.
 - PR review feedback (bot or human) is handled with the `review-loop`
   skill: verify each finding before acting, classify it (real / nitpick /
   false positive), and reply with evidence. Never blanket-apply bot
-  suggestions — reviewers contradict each other.
+  suggestions — reviewers contradict each other. A real finding local
+  review missed also becomes a new lens in the `local-review` skill
+  (its "Grow the lenses" section), in the same fixing PR.
 
 ## Actions that need the human directly
 

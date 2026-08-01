@@ -47,6 +47,11 @@ Never blanket-apply a bot's suggestions: reviewers disagree, and applying
 both sides of a contradiction produces churn. The classification decision
 is the review — record it.
 
+One more obligation for **real** findings: they mean the pre-PR
+`local-review` pass missed something. Generalize the miss into a lens in
+that skill's checklist (its "Grow the lenses" section) in the same PR
+that fixes it, so the category is caught locally next time.
+
 ## 4. Gate, commit, push
 
 Run the full local gate before pushing (`scripts/lint.sh` and

@@ -1,0 +1,107 @@
+---
+name: local-review
+description: Review the current branch's diff locally BEFORE opening or updating a PR, so external reviewers (CodeRabbit, Codex, humans) find nothing you could have caught yourself. Use when asked to review local changes, before commit-push-pr, or when about to open a PR. Applies a lens checklist grown from real review findings; report findings with concrete failure scenarios, fix them, and re-run until clean.
+---
+
+# Local review
+
+Goal: the external reviewers on the PR should come back empty-handed.
+Every finding a bot catches after push is one this review should have
+caught before it. When one slips through anyway, this file learns it —
+see "Grow the lenses" at the bottom.
+
+## 0. Scope and mechanical gates first
+
+```sh
+git diff --stat origin/main...HEAD        # committed changes
+git status --short                        # uncommitted / untracked too
+```
+
+Review everything that will end up in the PR, not just the last commit.
+Before reading anything, run the machine's share — style and lint
+findings are its job, not this review's:
+
+```sh
+scripts/lint.sh && cargo test
+```
+
+For nontrivial logic changes, also spot-run mutation testing on the
+changed files (`cargo mutants -f src/<changed>.rs`) — a test that
+wouldn't go red is a finding.
+
+## 1. Review through each lens
+
+Read the full diff once for orientation, then pass through the lenses
+below. A finding must name a **concrete failure scenario** (inputs/state
+→ wrong outcome); "this looks risky" without one is not a finding.
+These lenses are generalized from real external-review findings that
+local review failed to catch first (source PRs noted).
+
+**Policy and trust boundaries** (PR #38)
+- Any allow/deny decision: is the *default* direction safe when the
+  input is unknown or novel? An enumerated denylist silently allows the
+  next thing an upstream adds — prefer default-deny by namespace/class
+  with explicit carve-outs, or document why transparency wins.
+- New listeners/endpoints: bound as narrowly as possible (specific
+  interface, not `0.0.0.0`)? Who can reach it besides the intended peer,
+  and what gates them?
+- Anything downloaded and later executed or mounted: integrity-verified
+  on every use, not just at fetch time? Where does the verification
+  record live — can the thing being verified overwrite its own record?
+- Fail open vs fail closed: when setup fails partway, which side does
+  the feature land on, and does the user find out?
+
+**Silent fallbacks** (PR #38)
+- Config parsing: does a misspelled key/value fall back silently to a
+  default — and is that default the *permissive* one? Security-relevant
+  settings must fail the parse (`deny_unknown_fields`), not degrade.
+- Any `unwrap_or(default)` / `.ok()` on user intent: same question.
+
+**Concurrency and shared state** (PR #38)
+- Fixed-name temp files, caches, or locks that two concurrent runs can
+  collide on (pall8t runs in parallel panes by design). Per-pid names +
+  atomic rename; define what the second writer publishing means.
+- State shared across a mount/process boundary: who can mutate it
+  between your check and your use?
+
+**Claims vs code** (PR #38)
+- Do ADR/README/skill statements match what the code does *in the
+  degraded paths* — missing optional dependency, failed setup, mode
+  switched off? Docs written before the code hardened are the usual
+  drift site. Read the doc diff against the code diff, not against
+  memory.
+- Preconditions stated as absolutes ("X works inside the sandbox")
+  that are actually conditional — qualify them.
+
+**CI workflows** (PR #39)
+- `actions/checkout`: `persist-credentials: false` unless the job pushes.
+- Event triggers: does the trigger set cover the *loop*, not just the
+  first pass (e.g. `synchronize` for re-reviews)? If a trigger is
+  omitted deliberately (cost), say so inline or it reads as a bug.
+- Listing APIs (`gh api`): `--paginate` or the first page silently
+  truncates.
+- Report-only jobs: `continue-on-error` where a report must not gate.
+
+**Tests** (standing)
+- Per docs/testing.md: new tests use table form with reasoned assertion
+  messages; each bug fix and each refuted review finding gets a pin;
+  contracts (argv shapes, wire formats, exit codes) are asserted
+  structurally.
+
+## 2. Fix, don't file
+
+This is a pre-PR review: findings are yours to fix now, in the same
+branch, each with its pinning test where applicable. Re-run the gates and
+re-pass the lenses over what changed. Declining a lens's advice is fine —
+but then the code or doc must carry the rationale, because the external
+reviewers will raise it otherwise and the PR reply will just repeat what
+should have been written down.
+
+## 3. Grow the lenses
+
+When an external reviewer (bot or human) later finds something real that
+this review missed, don't just fix it — generalize it into a lens above
+(or sharpen an existing one) with the source PR noted, in the same PR
+that fixes the finding. That's the ratchet: each external catch should be
+a category caught locally forever after. Findings that were refuted don't
+become lenses; they become clearer code (see the review-loop skill).
