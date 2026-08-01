@@ -52,19 +52,25 @@ Two facts about apple/container, verified live on 1.1.0, shape the design:
    default image ships `socat`; a missing `socat` degrades with a warning.
 3. **Version-matched CLI**: pall8t reads the host's `herdr --version`,
    downloads that release's musl-static Linux build once into
-   `~/.pall8t/tools/herdr/<version>/`, and mounts it at `/opt/pall8t/bin`
-   (prepended to `PATH`). Version lockstep is load-bearing: the CLI
-   refuses to talk across any protocol difference, and this makes the pin
-   automatic — a brew-upgraded host herdr fetches its matching Linux build
-   on the next run. Integrity: herdr's releases publish no checksums, so
-   the first download trusts TLS to github.com (trust-on-first-use); its
-   sha256 is recorded in a sidecar stored *outside* the mounted directory,
-   and every subsequent run re-verifies the cached binary against that
-   record before mounting. Because apple/container has no read-only
-   mounts, a sandbox *can* overwrite the binary through the rw mount — but
-   that poisons only its own live session; the next run detects the
-   mismatch and re-downloads. Downloads use per-pid temp names so
+   `~/.pall8t/tools/herdr/<version>/`. Version lockstep is load-bearing:
+   the CLI refuses to talk across any protocol difference, and this makes
+   the pin automatic — a brew-upgraded host herdr fetches its matching
+   Linux build on the next run. Integrity: herdr's releases publish no
+   checksums, so the first download trusts TLS to github.com
+   (trust-on-first-use); its sha256 is recorded in a sidecar and
+   re-verified before each use. Downloads use per-pid temp names so
    concurrent cold-cache runs publish complete files via atomic rename.
+   Because apple/container has no read-only mounts, whatever is mounted is
+   writable by the sandbox (same host uid), so the shared cache is **never
+   mounted**: each run copies the verified binary into a private per-run
+   directory (`~/.pall8t/tools/herdr-run/<container>/`) and mounts *that*
+   at `/opt/pall8t/bin`. A sandbox can therefore corrupt only its own
+   throwaway copy — breaking nothing but its own herdr CLI — and cannot
+   reach the binary a concurrently running sandbox executes, nor the
+   verified source. Per-run copies from exited (`--rm`'d) runs are pruned
+   best-effort on later runs (kept while their container is live or the
+   copy is within a grace window, so a concurrently launching run's copy
+   is never reaped mid-launch).
 4. **Env passthrough**: `HERDR_ENV=1`, `HERDR_{WORKSPACE,TAB,PANE}_ID`,
    `HERDR_SOCKET_PATH` (container path), `HERDR_BIN_PATH` — so herdr's
    published SKILL.md works inside the sandbox *unmodified*, including
@@ -112,8 +118,14 @@ Compared to herdr's own `0600` socket, the TCP listener is a broader
 surface; the compensations are binding to the vmnet gateway address
 (falling back to `0.0.0.0` only if it can't be resolved), peer-pinning to
 the one container's address, the always-denied host-admin class, and the
-audit log. Same-host same-user processes could already reach `herdr.sock`
-directly, so the relay adds no privilege they didn't have.
+audit log. Note what the bridge does and does not change: it runs the
+container as the host user, so it grants no privilege *above* that user —
+but it does give code inside the sandbox a new *capability* it otherwise
+lacks, namely reachability to the host herdr session across the sandbox
+boundary. That new reach is the whole point in `full` mode and is exactly
+what `readonly`/`off` and the policy classes govern; same-uid parity
+bounds the blast radius (a sandbox can do nothing to herdr the host user
+couldn't), it does not make the opening a non-event.
 
 ## Consequences
 
@@ -130,6 +142,11 @@ directly, so the relay adds no privilege they didn't have.
 - herdr's screen-scrape agent detection still comes from the host-side
   argv0 hint (unchanged); in-container integrations that report state over
   the socket (herdr's `integration install` hooks in the container home)
-  now also work, since the socket surface is present.
+  also work — but only once the in-container `socat` bridge has created
+  the Unix socket at `HERDR_SOCKET_PATH`. `HERDR_ENV=1` is set whenever
+  the bridge is *configured*; it is not proof the socket is *up*. Without
+  `socat` in the image (previous bullet) the socket never appears, so
+  those integrations and the stock CLI stay unusable even though
+  `HERDR_ENV=1`.
 - `pane.move` responses, closed-pane ID rules, etc. pass through untouched
   — pall8t interprets nothing but the method name.

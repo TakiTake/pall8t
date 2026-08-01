@@ -285,7 +285,9 @@ pub fn prepare_bridge(
         .ok_or_else(|| anyhow::anyhow!("herdr did not provide HERDR_SOCKET_PATH for this pane"))?;
 
     let mut mounts = Vec::new();
-    match ensure_linux_herdr(env.herdr_bin()) {
+    match ensure_linux_herdr(env.herdr_bin())
+        .and_then(|source_dir| stage_run_local_herdr(&source_dir, container_name))
+    {
         Ok(dir) => mounts.push(crate::container::Mount {
             host: dir,
             dest: CONTAINER_BIN_DIR.into(),
@@ -499,6 +501,85 @@ fn ensure_linux_herdr(host_bin: &str) -> Result<std::path::PathBuf> {
     std::fs::rename(&sidecar_tmp, &sidecar)?;
     std::fs::rename(&tmp, &bin)?;
     Ok(dir)
+}
+
+/// Root for per-run private copies of the herdr CLI (see
+/// [`stage_run_local_herdr`]).
+fn run_bin_root() -> Result<std::path::PathBuf> {
+    Ok(crate::config::pall8t_root()?
+        .join("tools")
+        .join("herdr-run"))
+}
+
+/// Copies the verified herdr binary from the shared cache into a private
+/// per-run directory and returns that directory — the mount source, in
+/// place of the shared cache dir itself.
+///
+/// Why the copy (review finding on PR #38): apple/container has no
+/// read-only mounts, so whatever directory is mounted is writable by the
+/// sandbox (same host uid). Mounting the shared cache directly let one
+/// sandbox overwrite the binary that a *concurrently running* sandbox
+/// executes. With a per-run copy, the verified source in
+/// [`ensure_linux_herdr`]'s cache is NEVER mounted — a sandbox can only
+/// corrupt its own throwaway copy, which breaks nothing but its own herdr
+/// CLI. Stale copies from exited (`--rm`'d) runs are pruned best-effort.
+fn stage_run_local_herdr(
+    source_dir: &std::path::Path,
+    container_name: &str,
+) -> Result<std::path::PathBuf> {
+    let root = run_bin_root()?;
+    prune_stale_run_bins(&root, container_name);
+    let dir = root.join(container_name);
+    std::fs::create_dir_all(&dir)?;
+    let dst = dir.join("herdr");
+    std::fs::copy(source_dir.join("herdr"), &dst)
+        .with_context(|| format!("cannot stage herdr binary into {}", dir.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(dir)
+}
+
+/// Grace window shielding a per-run copy from being reaped between its
+/// creation and its container appearing in `container list` — a
+/// concurrently launching run's copy is fresh, so the age guard keeps it.
+const RUN_BIN_REAP_GRACE: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// Best-effort removal of per-run herdr copies left by exited runs. Only
+/// the pure decision is factored out (see [`should_reap_run_bin`]); this
+/// walks the directory, reads live container names once, and applies it.
+fn prune_stale_run_bins(root: &std::path::Path, current: &str) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let live: std::collections::HashSet<String> = crate::container::list_pall8t()
+        .map(|cs| cs.into_iter().map(|c| c.name).collect())
+        .unwrap_or_default();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok());
+        if should_reap_run_bin(&name, current, &live, age, RUN_BIN_REAP_GRACE) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Whether a per-run herdr copy directory named `name` should be removed:
+/// it is neither the current run nor a live container, and it is older
+/// than `grace` (an unknown age never reaps — err toward keeping).
+fn should_reap_run_bin(
+    name: &str,
+    current: &str,
+    live: &std::collections::HashSet<String>,
+    age: Option<std::time::Duration>,
+    grace: std::time::Duration,
+) -> bool {
+    name != current && !live.contains(name) && age.is_some_and(|a| a > grace)
 }
 
 /// Raw env-var snapshot for `pall8t herdr doctor`, kept separate from the
@@ -882,6 +963,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_reap_run_bin_table() {
+        use std::collections::HashSet;
+        let grace = std::time::Duration::from_mins(5);
+        let old = Some(std::time::Duration::from_mins(10));
+        let young = Some(std::time::Duration::from_secs(10));
+        let mut live = HashSet::new();
+        live.insert("pall8t-x-1".to_string());
+
+        assert!(
+            should_reap_run_bin("pall8t-x-2", "pall8t-x-9", &live, old, grace),
+            "an old copy for a container no longer running is reaped"
+        );
+        assert!(
+            !should_reap_run_bin("pall8t-x-9", "pall8t-x-9", &live, old, grace),
+            "the current run's own copy is never reaped"
+        );
+        assert!(
+            !should_reap_run_bin("pall8t-x-1", "pall8t-x-9", &live, old, grace),
+            "a live container's copy is never reaped even if old"
+        );
+        assert!(
+            !should_reap_run_bin("pall8t-x-2", "pall8t-x-9", &live, young, grace),
+            "a fresh copy (concurrently launching run, not yet in the \
+             container list) is protected by the grace window"
+        );
+        assert!(
+            !should_reap_run_bin("pall8t-x-2", "pall8t-x-9", &live, None, grace),
+            "an unreadable age never reaps — err toward keeping"
+        );
     }
 
     #[test]
