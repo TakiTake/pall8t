@@ -361,9 +361,12 @@ fn handle(
         .with_context(|| format!("cannot connect to herdr socket {}", socket.display()))?;
     upstream.write_all(line.as_bytes())?;
 
-    // Pump the rest of the conversation. `reader` still holds anything
-    // buffered past the first line, so the container→herdr direction
-    // continues from it rather than from the raw stream.
+    // Pump the rest of the conversation. This `into_inner` unwraps only
+    // the `Take` cap and yields the `BufReader` itself, so bytes
+    // `read_line` prefetched past the first newline stay buffered and are
+    // forwarded first by the copy below. (`BufReader::into_inner()` —
+    // which WOULD discard them and lose pipelined requests — is never
+    // called; pinned by `relay_forwards_bytes_prefetched_past_the_first_line`.)
     let mut upstream_write = upstream.try_clone()?;
     let mut reader = reader.into_inner();
     let to_upstream = std::thread::spawn(move || {
@@ -511,6 +514,67 @@ mod tests {
 
         let logged = std::fs::read_to_string(&log).unwrap();
         assert!(logged.contains("\"allow\"") && logged.contains("\"deny\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression pin for a review question: after `read_line` takes the
+    /// first request, anything it prefetched past that newline sits in the
+    /// `BufReader`'s internal buffer — the pump must forward those bytes,
+    /// not drop them (which `BufReader::into_inner()` would do; the code
+    /// unwraps only the `Take` cap). The client sends two NDJSON lines in
+    /// one write and half-closes; the fake upstream echoes everything it
+    /// received, so the reply proves both lines crossed the bridge. (TCP
+    /// framing on loopback delivers one small write in one segment, which
+    /// is what puts line 2 in the prefetch buffer; if the kernel ever did
+    /// split it, the bytes still arrive via the pump and the test still
+    /// passes — it can't false-fail.)
+    #[test]
+    fn relay_forwards_bytes_prefetched_past_the_first_line() {
+        use std::os::unix::net::UnixListener;
+        let dir = test_dir("pipeline");
+        let sock = dir.join("h.sock");
+        let log = dir.join("relay.log");
+        let upstream = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for conn in upstream.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                std::thread::spawn(move || {
+                    let mut all = String::new();
+                    let mut r = conn.try_clone().unwrap();
+                    if r.read_to_string(&mut all).is_ok() {
+                        let _ = conn.write_all(
+                            serde_json::json!({"id":"x","result":{"received": all}})
+                                .to_string()
+                                .as_bytes(),
+                        );
+                        let _ = conn.write_all(b"\n");
+                    }
+                });
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gate = std::sync::Arc::new(PeerGate {
+            policy: PeerPolicy::AllowAll,
+            cached: Mutex::new(None),
+        });
+        let log_clone = log.clone();
+        std::thread::spawn(move || serve(&listener, &sock, Mode::Full, &gate, &log_clone));
+
+        let mut conn = TcpStream::connect(addr).unwrap();
+        conn.write_all(
+            b"{\"id\":\"r1\",\"method\":\"pane.list\",\"params\":{}}\n{\"id\":\"r2\",\"method\":\"pane.get\",\"params\":{}}\n",
+        )
+        .unwrap();
+        conn.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut line = String::new();
+        BufReader::new(conn).read_line(&mut line).unwrap();
+        let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let received = resp["result"]["received"].as_str().unwrap();
+        assert!(
+            received.contains("\"id\":\"r1\"") && received.contains("\"id\":\"r2\""),
+            "both pipelined requests must reach the upstream socket, got: {received}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
