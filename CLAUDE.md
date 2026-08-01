@@ -28,6 +28,10 @@ hook is opt-in, not automatic: enable it once per checkout with
 `mise run setup-hooks` or `git config core.hooksPath .githooks`. On a fresh
 clone/worktree, run `scripts/lint.sh` or `mise run lint` by hand.)
 
+Read [docs/testing.md](docs/testing.md) **before writing tests** — it
+records the conventions the suite follows (pure-function seams, table
+tests with reasoned assertions, regression pins).
+
 ## Git workflow
 
 - The main checkout stays on `main` — never switch branches there. Do task
@@ -36,6 +40,14 @@ clone/worktree, run `scripts/lint.sh` or `mise run lint` by hand.)
 - Merge style is merge commits ("Merge pull request #N from ...").
 - Only merge a PR once it's been declared ready for review and merge — don't
   merge speculatively.
+- Before opening or updating a PR, run the `local-review` skill on the
+  branch diff — the external reviewers should come back empty-handed.
+- PR review feedback (bot or human) is handled with the `review-loop`
+  skill: verify each finding before acting, classify it (real / nitpick /
+  false positive), and reply with evidence. Never blanket-apply bot
+  suggestions — reviewers contradict each other. A real finding local
+  review missed also becomes a new lens in the `local-review` skill
+  (its "Grow the lenses" section), in the same fixing PR.
 
 ## Actions that need the human directly
 
@@ -56,4 +68,11 @@ stop there.
 - Homebrew formula: [TakiTake/homebrew-tap](https://github.com/TakiTake/homebrew-tap)
 - Requirements: [docs/requirements.md](docs/requirements.md)
 - Architecture decisions: [docs/adr/](docs/adr/)
+- Testing conventions (read before writing tests): [docs/testing.md](docs/testing.md)
 - Sandbox environment details: `.claude/skills/pall8t`
+- Review automation: report-only workflows for mutation testing
+  (`mutants.yml`) and duplication/unused-deps (`hygiene.yml`), each
+  weekly plus on-demand via `gh workflow run <name>` — reports, never
+  gates; Codex PR review (`codex-review.yml`) stays dormant until an
+  `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
+  `.coderabbit.yaml` (free for this public repo once the app is installed).

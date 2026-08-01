@@ -1,0 +1,69 @@
+# Cross-model PR review by OpenAI Codex (a different model family than the
+# one writing most of this repo's code — the point is independent eyes).
+#
+# COST: this is NOT free. openai/codex-action authenticates with an
+# OPENAI_API_KEY only (ChatGPT-subscription auth is not supported in CI),
+# billed per token. The workflow is dormant until the repo secret
+# OPENAI_API_KEY exists, so merging this file costs nothing. The free
+# alternative for this public repo is CodeRabbit (see .coderabbit.yaml) —
+# free for open-source repos via its GitHub App.
+#
+# Findings posted here are claims, not verdicts: address them with the
+# review-loop skill (verify → classify → fix or refute with evidence).
+name: Codex review
+
+# `synchronize` makes fix commits get re-reviewed — without it the
+# review-loop stalls after the first round. It also means every push
+# spends tokens; drop it from the list if cost outweighs re-review.
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+jobs:
+  codex:
+    runs-on: ubuntu-latest
+    # `secrets` isn't available in job-level `if`, so the gate lives in an
+    # env var each step checks: no key → every step skips, job stays green.
+    env:
+      HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.HAS_KEY == 'true'
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run Codex
+        id: run_codex
+        if: env.HAS_KEY == 'true'
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/prompts/review.md
+          output-file: codex-output.md
+
+  post_feedback:
+    runs-on: ubuntu-latest
+    needs: codex
+    if: needs.codex.outputs.final_message != ''
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post Codex feedback
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: process.env.CODEX_FINAL_MESSAGE,
+            });
+        env:
+          CODEX_FINAL_MESSAGE: ${{ needs.codex.outputs.final_message }}
