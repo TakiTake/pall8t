@@ -82,6 +82,23 @@ local review failed to catch first (source PRs noted).
   truncates.
 - Report-only jobs: `continue-on-error` where a report must not gate.
 
+**Impact beyond the diff** (standing — use the LSP tool)
+- For every public function, type, or constant whose signature, contract,
+  or semantics the diff changes: enumerate ALL call/use sites with the
+  LSP tool (`incomingCalls` for functions, `findReferences` otherwise) —
+  not grep, which misses renames, method syntax, and re-exports. Then
+  check each site the diff does *not* touch: does it still hold under the
+  new behavior? An updated callee with an unexamined caller is a finding.
+- Changed enum/match-heavy types: `findReferences` on the type, looking
+  for match sites that a new variant or changed default now reaches.
+- Position gotcha: `documentSymbol` reports a symbol's range *including
+  its doc comment*; position-based operations (`hover`, `incomingCalls`,
+  `findReferences`) need the line/character of the identifier itself, so
+  read the declaration line first. If the LSP server is unavailable
+  (e.g. it needs a session restart after a crash loop), say so in the
+  review output and fall back to `rg` — silently degraded coverage reads
+  as full coverage.
+
 **Tests** (standing)
 - Per docs/testing.md: new tests use table form with reasoned assertion
   messages; each bug fix and each refuted review finding gets a pin;
