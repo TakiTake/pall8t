@@ -1,0 +1,34 @@
+# CodeRabbit — free automated PR review for open-source/public repos.
+# Activation is a one-time human action: install the CodeRabbit GitHub App
+# (https://github.com/apps/coderabbitai) and grant it this repository;
+# this file then configures every review. It complements the Codex
+# workflow (.github/workflows/codex-review.yml): different model, second
+# pair of eyes — expect (and adjudicate) disagreements via the
+# review-loop skill rather than applying both blindly.
+language: "en-US"
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: |
+        Rust with clippy pedantic already enforced in CI — do not comment
+        on style or lint-owned concerns. Focus on: correctness (concrete
+        failure scenarios only), unhandled error paths, cross-process
+        contracts (argv construction for the `container` CLI, NDJSON
+        relay framing), and whether new tests would actually fail if the
+        code under test were broken. Comments in this codebase document
+        constraints; flag comments that merely restate the code.
+    - path: "docs/adr/**"
+      instructions: |
+        Check internal consistency with earlier accepted ADRs and with
+        docs/requirements.md, not prose style.
+
+chat:
+  auto_reply: true

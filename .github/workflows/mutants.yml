@@ -1,0 +1,63 @@
+# Mutation testing: does the test suite actually go red when the code is
+# broken? cargo-mutants automates the "flip a condition, delete a guard,
+# check the tests notice" exercise mutant by mutant.
+#
+# REPORT-ONLY by design (continue-on-error): missed mutants surface in the
+# run summary and artifact, but never block anything. Blocking from day
+# one teaches reflexive ignoring; the intended path is to drain the
+# missed-mutant list first and only then consider making this a gate.
+name: Mutation testing
+
+on:
+  schedule:
+    # Weekly, Saturday 03:00 JST (Friday 18:00 UTC) — full runs build the
+    # crate once per mutant, too slow for per-PR use.
+    - cron: '0 18 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Run mutants (report only)
+        # Non-zero exit means missed mutants — that's the report, not a
+        # failure of this job.
+        continue-on-error: true
+        run: cargo mutants --no-shuffle -j 2 --output mutants-report
+
+      - name: Summarize
+        if: always()
+        run: |
+          out=mutants-report/mutants.out
+          {
+            echo "## Mutation testing"
+            for f in missed timeout unviable caught; do
+              n=$(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)
+              echo "- $f: $n"
+            done
+            if [ -s "$out/missed.txt" ]; then
+              echo
+              echo '### Missed mutants (tests stayed green)'
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-report
+          path: mutants-report/mutants.out
+          retention-days: 30

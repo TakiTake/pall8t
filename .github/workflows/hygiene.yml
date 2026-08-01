@@ -1,0 +1,58 @@
+# Code-hygiene report: copy-paste duplication (jscpd) and unused
+# dependencies (cargo-machete). Dead code itself is already a hard error
+# via `-D warnings` in CI, so this covers what the compiler can't see.
+#
+# REPORT-ONLY by design: duplication lands as Code Scanning alerts and a
+# run summary, never a red build. Blocking from day one teaches reflexive
+# ignore-comments; drain the report first, ratchet later if ever.
+name: Code hygiene
+
+on:
+  schedule:
+    # Weekly, Saturday 03:00 JST (Friday 18:00 UTC).
+    - cron: '0 18 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  duplication:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for copy-paste duplication
+        # jscpd exits zero here (no --threshold set); the SARIF is the report.
+        run: |
+          npx --yes jscpd --pattern 'src/**/*.rs' \
+            --reporters consoleFull,sarif --output .jscpd --min-tokens 70 \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .jscpd/jscpd-report.sarif
+          category: jscpd
+
+  unused-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Scan for unused dependencies (report only)
+        continue-on-error: true
+        run: |
+          {
+            echo '## cargo-machete'
+            echo '```'
+            cargo machete 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cargo machete
