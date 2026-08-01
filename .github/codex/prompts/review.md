@@ -1,6 +1,7 @@
-Review ONLY the changes introduced by this pull request. Find the PR's
-diff with `git log --oneline -20` and `git diff origin/main...HEAD` (the
-checkout is the PR merge ref).
+Review ONLY the changes introduced by this pull request. The checkout is
+the PR merge ref, so its parents delimit the PR exactly regardless of the
+base branch: find the diff with `git log --oneline HEAD^1..HEAD^2` and
+`git diff HEAD^1...HEAD^2`.
 
 Context: this is pall8t, a Rust CLI that runs AI coding agents inside
 apple/container sandboxes on macOS. Its conventions: clippy pedantic is

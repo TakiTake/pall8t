@@ -13,10 +13,14 @@ and never apply a finding you haven't reproduced or reasoned through.**
 ## 1. Gather every finding
 
 ```sh
-gh pr view <N> --comments                                  # conversation
-gh api repos/{owner}/{repo}/pulls/<N>/comments             # inline review threads
-gh api repos/{owner}/{repo}/pulls/<N>/reviews              # review verdicts
+gh pr view <N> --comments                                     # conversation
+gh api --paginate repos/{owner}/{repo}/pulls/<N>/comments     # inline review threads
+gh api --paginate repos/{owner}/{repo}/pulls/<N>/reviews      # review verdicts
 ```
+
+`--paginate` matters: without it a busy PR silently truncates to the
+first page and findings past it are never addressed. Merge all pages into
+one collection before deduplicating.
 
 Collect findings from all sources, including resolved-looking threads with
 no reply. Deduplicate across reviewers (bots often overlap).
@@ -50,14 +54,24 @@ Run the full local gate before pushing (`scripts/lint.sh` and
 what was real and fixed, what was refuted and why the code changed anyway
 (clarity, pinning) or didn't.
 
+Pushing fix commits to the PR's own feature branch is ordinary workflow —
+it's what keeps the loop moving. But the repo's publish gates still
+apply: anything CLAUDE.md reserves for the human (tag pushes, merging,
+other repos) or that the permission system denies is handed to the human
+as an exact command, never retried or worked around.
+
 ## 5. Reply per finding, then request re-review
 
 Reply on the PR (thread reply for inline comments, PR comment otherwise)
 with the verdict and the evidence: for a fix, name the commit and the
 pinning test; for a refutation, show the trace ("this `into_inner` unwraps
 the `Take`, not the `BufReader`") — enough that the thread can be resolved
-without re-deriving your work. Then request re-review from the bot/human
-that raised it.
+without re-deriving your work. Then request re-review from whoever raised
+it — each reviewer has its own trigger: CodeRabbit reviews pushed commits
+automatically (or on `@coderabbitai review`), the Codex workflow runs on
+`synchronize` (every push) when its API key is configured, and humans get
+a normal re-review request. Confirm the re-review actually started; a
+reply nobody re-reads closes nothing.
 
 ## 6. Loop, bounded
 

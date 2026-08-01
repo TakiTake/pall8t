@@ -47,9 +47,13 @@ The test strategy starts in the production code, not the test file:
 ## Would the test go red?
 
 A test only counts if it fails when the code it names is broken. The
-mutation-testing workflow (`.github/workflows/mutants.yml`, weekly,
-report-only) automates this check — it flips conditions and deletes
-guards, then reports mutants the suite failed to catch. When you write a
+mutation-testing workflow (`.github/workflows/mutants.yml`) automates
+this check — it flips conditions and deletes guards, then reports mutants
+the suite failed to catch. It runs weekly and on demand (Actions →
+"Mutation testing" → *Run workflow*, or
+`gh workflow run mutants.yml`); either way it is report-only and never
+blocks a build. For a quick local pass on one file:
+`cargo mutants -f src/<file>.rs`. When you write a
 nontrivial test, do the manual version once: break the code, watch the
 test fail, restore it. If it stays green, the test is asserting the wrong
 thing.

@@ -12,9 +12,12 @@
 # review-loop skill (verify → classify → fix or refute with evidence).
 name: Codex review
 
+# `synchronize` makes fix commits get re-reviewed — without it the
+# review-loop stalls after the first round. It also means every push
+# spends tokens; drop it from the list if cost outweighs re-review.
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review, synchronize]
 
 jobs:
   codex:

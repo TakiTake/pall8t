@@ -66,8 +66,9 @@ stop there.
 - Architecture decisions: [docs/adr/](docs/adr/)
 - Testing conventions (read before writing tests): [docs/testing.md](docs/testing.md)
 - Sandbox environment details: `.claude/skills/pall8t`
-- Review automation: weekly report-only workflows for mutation testing
-  (`mutants.yml`) and duplication/unused-deps (`hygiene.yml`) — reports,
-  never gates; Codex PR review (`codex-review.yml`) stays dormant until an
+- Review automation: report-only workflows for mutation testing
+  (`mutants.yml`) and duplication/unused-deps (`hygiene.yml`), each
+  weekly plus on-demand via `gh workflow run <name>` — reports, never
+  gates; Codex PR review (`codex-review.yml`) stays dormant until an
   `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
   `.coderabbit.yaml` (free for this public repo once the app is installed).
