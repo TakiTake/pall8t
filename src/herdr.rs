@@ -406,25 +406,59 @@ fn linux_asset_name() -> Result<&'static str> {
     }
 }
 
-/// Ensures `~/.pall8t/tools/herdr/<version>/herdr` exists (downloading the
-/// release asset on first use) and returns its directory — the mount
-/// source for [`CONTAINER_BIN_DIR`].
+/// Full sha256 of a file, lowercase hex.
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    Ok(crate::container::sha256_hex_prefix(&bytes, 32))
+}
+
+/// True if `bin`'s content matches the hash recorded in `sidecar`.
+/// The sidecar lives OUTSIDE the directory that gets mounted into
+/// sandboxes, so a sandboxed process (which shares the host uid and gets
+/// the mount rw — apple/container has no read-only mounts) can tamper
+/// with the binary but not with the record used to check it.
+fn cache_verified(bin: &std::path::Path, sidecar: &std::path::Path) -> bool {
+    let Ok(recorded) = std::fs::read_to_string(sidecar) else {
+        return false;
+    };
+    sha256_file(bin).is_ok_and(|actual| actual == recorded.trim())
+}
+
+/// Ensures a verified `~/.pall8t/tools/herdr/<version>/herdr` exists and
+/// returns its directory — the mount source for [`CONTAINER_BIN_DIR`].
+///
+/// Integrity model (review findings on PR #38): herdr's releases publish
+/// no checksums, so the first download trusts TLS to github.com —
+/// trust-on-first-use, recorded as a sha256 sidecar stored outside the
+/// mounted directory. Every later run re-verifies the cached binary
+/// against that record before mounting it: a sandbox that tampered with
+/// the binary through the rw mount poisons only its own already-running
+/// session, and the next run detects the mismatch and re-downloads. The
+/// download uses a per-pid temp name so two cold-cache runs racing each
+/// other both publish complete files via atomic rename (same asset, so
+/// whichever rename lands last is equivalent).
 fn ensure_linux_herdr(host_bin: &str) -> Result<std::path::PathBuf> {
     let version = host_herdr_version(host_bin)
         .ok_or_else(|| anyhow::anyhow!("cannot determine the host herdr version"))?;
-    let dir = crate::config::pall8t_root()?
-        .join("tools")
-        .join("herdr")
-        .join(&version);
+    let root = crate::config::pall8t_root()?.join("tools").join("herdr");
+    let dir = root.join(&version);
     let bin = dir.join("herdr");
+    let sidecar = root.join(format!("{version}.sha256"));
     if bin.exists() {
-        return Ok(dir);
+        if cache_verified(&bin, &sidecar) {
+            return Ok(dir);
+        }
+        eprintln!(
+            "pall8t: cached herdr binary failed integrity verification — re-downloading \
+             (a sandbox may have modified it through the mount)"
+        );
+        std::fs::remove_file(&bin).ok();
     }
     let asset = linux_asset_name()?;
     let url = format!("https://github.com/ogulcancelik/herdr/releases/download/v{version}/{asset}");
     eprintln!("pall8t: downloading {asset} v{version} for the sandbox…");
     std::fs::create_dir_all(&dir)?;
-    let tmp = dir.join(".herdr.partial");
+    let tmp = dir.join(format!(".herdr.partial.{}", std::process::id()));
     crate::util::run_ok(
         "curl",
         &[
@@ -441,6 +475,14 @@ fn ensure_linux_herdr(host_bin: &str) -> Result<std::path::PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     }
+    // Sidecar first, then the binary: a crash between the two leaves a
+    // sidecar without a matching binary, which the next run treats as a
+    // verification failure and re-downloads — never a trusted-but-wrong
+    // state.
+    let digest = sha256_file(&tmp)?;
+    let sidecar_tmp = root.join(format!(".{version}.sha256.{}", std::process::id()));
+    std::fs::write(&sidecar_tmp, &digest)?;
+    std::fs::rename(&sidecar_tmp, &sidecar)?;
     std::fs::rename(&tmp, &bin)?;
     Ok(dir)
 }
@@ -475,16 +517,17 @@ impl DoctorSnapshot {
 }
 
 /// The cached Linux herdr CLI matching the host's version, if it has been
-/// downloaded already (see [`prepare_bridge`]) — for `doctor`.
+/// downloaded already AND still passes integrity verification (see
+/// [`ensure_linux_herdr`]) — for `doctor`.
 pub fn cached_linux_herdr(host_bin: &str) -> Option<std::path::PathBuf> {
     let version = host_herdr_version(host_bin)?;
-    let bin = crate::config::pall8t_root()
+    let root = crate::config::pall8t_root()
         .ok()?
         .join("tools")
-        .join("herdr")
-        .join(version)
         .join("herdr");
-    bin.exists().then_some(bin)
+    let bin = root.join(&version).join("herdr");
+    let sidecar = root.join(format!("{version}.sha256"));
+    (bin.exists() && cache_verified(&bin, &sidecar)).then_some(bin)
 }
 
 /// Bridge-prerequisite lines appended to `doctor`'s report. Both are
@@ -796,6 +839,38 @@ mod tests {
             None,
             "no recognized token -> no hint"
         );
+    }
+
+    #[test]
+    fn cache_verified_table() {
+        let dir = std::env::temp_dir().join(format!("pall8t-test-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("herdr");
+        let sidecar = dir.join("v.sha256");
+        std::fs::write(&bin, b"binary-content").unwrap();
+
+        assert!(
+            !cache_verified(&bin, &sidecar),
+            "no sidecar record -> unverified (a bare cached file is never trusted)"
+        );
+
+        std::fs::write(&sidecar, sha256_file(&bin).unwrap()).unwrap();
+        assert!(cache_verified(&bin, &sidecar), "matching record verifies");
+
+        std::fs::write(&sidecar, format!("{}\n", sha256_file(&bin).unwrap())).unwrap();
+        assert!(
+            cache_verified(&bin, &sidecar),
+            "a trailing newline in the record must not break verification"
+        );
+
+        std::fs::write(&bin, b"tampered-by-sandbox").unwrap();
+        assert!(
+            !cache_verified(&bin, &sidecar),
+            "content drift (e.g. tampering through the rw mount) is detected"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

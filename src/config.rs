@@ -144,7 +144,13 @@ struct Raw {
     herdr: RawHerdr,
 }
 
+/// `deny_unknown_fields` is security-relevant here, not just hygiene: a
+/// typo like `sandbo = "off"` would otherwise be silently ignored and the
+/// bridge would default to `full` — the user believes the sandbox is
+/// sealed while it is wide open. Failing the parse is the only honest
+/// behavior (PR #38 review finding).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawHerdr {
     sandbox: Option<HerdrSandbox>,
 }
@@ -447,6 +453,11 @@ mod tests {
         assert!(
             toml::from_str::<Raw>("[herdr]\nsandbox = \"bogus\"\n").is_err(),
             "an unknown sandbox value must fail to parse"
+        );
+        assert!(
+            toml::from_str::<Raw>("[herdr]\nsandbo = \"off\"\n").is_err(),
+            "a misspelled key must fail the parse, not silently leave the \
+             bridge in full mode (deny_unknown_fields)"
         );
     }
 

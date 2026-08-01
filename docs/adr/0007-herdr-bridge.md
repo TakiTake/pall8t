@@ -56,7 +56,15 @@ Two facts about apple/container, verified live on 1.1.0, shape the design:
    (prepended to `PATH`). Version lockstep is load-bearing: the CLI
    refuses to talk across any protocol difference, and this makes the pin
    automatic — a brew-upgraded host herdr fetches its matching Linux build
-   on the next run.
+   on the next run. Integrity: herdr's releases publish no checksums, so
+   the first download trusts TLS to github.com (trust-on-first-use); its
+   sha256 is recorded in a sidecar stored *outside* the mounted directory,
+   and every subsequent run re-verifies the cached binary against that
+   record before mounting. Because apple/container has no read-only
+   mounts, a sandbox *can* overwrite the binary through the rw mount — but
+   that poisons only its own live session; the next run detects the
+   mismatch and re-downloads. Downloads use per-pid temp names so
+   concurrent cold-cache runs publish complete files via atomic rename.
 4. **Env passthrough**: `HERDR_ENV=1`, `HERDR_{WORKSPACE,TAB,PANE}_ID`,
    `HERDR_SOCKET_PATH` (container path), `HERDR_BIN_PATH` — so herdr's
    published SKILL.md works inside the sandbox *unmodified*, including
@@ -68,16 +76,25 @@ Two facts about apple/container, verified live on 1.1.0, shape the design:
 `readonly`, `off`. Methods are classified:
 
 - **Read** (list/get/read/current/layout/wait/subscribe…): always allowed.
+- **Host admin**: every method in the `server.*`, `integration.*`,
+  `plugin.*`, and `session.*` namespaces (`server.stop`,
+  `integration.install`, `plugin.link`, …) except the exact read-only
+  methods carved out above (`server.agent_manifests`, `plugin.list`,
+  `session.snapshot`, …): always denied. These administer the host herdr
+  installation or its lifecycle — herdr's own skill already tells agents
+  never to do them, so denying them blocks nothing legitimate. Denial is
+  *by namespace*, not by an enumerated list, so an admin method a newer
+  herdr adds is denied before pall8t has heard of it.
 - **Mutate** (split, prompt, agent start, send input, tabs, workspaces…):
-  allowed in `full`, denied in `readonly`. Methods unknown to pall8t (a
-  newer herdr) classify as Mutate — transparent under `full`, safe under
-  `readonly`.
-- **Host admin** (`server.stop`, `server.live_handoff`,
-  `server.reload_config`, `server.reload_agent_manifests`,
-  `integration.install/uninstall`, `plugin.link/unlink/enable/disable`):
-  always denied. These administer the host herdr installation itself —
-  herdr's own skill already tells agents never to do them, so denying
-  them blocks nothing legitimate.
+  allowed in `full`, denied in `readonly`. Methods unknown to pall8t
+  *outside* the admin namespaces classify as Mutate — transparent under
+  `full`, safe under `readonly`. Failing closed for those too was
+  considered and rejected: the CLI version-updates automatically while
+  the classifier ships with pall8t, so a global deny-unknown would break
+  the bridge on every herdr release that adds a workspace-surface method
+  — a blocker, which this design explicitly is not. The namespace rule
+  covers where admin methods actually land; the residual risk is a future
+  admin method placed outside those namespaces, accepted and revisitable.
 
 Denied requests get a herdr-shaped error
 (`{"id":…,"error":{"code":"sandbox_denied",…}}`) naming the config knob,
@@ -92,18 +109,22 @@ the host**: this is a controlled, audited opening in the sandbox wall,
 chosen because coordinating sibling agents is the entire point of running
 pall8t under herdr. Users who want the wall solid set `readonly` or `off`.
 Compared to herdr's own `0600` socket, the TCP listener is a broader
-surface; the compensations are peer-pinning to the one container's
-address, the always-denied host-admin class, and the audit log. Same-host
-same-user processes could already reach `herdr.sock` directly, so the
-relay adds no privilege they didn't have.
+surface; the compensations are binding to the vmnet gateway address
+(falling back to `0.0.0.0` only if it can't be resolved), peer-pinning to
+the one container's address, the always-denied host-admin class, and the
+audit log. Same-host same-user processes could already reach `herdr.sock`
+directly, so the relay adds no privilege they didn't have.
 
 ## Consequences
 
 - A developer using herdr + pall8t gets herdr's documented agent workflow
   inside the sandbox with zero setup; herdr's upstream SKILL.md needs no
   pall8t-specific edits.
-- The default image grows `socat`; custom Containerfiles need it (or the
-  bridge degrades to env-plus-relay for raw-socket clients only).
+- The default image grows `socat`; custom Containerfiles need it. Without
+  `socat` the bootstrap only warns — `HERDR_SOCKET_PATH` then points at a
+  socket that never exists, so the stock herdr CLI and Unix-socket
+  clients cannot connect; only a client that reads `PALL8T_HERDR_PORT`
+  and speaks TCP to the gateway directly can still reach the relay.
 - First bridged run needs network access to download the Linux herdr CLI;
   it's cached per version afterwards.
 - herdr's screen-scrape agent detection still comes from the host-side

@@ -85,19 +85,17 @@ pub enum Class {
     HostAdmin,
 }
 
-/// Methods that administer the host herdr installation (always denied).
-const HOST_ADMIN: &[&str] = &[
-    "server.stop",
-    "server.live_handoff",
-    "server.reload_config",
-    "server.reload_agent_manifests",
-    "integration.install",
-    "integration.uninstall",
-    "plugin.link",
-    "plugin.unlink",
-    "plugin.enable",
-    "plugin.disable",
-];
+/// Namespaces whose methods administer the host herdr installation or its
+/// session/server lifecycle rather than the terminal workspace
+/// (`server.stop`, `integration.install`, `plugin.link`, …): denied by
+/// namespace, not by an enumerated list, so an admin method a FUTURE herdr
+/// adds in these namespaces is denied before this module ever hears of it
+/// (review finding on PR #38 — an enumerated denylist silently allowed
+/// new admin methods in `full` mode). The read-only exceptions that do
+/// live in these namespaces (`server.agent_manifests`, `plugin.list`,
+/// `session.snapshot`, …) are carved out by the exact-match [`READ`]
+/// check running first.
+const ADMIN_NAMESPACES: &[&str] = &["server.", "integration.", "plugin.", "session."];
 
 /// Pure-inspection methods (allowed even in `readonly`), from herdr 0.7.5's
 /// method inventory. A read method a newer herdr adds is missing here until
@@ -138,10 +136,10 @@ const READ: &[&str] = &[
 ];
 
 pub fn classify(method: &str) -> Class {
-    if HOST_ADMIN.contains(&method) {
-        Class::HostAdmin
-    } else if READ.contains(&method) {
+    if READ.contains(&method) {
         Class::Read
+    } else if ADMIN_NAMESPACES.iter().any(|ns| method.starts_with(ns)) {
+        Class::HostAdmin
     } else {
         Class::Mutate
     }
@@ -238,8 +236,19 @@ fn watch_parent() {
 /// never by hand). Binds an ephemeral port, prints it as the single stdout
 /// line the parent reads, then serves until the parent exits.
 pub fn run(socket: &Path, container: &str, mode: Mode, log_path: &Path) -> Result<()> {
-    let listener =
-        TcpListener::bind(("0.0.0.0", 0)).context("cannot bind the relay TCP listener")?;
+    // Bind to the vmnet gateway — the one host address containers can
+    // reach — so the listener is not published on Wi-Fi/Ethernet
+    // interfaces at all (review finding on PR #38). The gateway exists as
+    // soon as the container system is up, which `pall8t run` guarantees
+    // before spawning this relay; if resolving it still fails, fall back
+    // to 0.0.0.0, where the peer-IP gate remains the (audited) control.
+    let gateway = crate::container::default_gateway().and_then(|s| s.parse::<IpAddr>().ok());
+    let listener = match gateway {
+        Some(ip) => TcpListener::bind((ip, 0))
+            .or_else(|_| TcpListener::bind(("0.0.0.0", 0)))
+            .context("cannot bind the relay TCP listener")?,
+        None => TcpListener::bind(("0.0.0.0", 0)).context("cannot bind the relay TCP listener")?,
+    };
     let port = listener.local_addr()?.port();
     println!("{port}");
     // The port line is the whole stdout contract; anything later would
@@ -255,6 +264,7 @@ pub fn run(socket: &Path, container: &str, mode: Mode, log_path: &Path) -> Resul
         log_path,
         &serde_json::json!({
             "ts": epoch_secs(), "event": "start",
+            "bind": listener.local_addr().map_or_else(|_| "?".into(), |a| a.ip().to_string()),
             "port": port, "mode": mode.as_str(), "container": container,
             "socket": socket.display().to_string(),
         }),
@@ -397,10 +407,35 @@ mod tests {
         );
         assert_eq!(classify("server.stop"), Class::HostAdmin);
         assert_eq!(classify("integration.install"), Class::HostAdmin);
+        assert_eq!(classify("plugin.link"), Class::HostAdmin);
+        assert_eq!(
+            classify("server.shutdown"),
+            Class::HostAdmin,
+            "an admin method this module has never heard of is denied by \
+             its namespace, not allowed by omission (PR #38 review finding)"
+        );
+        assert_eq!(
+            classify("plugin.action.invoke"),
+            Class::HostAdmin,
+            "plugin actions run arbitrary host-side plugin code — admin \
+             namespace, deliberately no carve-out"
+        );
+        assert_eq!(
+            classify("session.snapshot"),
+            Class::Read,
+            "exact READ matches carve through the admin namespaces"
+        );
+        assert_eq!(classify("server.agent_manifests"), Class::Read);
         assert_eq!(
             classify("future.method"),
             Class::Mutate,
-            "unknown methods default to Mutate: transparent in full, safe in readonly"
+            "unknown methods outside the admin namespaces default to \
+             Mutate: transparent in full, safe in readonly"
+        );
+        assert_eq!(
+            classify("pane.future_thing"),
+            Class::Mutate,
+            "a new workspace-surface method stays usable in full mode"
         );
     }
 

@@ -566,6 +566,19 @@ pub fn ip_address(name: &str) -> Option<String> {
     Some(cidr.split('/').next().unwrap_or(&cidr).to_string())
 }
 
+/// The default network's host-side gateway address (`container network
+/// inspect default` → `status.ipv4Gateway`) — the one host address
+/// containers can reach, so the relay binds to it rather than `0.0.0.0`
+/// (see [`crate::relay`]). Available as soon as the container system is
+/// up, before any container exists.
+pub fn default_gateway() -> Option<String> {
+    let out = run_ok(["network", "inspect", "default"]).ok()?;
+    let v: Value = serde_json::from_str(out.trim()).ok()?;
+    v.pointer("/0/status/ipv4Gateway")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// What to exec for the `container` CLI when argv[0] matters, plus env
 /// assignments to carry over. Homebrew installs `container` as a bash
 /// wrapper (`VAR="…" exec "<cellar>/libexec/container" "$@"`), and that
