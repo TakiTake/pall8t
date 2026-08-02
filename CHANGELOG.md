@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.pall8t/logs/`.
 - The default image now installs `socat` (required by the in-container
   bridge; its absence degrades with a warning, never a failed run).
+- Project icon: `assets/pall8t-icon-cobalt.svg` (three shipping
+  containers on a pallet, cobalt navy).
 
 ### Development
 
