@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/pall8t-icon-cobalt.svg" alt="pall8t icon — three shipping containers on a pallet" width="128" height="128">
+</p>
+
 # pall8t
 
 *(pronounced "pallet" — the thing containers ship on)*
