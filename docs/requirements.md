@@ -22,6 +22,10 @@ Adding a TUI, attach/detach, and other session-management features was turning p
 
 ## 2. Scope
 
+### 2.0 Runtime baseline
+
+apple/container **1.2.0 or newer**. Below that, `Parser.allEnv` expanded a bare env name (no `=`) declared in an *image config* from the host process's environment and injected the result into the container ([apple/container#2027](https://github.com/apple/container/pull/2027)). That breaks the boundary FR-1 states — pall8t forwards nothing from the host environment by default — from underneath, since the expansion happens host-side before pall8t's argv is involved. An older runtime is not blocked: pall8t warns once per invocation and continues, because refusing to run buys the user nothing they can act on faster than the warning does.
+
 ### 2.1 In Scope
 
 - Run AI agents on apple/container as foreground processes
@@ -54,6 +58,7 @@ Adding a TUI, attach/detach, and other session-management features was turning p
 - Forward SIGINT / SIGTERM etc. correctly to the process inside the container
 - Return the container process's exit code unchanged
 - `-- <cmd>` overrides the command from the config file
+- Forward nothing from the host environment by default: the container process gets only what pall8t sets explicitly (today, the herdr bridge's `HERDR_*` identity and relay port). Honoring this needs the runtime baseline in §2.0 — an image config's bare env names are expanded host-side, out of pall8t's reach, before 1.2.0
 
 ### FR-2: Automatic build
 
