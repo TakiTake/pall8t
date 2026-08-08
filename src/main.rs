@@ -24,7 +24,7 @@ enum Cmd {
     Run {
         /// Mount reference repos read-only (default), overriding
         /// `readonly` on every [[repos]] entry. `--repos-readonly=false`
-        /// mounts a writable disposable copy of each instead
+        /// mounts a writable copy of each instead
         #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
         repos_readonly: Option<bool>,
         /// Command to run instead of the configured one (after --)

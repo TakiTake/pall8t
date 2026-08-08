@@ -20,11 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Breaking for agents that write to a reference repo.** `git fetch`,
     `git commit`, and any other write inside one now fail with
     `Read-only file system` where they previously succeeded against a
-    disposable copy that was discarded at the end of the run. Set
-    `readonly = false` on the entry (or run `pall8t run
+    copy. Set `readonly = false` on the entry (or run `pall8t run
     --repos-readonly=false`) to get that copy back — it is unchanged,
     including the `origin` rewrite that makes `git fetch` reach the real
-    upstream.
+    upstream, and including the fact that it is kept under
+    `~/.pall8t/repos` and reused by later runs rather than refreshed from
+    the source.
   - `readonly` is per entry, defaults to `true`, and
     `--repos-readonly[=BOOL]` on `pall8t run` overrides every entry for
     one run. A misspelled key now fails the config parse rather than

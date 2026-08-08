@@ -87,8 +87,8 @@ pub struct RepoEntry {
     /// inside the container (FR-4).
     pub source: PathBuf,
     /// Mount the source read-only (the default — see [`repo_readonly`]),
-    /// or `false` to mount a disposable `git clone --local` copy that the
-    /// agent may write to.
+    /// or `false` to mount a `git clone --local` copy that the agent may
+    /// write to (kept between runs — see [`crate::repos::RepoMount::Copy`]).
     pub readonly: Option<bool>,
 }
 
@@ -302,8 +302,9 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # source = "~/src/some-library"
 # Read-only by default: the runtime refuses every write, so the agent can
 # read the real checkout and cannot change it. Set false to mount a
-# disposable `git clone --local` copy instead, which the agent may commit
-# and fetch in — its changes are thrown away when the run ends.
+# `git clone --local` copy instead, which the agent may commit and fetch
+# in. That copy is kept under ~/.pall8t/repos and reused by later runs —
+# delete it there to re-clone from the source.
 # readonly = true
 
 [herdr]
@@ -345,7 +346,8 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 # list rather than adding to it.
 # [[repos]]
 # source = "~/src/some-library"
-# readonly = true    # false mounts a writable disposable copy instead
+# readonly = true    # false mounts a writable copy instead, kept in
+                     # ~/.pall8t/repos and reused by later runs
 # Override for one run without editing this file:
 #   pall8t run --repos-readonly=false
 

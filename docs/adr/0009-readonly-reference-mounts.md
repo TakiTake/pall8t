@@ -7,7 +7,7 @@
 
 ## Context
 
-ADR-0004 recorded that apple/container had no read-only mount support ([apple/container#990](https://github.com/apple/container/issues/990), then an open feature request) and chose *protection by duplication*: each reference repo is cloned with `git clone --local` and the copy is mounted at the original's absolute path, so an agent that writes damages only a disposable clone. ADR-0006 kept that when the TUI went away, and both left the same follow-up: *"#990 resolved → mount reference repos ro directly."*
+ADR-0004 recorded that apple/container had no read-only mount support ([apple/container#990](https://github.com/apple/container/issues/990), then an open feature request) and chose *protection by duplication*: each reference repo is cloned with `git clone --local` and the copy is mounted at the original's absolute path, so an agent that writes damages only the clone. ADR-0006 kept that when the TUI went away, and both left the same follow-up: *"#990 resolved → mount reference repos ro directly."*
 
 The trigger fired, earlier than the docs assumed. #990 closed 2026-01-07, before 1.0.0 was ever tagged — so pall8t had been carrying a workaround for a constraint that no shipped version it supported actually had.
 
@@ -44,7 +44,7 @@ The `--reference` alternates half of ADR-0004's deferred design is **not** adopt
 
 ## Consequences
 
-- **`git fetch` and commits inside a read-only reference repo now fail** with `EROFS`, where before they silently succeeded against a disposable copy. That is a behavior change in the honest direction — those commits were always thrown away at the end of the run — but a user who relied on the copy needs `readonly = false`. The CHANGELOG says so, and each run prints which protection each repo got.
+- **`git fetch` and commits inside a read-only reference repo now fail** with `EROFS`, where before they succeeded against a copy. A user who relied on that needs `readonly = false`; the CHANGELOG says so, and each run prints which protection each repo got. Note the copy is *not* discarded at the end of a run — `prepare` reuses an existing clone as-is — so those commits did persist under `~/.pall8t/repos`, just invisibly to anyone looking at the source checkout.
 - **No clone, no clone maintenance.** A read-only entry costs no disk, no `git clone --local` on first use, and cannot go stale against its source — the previous copy was refreshed only by deleting it by hand.
 - **The `[[repos]]`-overlaps-the-workspace check still applies**, and its error message now covers both modes: mounted as a copy the agent's commits are swallowed; mounted read-only the live checkout turns read-only underneath the agent.
 - **Every mount changed flag**, including the workspace and the container home. They were `-v host:dest` and are now `--mount type=virtiofs,source=…,target=…`. Same semantics, validated parsing, and no dependence on `:` not appearing in a path. `run_argv_shape` pins the exact strings.

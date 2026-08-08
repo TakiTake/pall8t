@@ -30,7 +30,7 @@ Adding a TUI, attach/detach, and other session-management features was turning p
 - If cwd is a git worktree, automatically mount the main repository's `.git` as well
 - At run time, compare the Containerfile hash and rebuild before launch if it changed
 - Customization via TOML config (CPU/memory allocation, reference repositories, default command, etc.)
-- Duplicate reference repositories with `git clone --local` (hardlinked objects) before mounting, protecting the originals
+- Mount reference repositories read-only, protecting the originals by the runtime rather than by copying them (ADR-0009); duplication with `git clone --local` remains available per entry for agents that must write
 - TTY passthrough and signal forwarding (behave well under tmux / herdr)
 - herdr bridge: inside a herdr pane, expose the host herdr session to the sandboxed agent (env passthrough, socket relay with policy + audit, version-matched Linux CLI) — ADR-0007
 
@@ -71,8 +71,8 @@ Adding a TUI, attach/detach, and other session-management features was turning p
 ### FR-4: Reference repositories
 
 - Mount each repository listed under `[[repos]]` at its own absolute path inside the container, **read-only by default** — the runtime refuses every write, so the agent reads the real checkout and cannot change it (ADR-0009)
-- `readonly = false` on an entry mounts a `git clone --local` duplicate at that path instead, writable, so an agent can commit or fetch; its changes are discarded with the run. `pall8t run --repos-readonly[=BOOL]` overrides every entry for one run
-- `cp -al` is rejected for that duplicate: hardlinks don't apply to directories, and hardlinked working-tree files risk corrupting the original via in-place writes
+- `readonly = false` on an entry mounts a `git clone --local` duplicate at that path instead, writable, so an agent can commit or fetch. The duplicate lives under `~/.pall8t/repos` and is **kept between runs**: an existing one is reused as-is, never refreshed from the source, so delete it there to re-clone. `pall8t run --repos-readonly[=BOOL]` overrides every entry for one run
+- `cp -al` is rejected for that duplicate: it hardlinks the working-tree files, so a write through one modifies the source checkout — the very thing duplication exists to prevent. `git clone --local` hardlinks only the immutable objects under `.git`, and gives the copy its own working tree
 - A `[[repos]]` source overlapping the workspace (or a worktree's main `.git`) is an error under either mode — the mount would cover the live checkout the run works in
 
 ### FR-5: Container management
@@ -114,8 +114,10 @@ memory = "8g"
 command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
                          # Users who want it must set it explicitly.
 
-[[repos]]                # reference repos (duplicated via git clone --local, then mounted)
-source = "~/src/other-lib"
+[[repos]]                # reference repos, mounted at this same path inside
+source = "~/src/other-lib"   # the container
+# readonly = true          # default; false mounts a writable git clone --local
+                           # copy (kept under ~/.pall8t/repos) instead
 ```
 
 ## 6. Non-Functional Requirements

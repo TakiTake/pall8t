@@ -56,11 +56,17 @@ pub enum RepoMount {
     /// write, so the agent cannot touch the real checkout — protection by
     /// the runtime, the default since ADR-0009.
     ReadOnly { source: PathBuf },
-    /// A disposable `git clone --local` copy (under `~/.pall8t/repos`)
-    /// mounted at `source`'s path, so writes land in the copy and the real
-    /// checkout is untouched — protection by duplication, which is what
-    /// pall8t did for every repo before read-only mounts were verified.
-    /// Still the way to let an agent commit or fetch in a reference repo.
+    /// A `git clone --local` copy (under `~/.pall8t/repos`) mounted at
+    /// `source`'s path, so writes land in the copy and the real checkout is
+    /// untouched — protection by duplication, which is what pall8t did for
+    /// every repo before read-only mounts were verified. Still the way to
+    /// let an agent commit or fetch in a reference repo.
+    ///
+    /// The copy outlives the run: [`prepare`] reuses an existing clone
+    /// as-is, so an agent's commits are there again next time, and the way
+    /// to start over from the source is to delete it under
+    /// `~/.pall8t/repos`. Disposable in the sense that losing it costs
+    /// nothing pall8t tracks — not in the sense of being cleaned up.
     Copy { source: PathBuf, clone: PathBuf },
 }
 
@@ -123,7 +129,7 @@ fn overlaps(a: &Path, b: &Path) -> bool {
 /// workspace cwd and, for a worktree, the main repository's `.git`). A
 /// source overlapping one of them is an error, checked before anything is
 /// cloned, and it is an error under either mode: mounted as a copy, the
-/// agent's commits would land in the disposable clone and be thrown away;
+/// agent's commits would land in the clone rather than the workspace;
 /// mounted read-only, the live checkout the agent is supposed to be
 /// working in would turn read-only underneath it.
 pub fn prepare(
@@ -144,7 +150,7 @@ pub fn prepare(
             return Err(anyhow!(
                 "reference repo {} overlaps {} — mounting it would cover the live \
                  checkout this run works in, either swallowing the agent's commits \
-                 into a disposable clone or turning the checkout read-only; remove \
+                 into a clone or turning the checkout read-only; remove \
                  it from [[repos]]",
                 source.display(),
                 p.display()
