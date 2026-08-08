@@ -8,3 +8,7 @@
 
 # Serena (LSP MCP server) writes per-project config/memories here on activation.
 .serena/
+
+# cargo-mutants run output (reports, not sources).
+/mutants.out
+/mutants.out.old
