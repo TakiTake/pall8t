@@ -92,8 +92,9 @@ struct Raw {
     /// `[home]` selected the experimental isolated-home compositor, since
     /// removed (ADR-0008). Still *parsed* so a config that carries it keeps
     /// loading — its presence only drives the deprecation warning in
-    /// [`load`]. Accepted as an opaque table so no field of the old schema
-    /// has to survive here.
+    /// [`load`]. Accepted as an opaque value — not a table — so that a
+    /// mistyped `home = "isolated"` still parses (and still warns) instead
+    /// of failing the load, and so no field of the old schema survives here.
     home: Option<toml::Value>,
     #[serde(default)]
     herdr: RawHerdr,
@@ -166,13 +167,19 @@ fn read_raw(path: &Path) -> Result<Option<Raw>> {
 /// unread is exactly the data loss the old `gc` refused to cause.
 fn deprecations_in(raw: &Raw, path: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    // `[[home.policy]]` alone (no `[home]` header) also lands here, as a
-    // table with just that key — still a setting, still worth a warning.
-    let sets_something = raw
-        .home
-        .as_ref()
-        .and_then(toml::Value::as_table)
-        .is_some_and(|t| !t.is_empty());
+    let sets_something = match raw.home.as_ref() {
+        None => false,
+        // An empty table is the 0.3.0 skeleton's bare `[home]` header: it
+        // sets nothing, so it says nothing. A non-empty one is a real
+        // setting — including `[[home.policy]]` with no `[home]` header,
+        // which lands here as a table holding just that key.
+        Some(toml::Value::Table(t)) => !t.is_empty(),
+        // `home = "isolated"`, `home = []`, … — a plausible miswrite of
+        // `[home] mode = "isolated"`. pall8t honors none of it either way,
+        // and silently swallowing an intent is the thing this warning
+        // exists to prevent (CodeRabbit, PR #43).
+        Some(_) => true,
+    };
     if sets_something {
         out.push(format!(
             "[home] in {} is no longer supported and is ignored — the experimental \
@@ -452,13 +459,14 @@ mod tests {
         );
     }
 
-    /// Regression pin: 0.3.0's `init` skeletons wrote a bare `[home]` header
-    /// with every key commented out, and `init` never rewrites an existing
-    /// file. Warning on the header alone would nag every user who ran `init`
-    /// and never opted in — on every `run`, forever, about a feature they
-    /// never used.
+    /// The warning fires on intent, not on syntax. Two regression pins in
+    /// one: 0.3.0's `init` skeletons wrote a bare `[home]` header with every
+    /// key commented out and `init` never rewrites an existing file, so
+    /// warning on the header alone would nag every `init` user forever about
+    /// a feature they never enabled; and a `home` value that isn't a table
+    /// at all is still an intent being dropped, so it must not slip through.
     #[test]
-    fn empty_home_section_from_the_old_skeleton_does_not_warn() {
+    fn home_section_warns_only_when_it_sets_something() {
         let path = Path::new("/x/.pall8t/config.toml");
         for src in [
             // The 0.3.0 skeleton shape: header present, everything commented.
@@ -477,6 +485,19 @@ mod tests {
             1,
             "`[[home.policy]]` without a `[home]` header still sets something"
         );
+
+        // Regression pin (CodeRabbit, PR #43): `home` need not be a table.
+        // Narrowing the check with `as_table()` made every non-table value
+        // look absent, so a miswritten `home = "isolated"` was dropped in
+        // silence — the exact outcome the warning exists to prevent.
+        for miswritten in ["home = \"isolated\"\n", "home = []\n", "home = 5\n"] {
+            assert_eq!(
+                deprecations_in(&parse(miswritten), path).len(),
+                1,
+                "a non-table `home` value is still an intent pall8t ignores, so \
+                 it must warn: {miswritten:?}"
+            );
+        }
     }
 
     #[test]
