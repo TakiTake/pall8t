@@ -164,6 +164,28 @@ impl RepoMount {
     }
 }
 
+/// The warning for a `--repos-readonly` that cannot do anything, or `None`
+/// when the flag has entries to act on (or was not given).
+///
+/// The flag governs `[[repos]]` entries and nothing else, so with none
+/// configured it is a no-op — and a silent one, since a run with no
+/// reference repos prints no repo lines either. Someone reaching for it is
+/// usually reaching for "make this sandbox read-only", which is not what it
+/// does and not something pall8t offers: the workspace and the container
+/// home are always writable, or the agent could not work and Claude could
+/// not record its session. Say so rather than let the flag look effective.
+pub fn no_repos_warning(cli_readonly: Option<bool>, repo_count: usize) -> Option<String> {
+    if cli_readonly.is_none() || repo_count > 0 {
+        return None;
+    }
+    Some(
+        "pall8t: warning: --repos-readonly has no effect here — no [[repos]] are \
+         configured, so there is no reference repo to mount. It governs reference \
+         repos only; the workspace and the container home are always writable."
+            .to_string(),
+    )
+}
+
 /// `GIT_CONFIG_*` environment marking every read-only repo path as a git
 /// `safe.directory`, or empty when there are none.
 ///
@@ -646,6 +668,38 @@ mod tests {
             !copy.readonly,
             "the copy is writable: letting the agent commit and fetch is the \
              only reason to prefer it over a read-only mount"
+        );
+    }
+
+    /// A flag the user typed that cannot do anything must say so. With no
+    /// `[[repos]]` configured a run prints no repo lines at all, so
+    /// `--repos-readonly` would otherwise look like it took effect while
+    /// changing nothing — and the workspace stays writable, which is what
+    /// someone reaching for the flag is most likely testing.
+    #[test]
+    fn no_repos_warning_table() {
+        let warning = no_repos_warning(Some(true), 0).expect("a no-op flag must be reported");
+        assert!(
+            warning.contains("[[repos]]") && warning.contains("workspace"),
+            "the warning must name what the flag governs and what it does not, or \
+             it just restates the confusion: {warning}"
+        );
+        assert_eq!(
+            no_repos_warning(Some(false), 0),
+            warning.into(),
+            "--repos-readonly=false is equally inert with no repos configured"
+        );
+
+        assert_eq!(
+            no_repos_warning(Some(true), 1),
+            None,
+            "with an entry to act on, the flag is doing its job"
+        );
+        assert_eq!(
+            no_repos_warning(None, 0),
+            None,
+            "no flag, no claim to correct — an ordinary run with no reference \
+             repos must stay quiet"
         );
     }
 

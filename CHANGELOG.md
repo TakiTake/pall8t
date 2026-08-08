@@ -32,7 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     source. `~/.pall8t/repos` is only created when some entry actually
     needs a copy, and existing clones there are left alone.
   - Each run prints which protection each repo got, since the two modes
-    differ in what the agent may do.
+    differ in what the agent may do. Passing `--repos-readonly` with no
+    `[[repos]]` configured warns that it has no effect, rather than
+    looking like it did something: the flag governs reference repos
+    only, and the workspace and container home are always writable.
   - A read-only entry that is a **linked git worktree** also gets its main
     repository's `.git` mounted read-only, the same way `pall8t run`
     already handles a worktree workspace (FR-3). Without it the sandbox

@@ -247,6 +247,9 @@ fn cmd_run(cli_command: Vec<String>, repos_readonly: Option<bool>) -> Result<()>
     // The live identity-mounted paths assembled so far (cwd, worktree git
     // dir) are exactly what a reference-repo mount must never shadow.
     let protected: Vec<_> = mounts.iter().map(|m| m.host.clone()).collect();
+    if let Some(msg) = repos::no_repos_warning(repos_readonly, cfg.repos.len()) {
+        eprintln!("{msg}");
+    }
     for rm in repos::prepare(&cfg.repos, &protected, repos_readonly)? {
         eprintln!("pall8t: {}", rm.describe());
         mounts.extend(rm.mounts());
