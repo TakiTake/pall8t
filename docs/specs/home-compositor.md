@@ -1,5 +1,7 @@
 # Spec: agent-home state compositor (pall8t `home` module)
 
+> **⚠️ REMOVED (2026-08-08).** The feature specified here shipped in 0.3.0 as the experimental `[home] mode = "isolated"` and was removed for lack of use — see [ADR-0008](../adr/0008-drop-home-compositor.md). Every run mounts `~/.pall8t/home` as the container home, unconditionally. Kept for historical reference: the problem it addresses (requirements §8 roadmap item 1) is still open.
+
 Status: **Accepted**, 2026-07-07. Addresses [issue #9](https://github.com/TakiTake/pall8t/issues/9)
 (shared home under parallel runs — requirements §8 roadmap item 1). Background: the
 [bit-vcs/bit evaluation](https://github.com/TakiTake/pall8t/issues/9#issuecomment-4904121268)

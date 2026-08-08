@@ -51,11 +51,32 @@ local review failed to catch first (source PRs noted).
 - Fail open vs fail closed: when setup fails partway, which side does
   the feature land on, and does the user find out?
 
-**Silent fallbacks** (PR #38)
+**Silent fallbacks** (PR #38, #43)
 - Config parsing: does a misspelled key/value fall back silently to a
   default — and is that default the *permissive* one? Security-relevant
   settings must fail the parse (`deny_unknown_fields`), not degrade.
 - Any `unwrap_or(default)` / `.ok()` on user intent: same question.
+- **Type-narrowed presence checks** (PR #43): a check that asks "is this
+  setting present?" through a type filter (`as_table()`, `as_str()`,
+  `downcast`, a match on one variant) answers "absent" for every value of
+  the wrong shape. `home = "isolated"` is a plausible miswrite of
+  `[home] mode = "isolated"`; narrowing with `as_table()` made it invisible.
+  Enumerate what the *user* could plausibly have typed, not what the happy
+  path expects — and when the branch exists to tell the user something,
+  the wrong-shape case usually needs telling too.
+- **A deprecation/ignored-setting warning is itself user intent**: check
+  which commands reach the print. A warning only wired into the main path
+  is silent exactly where a confused user looks first (a `doctor`-style
+  diagnostic).
+
+**Docs the diff touches** (PR #43)
+- Markdown lint is part of the review even when CI doesn't run it:
+  adjacent blockquotes separated by a blank line (MD028) is the one this
+  repo has actually hit, from prepending a banner to a doc that already
+  opened with a `>` note. Continue with `>` rather than deleting the blank
+  line — deleting it merges two distinct notes into one paragraph.
+- A banner or status line added to a doc must not contradict a claim
+  further down the same doc, or the ADR/CHANGELOG describing the change.
 
 **Concurrency and shared state** (PR #38)
 - Fixed-name temp files, caches, or locks that two concurrent runs can

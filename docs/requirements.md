@@ -132,6 +132,6 @@ source = "~/src/other-lib"
 
 ## 8. Roadmap (post-v1)
 
-1. **Per-run home clones and knowledge aggregation**: give each run a copy of `~/.pall8t/home` to isolate writes, while aggregating knowledge each agent adds at user level (skills etc.) back to the host. Merging knowledge produced in parallel is the essential challenge — a good answer here could become pall8t's core value
+1. **Per-run home clones and knowledge aggregation**: give each run a copy of `~/.pall8t/home` to isolate writes, while aggregating knowledge each agent adds at user level (skills etc.) back to the host. Merging knowledge produced in parallel is the essential challenge — a good answer here could become pall8t's core value. Still open: one implementation (the home compositor, `[home] mode = "isolated"`) shipped in 0.3.0 and was removed for lack of use — see [ADR-0008](adr/0008-drop-home-compositor.md); its spec and the evaluation of off-the-shelf tools are kept in `docs/specs/home-compositor*.md` for whoever tries again
 2. **Read-only mounts**: make reference repositories ro once apple/container supports it
 3. **Network restrictions**: egress control to strengthen sandbox integrity

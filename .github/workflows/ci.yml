@@ -8,10 +8,12 @@ on:
 jobs:
   test:
     # Both runners actually execute `cargo test`, not just build/lint — a
-    # prior bug (ENOENT in `clone_tree`'s macOS `clonefile(2)` path) shipped
-    # because every real test run happened on Linux, where `home.rs`'s
-    # non-macOS fallback masked the exact defect. Lint-only cross-compiling
-    # to the other target isn't a substitute for running the suite on it.
+    # prior bug (ENOENT in the macOS `clonefile(2)` path of the since-removed
+    # home module, ADR-0008) shipped because every real test run happened on
+    # Linux, where the non-macOS fallback masked the exact defect. The tree
+    # has no `#[cfg(target_os = ...)]` branches at the moment, but the matrix
+    # stays: pall8t is a macOS tool, and lint-only cross-compiling to the
+    # other target isn't a substitute for running the suite on it.
     strategy:
       fail-fast: false
       matrix:

@@ -14,9 +14,11 @@ cargo fmt --check
 cargo test
 ```
 
-This repo has `#[cfg(target_os = ...)]` branches, so a lint pass on the host
-triple alone can miss a warning on the other side of a cfg gate. Also lint the
-non-host target before considering a change clean:
+A lint pass on the host triple alone can miss a warning on the other side of
+a `#[cfg(target_os = ...)]` gate — the tree has no such branches right now
+(the last ones went with the home module, ADR-0008), but the cross-lint stays
+as the guard that catches the next one. Lint the non-host target before
+considering a change clean:
 
 ```sh
 rustup target add aarch64-apple-darwin   # once

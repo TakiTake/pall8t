@@ -8,7 +8,9 @@
 # Clippy is run once per target on purpose: a lint behind a
 # `#[cfg(target_os = "...")]` gate is invisible on the host triple, so a
 # macOS-only warning would otherwise only surface in CI's macos runner (or on
-# a user's Mac). To keep that guarantee we never *silently* skip the darwin
+# a user's Mac). The tree has no such gates at the moment (ADR-0008 removed
+# the last ones) — this is the standing guard for the next one, not dead
+# ceremony. To keep that guarantee we never *silently* skip the darwin
 # leg: when rustup is present we install the target on demand (idempotent, a
 # no-op in the pall8t container where the image already added it) and then
 # lint it; only a toolchain without rustup at all skips it, and loudly.
