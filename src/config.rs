@@ -75,11 +75,36 @@ impl HerdrSandbox {
     }
 }
 
+/// `deny_unknown_fields` for the same reason [`RawHerdr`] has it: `readonly`
+/// governs whether the agent can write to a real checkout, and a config
+/// that misspells it (`read_only`, `readOnly`) would otherwise be accepted
+/// while pall8t quietly used the default. Whichever way the default points,
+/// a user who typed an intent must not have it dropped in silence.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RepoEntry {
-    /// Host path of a reference repository; duplicated via
-    /// `git clone --local` and the copy mounted at this path (FR-4).
+    /// Host path of a reference repository, mounted at this same path
+    /// inside the container (FR-4).
     pub source: PathBuf,
+    /// Mount the source read-only (the default — see [`repo_readonly`]),
+    /// or `false` to mount a disposable `git clone --local` copy that the
+    /// agent may write to.
+    pub readonly: Option<bool>,
+}
+
+/// How one reference repo is protected, given the entry's own `readonly`
+/// and the `--repos-readonly` override from the command line.
+///
+/// Precedence is the ordinary one — an explicit flag beats a config file,
+/// a config file beats the default — and the default is read-only. That
+/// default is the whole point of ADR-0009: a reference repo exists to be
+/// read, and until apple/container's read-only mounts were verified,
+/// pall8t could only approximate that by duplicating the repo. Now that
+/// the runtime enforces it, protection by mount is both stronger and
+/// cheaper than protection by copy, so it is what you get unless you ask
+/// for something else.
+pub fn repo_readonly(entry: &RepoEntry, cli_override: Option<bool>) -> bool {
+    cli_override.or(entry.readonly).unwrap_or(true)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -271,6 +296,16 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # the default; add it here explicitly if you want it.
 # command = ["claude"]
 
+# Reference repositories, mounted at their own absolute path inside the
+# container so paths referring to them keep resolving.
+# [[repos]]
+# source = "~/src/some-library"
+# Read-only by default: the runtime refuses every write, so the agent can
+# read the real checkout and cannot change it. Set false to mount a
+# disposable `git clone --local` copy instead, which the agent may commit
+# and fetch in — its changes are thrown away when the run ends.
+# readonly = true
+
 [herdr]
 # What a sandboxed agent may do to the host herdr session when pall8t runs
 # inside a herdr pane (the bridge is inert outside herdr):
@@ -305,6 +340,14 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 
 [run]
 # command = ["claude"]
+
+# Reference repos for this project. Declaring any here replaces the global
+# list rather than adding to it.
+# [[repos]]
+# source = "~/src/some-library"
+# readonly = true    # false mounts a writable disposable copy instead
+# Override for one run without editing this file:
+#   pall8t run --repos-readonly=false
 
 [herdr]
 # sandbox = "full"   # or "readonly" / "off" — see ~/.pall8t/config.toml
@@ -531,7 +574,8 @@ mod tests {
         assert_eq!(
             cfg.repos,
             vec![RepoEntry {
-                source: "~/src/b".into()
+                source: "~/src/b".into(),
+                readonly: None
             }]
         );
 
@@ -540,9 +584,59 @@ mod tests {
         assert_eq!(
             cfg.repos,
             vec![RepoEntry {
-                source: "~/src/a".into()
+                source: "~/src/a".into(),
+                readonly: None
             }],
             "global repos apply when the project declares none"
+        );
+    }
+
+    #[test]
+    fn repo_readonly_precedence_table() {
+        let unset = RepoEntry {
+            source: "~/src/a".into(),
+            readonly: None,
+        };
+        let writable = RepoEntry {
+            readonly: Some(false),
+            ..unset.clone()
+        };
+        let readonly = RepoEntry {
+            readonly: Some(true),
+            ..unset.clone()
+        };
+
+        assert!(
+            repo_readonly(&unset, None),
+            "read-only is the default: a reference repo exists to be read, and \
+             ADR-0009 makes the runtime enforce that"
+        );
+        assert!(!repo_readonly(&writable, None), "the entry opts out");
+        assert!(repo_readonly(&readonly, None), "the entry opts in");
+
+        assert!(
+            !repo_readonly(&readonly, Some(false)),
+            "--repos-readonly=false beats an entry that asked for read-only — an \
+             explicit flag is the more recent, more specific intent"
+        );
+        assert!(
+            repo_readonly(&writable, Some(true)),
+            "--repos-readonly beats an entry that asked for a writable copy"
+        );
+    }
+
+    #[test]
+    fn repo_entry_rejects_a_misspelled_readonly_key() {
+        assert!(
+            toml::from_str::<Raw>("[[repos]]\nsource = \"~/src/a\"\nread_only = false\n").is_err(),
+            "a misspelled key must fail the parse: silently ignoring it would \
+             hand back the default (read-only) to someone who explicitly asked \
+             for a writable copy, and they would find out only when a write \
+             failed inside the sandbox"
+        );
+        assert!(
+            toml::from_str::<Raw>("[[repos]]\nsource = \"~/src/a\"\nreadonly = \"yes\"\n").is_err(),
+            "readonly is a boolean; a string is a miswrite, not a truthy value"
         );
     }
 

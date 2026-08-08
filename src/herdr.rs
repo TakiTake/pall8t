@@ -288,10 +288,14 @@ pub fn prepare_bridge(
     match ensure_linux_herdr(env.herdr_bin())
         .and_then(|source_dir| stage_run_local_herdr(&source_dir, container_name))
     {
-        Ok(dir) => mounts.push(crate::container::Mount {
-            host: dir,
-            dest: CONTAINER_BIN_DIR.into(),
-        }),
+        // Still writable, and still a per-run copy. ADR-0007 built that
+        // copy *because* nothing could be mounted read-only; now that
+        // something can (ADR-0009), the shared verified cache could be
+        // mounted directly and the copy-plus-pruning machinery retired.
+        // That is a change to the bridge's threat model and wants its own
+        // change with a live herdr session to test against, so this stays
+        // as it was rather than being altered in passing.
+        Ok(dir) => mounts.push(crate::container::Mount::rw(dir, CONTAINER_BIN_DIR.into())),
         // Env + relay still work without the CLI (raw socket clients, e.g.
         // herdr's own agent-state integration hooks) — degrade, don't fail.
         Err(e) => eprintln!(

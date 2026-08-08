@@ -22,6 +22,11 @@ enum Cmd {
     /// Rebuild the image if the Containerfile changed, then run the agent
     /// in the sandbox (foreground, cwd mounted as the workspace)
     Run {
+        /// Mount reference repos read-only (default), overriding
+        /// `readonly` on every [[repos]] entry. `--repos-readonly=false`
+        /// mounts a writable disposable copy of each instead
+        #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+        repos_readonly: Option<bool>,
         /// Command to run instead of the configured one (after --)
         #[arg(last = true)]
         command: Vec<String>,
@@ -92,7 +97,10 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Init => cmd_init(),
-        Cmd::Run { command } => cmd_run(command),
+        Cmd::Run {
+            repos_readonly,
+            command,
+        } => cmd_run(command, repos_readonly),
         Cmd::Build => cmd_build(),
         Cmd::Ls { json } => cmd_ls(json),
         Cmd::Exec { id, command } => cmd_exec(&id, &command),
@@ -194,7 +202,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(cli_command: Vec<String>) -> Result<()> {
+fn cmd_run(cli_command: Vec<String>, repos_readonly: Option<bool>) -> Result<()> {
     let (cwd, cfg, uid, gid, resolved) = workspace_image(false)?;
     let run_name = container::run_name(&cwd);
 
@@ -209,21 +217,14 @@ fn cmd_run(cli_command: Vec<String>) -> Result<()> {
     // The live identity-mounted paths assembled so far (cwd, worktree git
     // dir) are exactly what a reference-repo mount must never shadow.
     let protected: Vec<_> = mounts.iter().map(|m| m.host.clone()).collect();
-    for rm in repos::prepare(&cfg.repos, &protected)? {
-        eprintln!(
-            "pall8t: reference repo {} (writes hit the copy {})",
-            rm.source.display(),
-            rm.clone.display()
-        );
-        mounts.push(container::Mount {
-            host: rm.clone,
-            dest: rm.source,
-        });
+    for rm in repos::prepare(&cfg.repos, &protected, repos_readonly)? {
+        eprintln!("pall8t: {}", rm.describe());
+        mounts.push(rm.mount());
     }
-    mounts.push(container::Mount {
-        host: container::home_mount()?,
-        dest: "/home/dev".into(),
-    });
+    mounts.push(container::Mount::rw(
+        container::home_mount()?,
+        "/home/dev".into(),
+    ));
 
     let herdr_env = herdr::detect();
     // An explicit `-- <cmd>` override is user intent and bypasses the

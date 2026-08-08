@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Reference repos are now mounted read-only** instead of being
+  duplicated (ADR-0009). A repo listed under `[[repos]]` appears at its
+  own absolute path inside the container as before, but the runtime
+  refuses every write to it, so the agent reads the real checkout and
+  cannot change it. apple/container's read-only mounts turned out to
+  have landed before 1.0.0 ever shipped — pall8t had been carrying a
+  workaround for a limitation no supported version had — and enforcement
+  is verified on 1.2.2.
+  - **Breaking for agents that write to a reference repo.** `git fetch`,
+    `git commit`, and any other write inside one now fail with
+    `Read-only file system` where they previously succeeded against a
+    disposable copy that was discarded at the end of the run. Set
+    `readonly = false` on the entry (or run `pall8t run
+    --repos-readonly=false`) to get that copy back — it is unchanged,
+    including the `origin` rewrite that makes `git fetch` reach the real
+    upstream.
+  - `readonly` is per entry, defaults to `true`, and
+    `--repos-readonly[=BOOL]` on `pall8t run` overrides every entry for
+    one run. A misspelled key now fails the config parse rather than
+    silently falling back to the default.
+  - A read-only entry creates no clone at all: no disk, no first-run
+    `git clone --local`, and nothing that can go stale against its
+    source. `~/.pall8t/repos` is only created when some entry asks for a
+    writable copy; existing clones there are left alone and are reused if
+    you set `readonly = false`.
+  - Each run prints which protection each repo got, since the two modes
+    differ in what the agent may do.
+- Mounts are passed to apple/container as `--mount
+  type=virtiofs,source=…,target=…` rather than `-v host:dest`. Same
+  semantics for every existing mount, but `--mount` directives are
+  validated by the runtime: on 1.2.2 a typo'd `-v src:dst:readonlyy`
+  mounts read-write in silence, while `--mount …,readonlyy` fails the run
+  before it starts. A protection flag must not fail quietly.
+
 ### Removed
 
 - The experimental home compositor (`[home] mode = "isolated"`) and the

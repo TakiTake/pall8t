@@ -70,9 +70,10 @@ Adding a TUI, attach/detach, and other session-management features was turning p
 
 ### FR-4: Reference repositories
 
-- Duplicate each repository listed under `[[repos]]` in the config via `git clone --local` and mount the copy
-- `cp -al` is rejected: hardlinks don't apply to directories, and hardlinked working-tree files risk corrupting the original via in-place writes
-- Positioned as the workaround for apple/container's lack of read-only mounts
+- Mount each repository listed under `[[repos]]` at its own absolute path inside the container, **read-only by default** — the runtime refuses every write, so the agent reads the real checkout and cannot change it (ADR-0009)
+- `readonly = false` on an entry mounts a `git clone --local` duplicate at that path instead, writable, so an agent can commit or fetch; its changes are discarded with the run. `pall8t run --repos-readonly[=BOOL]` overrides every entry for one run
+- `cp -al` is rejected for that duplicate: hardlinks don't apply to directories, and hardlinked working-tree files risk corrupting the original via in-place writes
+- A `[[repos]]` source overlapping the workspace (or a worktree's main `.git`) is an error under either mode — the mount would cover the live checkout the run works in
 
 ### FR-5: Container management
 
@@ -127,11 +128,11 @@ source = "~/src/other-lib"
 ## 7. Known Limitations
 
 - **Shared home under parallel execution**: with parallel runs, all containers share `~/.pall8t/home` rw. Claude Code itself has known `~/.claude.json` corruption issues under concurrent sessions (non-atomic read-modify-write) — the same conditions apply when running in parallel on the host. Accepted as a known limitation in v1
-- **No read-only mounts**: apple/container limitation. Reference repositories are protected via `git clone --local` duplication instead
+- ~~**No read-only mounts**: apple/container limitation~~ — resolved. apple/container#990 closed before 1.0.0 shipped, enforcement is verified on 1.2.2, and reference repositories are mounted read-only by default (ADR-0009). Duplication remains as the opt-out for agents that need to write
 - **Workspace isolation is the caller's responsibility**: pall8t does not prevent conflicts when multiple agents run in the same directory (interleaved edits, `.git/index.lock` contention, working trees swapped by branch switches). Worktree-based workflows are recommended
 
 ## 8. Roadmap (post-v1)
 
 1. **Per-run home clones and knowledge aggregation**: give each run a copy of `~/.pall8t/home` to isolate writes, while aggregating knowledge each agent adds at user level (skills etc.) back to the host. Merging knowledge produced in parallel is the essential challenge — a good answer here could become pall8t's core value. Still open: one implementation (the home compositor, `[home] mode = "isolated"`) shipped in 0.3.0 and was removed for lack of use — see [ADR-0008](adr/0008-drop-home-compositor.md); its spec and the evaluation of off-the-shelf tools are kept in `docs/specs/home-compositor*.md` for whoever tries again
-2. **Read-only mounts**: make reference repositories ro once apple/container supports it
+2. ~~**Read-only mounts**: make reference repositories ro once apple/container supports it~~ — **done** (ADR-0009). The remaining piece is the herdr bridge's binary mount, which still uses a writable per-run copy from the era when ro mounts were thought unavailable
 3. **Network restrictions**: egress control to strengthen sandbox integrity

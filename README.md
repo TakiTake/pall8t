@@ -15,7 +15,7 @@ Run AI coding agents inside [apple/container](https://github.com/apple/container
 - **Host non-pollution.** `~/.pall8t/home` is mounted as the container home — the agent's login and config live there, and your host `~/.claude` is never touched.
 - **Automatic rebuilds, no daemon.** At `run` time the Containerfile's content hash picks the image tag; a change means a rebuild before launch. No watch process, no state file.
 - **Worktree-aware.** If your cwd is a git worktree, the main repository's `.git` is mounted too, so git inside the container works exactly as on the host.
-- **Reference repos, protected by duplication.** Repos listed in config are duplicated via `git clone --local` (hardlinked objects) and the *copy* is mounted at the original's path — the workaround for apple/container's missing read-only mounts ([apple/container#990](https://github.com/apple/container/issues/990)).
+- **Reference repos, mounted read-only.** Repos listed in config appear at their own absolute path inside the container and the runtime refuses every write to them, so an agent can read the real checkout and cannot touch it ([ADR-0009](docs/adr/0009-readonly-reference-mounts.md)). Need one writable — to commit or fetch in it? `readonly = false` mounts a disposable `git clone --local` copy at that path instead, or `pall8t run --repos-readonly=false` for a single run.
 
 ## Requirements
 
@@ -67,9 +67,14 @@ memory = "8g"
 command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
                          # Users who want it must set it explicitly.
 
-[[repos]]                # reference repos: cloned with `git clone --local`,
-source = "~/src/other-lib"   # the copy is mounted at this same path
+[[repos]]                     # reference repos, mounted at this same path
+source = "~/src/other-lib"    # inside the container
+# readonly = true             # default: the runtime refuses every write to it.
+                              # false mounts a disposable `git clone --local`
+                              # copy instead, which the agent may write to.
 ```
+
+Override for a single run without editing the file: `pall8t run --repos-readonly=false` (or `--repos-readonly` to force read-only). The flag wins over every entry's own setting.
 
 ### Customizing the Containerfile
 
@@ -122,7 +127,7 @@ then, inside the container (one-time, persists in the container home), add `"tea
 ## Known limitations (v1)
 
 - **Shared home under parallel runs.** All containers share `~/.pall8t/home` rw; Claude Code has known `~/.claude.json` corruption issues under concurrent sessions — the same conditions as parallel agents on the host. The experimental per-run home fork that 0.3.0 offered as a way out (`[home] mode = "isolated"`) was removed for lack of use — see [ADR-0008](docs/adr/0008-drop-home-compositor.md). A leftover `[home]` section is now ignored with a warning; if you actually ran isolated mode, fold pending runs in with `pall8t home merge` **before** upgrading, since nothing after the upgrade can read them (see the [CHANGELOG](CHANGELOG.md)).
-- **No read-only mounts** (apple/container limitation) — reference repos are protected by `git clone --local` duplication instead.
+- **A read-only reference repo cannot be fetched or committed into** from the sandbox — that is the point, but if an agent needs to, set `readonly = false` on the entry and it gets a writable disposable copy whose changes are discarded when the run ends.
 - **Workspace isolation is the caller's responsibility.** Two agents in the same directory will step on each other; use worktrees.
 
 Full requirements in [docs/requirements.md](docs/requirements.md); architecture decisions in [docs/adr/](docs/adr/); release process in [docs/release.md](docs/release.md).

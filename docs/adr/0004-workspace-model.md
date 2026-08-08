@@ -1,7 +1,8 @@
 # ADR-0004: Multi-repo project workspaces with identity-path mounts
 
-- Status: Amended by ADR-0006 (project-workspace model dropped; hardlink-clone protection retained)
+- Status: Amended by ADR-0006 (project-workspace model dropped; hardlink-clone protection retained), then by [ADR-0009](0009-readonly-reference-mounts.md)
 - Date: 2026-07-04
+- **The "no read-only mounts" constraint below is obsolete.** apple/container#990 closed 2026-01-07, before 1.0.0 shipped; read-only enforcement is verified on 1.2.2 and reference repos are mounted ro by default — see [ADR-0009](0009-readonly-reference-mounts.md). The identity-path mount insight this ADR introduced is unaffected. The deferred `--reference` alternates design is moot: it belonged to the workspace seeding that ADR-0006 removed.
 
 ## Context
 
