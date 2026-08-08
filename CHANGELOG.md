@@ -56,6 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validated by the runtime: on 1.2.2 a typo'd `-v src:dst:readonlyy`
   mounts read-write in silence, while `--mount …,readonlyy` fails the run
   before it starts. A protection flag must not fail quietly.
+- apple/container **1.2.0 or newer** is now the documented baseline, and
+  `pall8t run`/`build`/`ls`/`exec`/`stop` warn once on stderr when the
+  installed CLI is older. Older runtimes still work — the warning never
+  blocks a run — but 1.2.0 is where apple/container#2027 stopped a bare
+  `ENV NAME` (no value) in an *image config* from being expanded out of
+  the host process's environment and injected into the container. That
+  expansion happens host-side, before pall8t's argv exists, so on an
+  older runtime a base image could pull a host token or path into the
+  sandbox and pall8t's "forwards nothing from the host environment by
+  default" could not stop it. An unrecognized version banner warns about
+  nothing.
 
 ### Removed
 
@@ -84,6 +95,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     commands that produced it are gone. It is still what clap returns
     for a usage error, so a script that calls `pall8t home …` now gets
     `2` for "no such subcommand"; `0` and `1` are unchanged.
+
+### Fixed
+
+- `pall8t run` from a workspace with a long directory name now works on
+  apple/container 1.2.0+. 1.2.0 started rejecting any container name over
+  63 characters (`ManagedContainer.nameValid`, apple/container#1956),
+  which `container run` checks before it launches anything — so a
+  workspace whose name pushed `pall8t-<slug>-<hash>-<pid>` past the cap
+  failed outright with "container ID ... is not a valid container ID"
+  where 1.0.0 had accepted it. The slug is now capped at 32 characters;
+  the path hash already carried the uniqueness, so nothing else changes.
+  - Only paths whose basename slugs past 32 characters are affected, and
+    for those the key is shortened, never re-derived: shorter names come
+    out byte for byte identical. An affected workspace gets a new image
+    tag base and a new `~/.pall8t/repos/<key>` clone directory, so its
+    next run rebuilds the image once and re-clones the reference repo.
+    Neither predecessor is cleaned up — image pruning is scoped to the
+    current tag base, so the old image and the old clone directory stay
+    until you delete them (`container image delete <old tag>`,
+    `rm -rf ~/.pall8t/repos/<old key>`).
 
 ## [0.3.0] - 2026-08-01
 

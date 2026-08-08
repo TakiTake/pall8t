@@ -107,6 +107,89 @@ pub fn system_status() -> SystemStatus {
     }
 }
 
+/// A parsed `major.minor.patch` from apple/container's version banner.
+type Version = (u32, u32, u32);
+
+/// Oldest apple/container pall8t asks for. 1.2.0 is where
+/// apple/container#2027 fixed `Parser.allEnv`: before it, a bare env name
+/// (no `=`) in an *image config* was expanded from the host process's
+/// environment and injected into the container. That is precisely the
+/// boundary [`RunSpec::env`] promises — pall8t forwards nothing from the
+/// host by default — so on an older runtime a base image could quietly
+/// pull a host value (a token, a path, anything) into the sandbox, and no
+/// amount of care on pall8t's side would stop it.
+const MIN_VERSION: Version = (1, 2, 0);
+
+/// `major.minor.patch` out of a `container --version` banner, or `None`
+/// when no token in it looks like a version. Scans tokens rather than
+/// matching the banner's wording, which is not a stable interface
+/// (ADR-0001) — the version is the first dotted numeric triple, and
+/// anything after the patch number (`-beta`, `_1`) is ignored.
+fn parse_cli_version(stdout: &str) -> Option<Version> {
+    stdout.split_whitespace().find_map(|token| {
+        let mut parts = token.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts
+            .next()?
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?;
+        Some((major, minor, patch))
+    })
+}
+
+/// The warning to print for an installed version, or `None` when there is
+/// nothing to say.
+///
+/// An unreadable banner says nothing on purpose. pall8t cannot tell "very
+/// old" from "newer than this build knows about" once parsing fails, and a
+/// false alarm about a security boundary is worse than silence: a warning
+/// users learn to scroll past stops working on the day it is right.
+fn version_warning(installed: Option<Version>) -> Option<String> {
+    let v = installed?;
+    if v >= MIN_VERSION {
+        return None;
+    }
+    let (major, minor, patch) = v;
+    let (min_major, min_minor, min_patch) = MIN_VERSION;
+    Some(format!(
+        "pall8t: warning: apple/container {major}.{minor}.{patch} is older than \
+         {min_major}.{min_minor}.{min_patch}. On this version an image that \
+         declares a bare `ENV NAME` (no value) has it filled in from *your* \
+         host environment and injected into the container \
+         (apple/container#2027), so the sandbox can receive host values pall8t \
+         never passed it. Upgrade to keep the boundary pall8t documents."
+    ))
+}
+
+/// One `container --version` probe, parsed by [`parse_cli_version`].
+/// Failure to spawn or read is indistinguishable from an unparseable
+/// banner here, and both mean the same thing to the caller: nothing
+/// trustworthy to say about the version.
+///
+/// Both streams are scanned. 1.2.2 prints the banner on stdout (verified),
+/// but the CLI's output shapes are pre-1.0 (ADR-0001) and a build that
+/// moved it to stderr would silently switch this warning off forever —
+/// the one failure mode nobody would notice, since its whole symptom is
+/// the absence of a message.
+pub fn cli_version() -> Option<Version> {
+    let out = Command::new("container").arg("--version").output().ok()?;
+    parse_cli_version(&String::from_utf8_lossy(&out.stdout))
+        .or_else(|| parse_cli_version(&String::from_utf8_lossy(&out.stderr)))
+}
+
+/// The version warning for the installed CLI, if it earns one. One extra
+/// subprocess on the startup path (NFR-1) — paid once per invocation,
+/// alongside the `container system status` probe that already runs there,
+/// and only worth it because the thing it warns about is silent by
+/// construction: nothing in a run's output would ever reveal that a host
+/// value leaked in.
+pub fn version_warning_for_installed() -> Option<String> {
+    version_warning(cli_version())
+}
+
 /// Starts the apple/container system service (`container system start`).
 /// Streams its progress live to stderr rather than inheriting stdout
 /// outright — `ensure_container_system` calls this from `pall8t ls`'s path
@@ -768,6 +851,143 @@ pub fn default_containerfile_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// apple/container's own rule, transcribed from
+    /// `ManagedContainer.nameValid` (Sources/ContainerResource/Container/
+    /// ManagedContainer.swift, 1.2.x):
+    ///
+    /// ```swift
+    /// guard name.count <= 63 else { return false }   // DNS label length
+    /// let pattern = #"^[a-zA-Z0-9][a-zA-Z0-9_.-]+$"#
+    /// ```
+    ///
+    /// `container run` checks this client-side before it reaches the API
+    /// server, so a name that fails here fails the run outright with
+    /// "container ID ... is not a valid container ID". A test oracle, not
+    /// production logic — pall8t constructs names that satisfy it rather
+    /// than validating them.
+    fn upstream_name_valid(name: &str) -> bool {
+        let mut chars = name.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        // `[...]+` after the leading class: a one-character name never matches.
+        let rest: Vec<char> = chars.collect();
+        name.chars().count() <= 63
+            && first.is_ascii_alphanumeric()
+            && !rest.is_empty()
+            && rest
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    }
+
+    /// Regression pin for the 1.2.0 name cap: a workspace whose basename is
+    /// far longer than the whole budget still has to produce a runnable
+    /// `--name`. Before the [`crate::repos`] slug cap this ran on 1.0.0 and
+    /// died on 1.2.0.
+    #[test]
+    fn run_name_stays_within_the_container_name_cap() {
+        let long = "a-very-long-workspace-directory-name-".repeat(6);
+        for (label, path) in [
+            (
+                "a pathological basename",
+                PathBuf::from("/Users/me").join(&long),
+            ),
+            ("an ordinary one", PathBuf::from("/Users/me/src/pall8t")),
+            (
+                "a basename that is all separators",
+                PathBuf::from("/Users/me").join("-".repeat(80)),
+            ),
+        ] {
+            let name = run_name(&path);
+            assert!(
+                name.chars().count() <= 63,
+                "{label}: apple/container 1.2.0 rejects a name over 63 chars \
+                 (ManagedContainer.nameValid), and `container run` checks it \
+                 before launching, so an over-long name is a dead run: \
+                 {name:?} is {} chars",
+                name.chars().count()
+            );
+            assert!(
+                upstream_name_valid(&name),
+                "{label}: {name:?} must satisfy apple/container's whole name rule, \
+                 not just its length"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_cli_version_table() {
+        // Verbatim from a live Homebrew install of apple/container 1.2.2
+        // (the truncated `commit: unspeci` is what the binary prints).
+        assert_eq!(
+            parse_cli_version("container CLI version 1.2.2 (build: release, commit: unspeci)\n"),
+            Some((1, 2, 2)),
+            "the shipped banner is the shape that has to work"
+        );
+        assert_eq!(
+            parse_cli_version("container CLI version 1.0.0 (build: release, commit: abc1234)\n"),
+            Some((1, 0, 0))
+        );
+        assert_eq!(
+            parse_cli_version("container CLI version 1.2.0-beta.1 (build: dev)\n"),
+            Some((1, 2, 0)),
+            "a pre-release suffix must not defeat the parse — it would make an \
+             unreadable banner out of a version pall8t can compare"
+        );
+        assert_eq!(
+            parse_cli_version("container CLI version 10.11.12\n"),
+            Some((10, 11, 12)),
+            "multi-digit components are not the single-character case"
+        );
+        assert_eq!(
+            parse_cli_version("some preamble\ncontainer CLI version 1.2.2\n"),
+            Some((1, 2, 2)),
+            "the banner need not be the first line — `cli_version` hands over \
+             whichever stream carried it, preamble and all"
+        );
+        for junk in [
+            "",
+            "container: command not found\n",
+            "container CLI version unknown\n",
+            "container CLI version 1.2\n",
+        ] {
+            assert_eq!(
+                parse_cli_version(junk),
+                None,
+                "nothing in {junk:?} is a version triple, and guessing one would \
+                 produce a warning about a version nobody is running"
+            );
+        }
+    }
+
+    #[test]
+    fn version_warning_table() {
+        assert!(
+            version_warning(Some((1, 0, 0)))
+                .is_some_and(|m| m.contains("2027") && m.contains("1.0.0")),
+            "an older runtime must be named in the warning, with the upstream \
+             fix to look up — a bare 'please upgrade' is unactionable"
+        );
+        assert!(
+            version_warning(Some((1, 1, 9))).is_some(),
+            "1.1.9 precedes 1.2.0: comparison is per component, not lexical"
+        );
+        for ok in [MIN_VERSION, (1, 2, 2), (2, 0, 0)] {
+            assert_eq!(
+                version_warning(Some(ok)),
+                None,
+                "{ok:?} carries the env fix, so there is nothing to warn about"
+            );
+        }
+        assert_eq!(
+            version_warning(None),
+            None,
+            "an unreadable banner is as likely to be a future format as an \
+             ancient build; crying wolf about a security boundary is what \
+             teaches users to ignore it"
+        );
+    }
 
     #[test]
     fn parse_exec_wrapper_homebrew_shape() {
