@@ -4,7 +4,7 @@
 - Date: 2026-07-06
 - Supersedes: ADR-0003 (embedded multiplexer), ADR-0005 (per-tab session holders)
 - Amends: ADR-0004 (project-workspace model replaced; hardlink-clone protection retained)
-- Amended by: [ADR-0009](0009-readonly-reference-mounts.md) — the revisit trigger below has fired. Reference repos are mounted read-only by default; the hardlink clone is now the opt-out (`readonly = false`), not the mechanism.
+- Amended by: [ADR-0009](0009-readonly-reference-mounts.md) — the revisit trigger below has fired. Reference repos can now be mounted read-only with `readonly = true`; the clone described here stays the default and the opt-out.
 
 ## Context
 
@@ -27,7 +27,7 @@ Remove the TUI and all session management. pall8t becomes a headless CLI special
 - **Foreground process model.** `pall8t run` executes the agent in a container with TTY passthrough, signal forwarding, and correct exit codes. Session lifetime equals process lifetime; persistence is the caller's business (tmux / herdr).
 - **No daemons, no holders, no registry.** `pall8t-tab`, `state.json`, and the attach protocol are deleted. Automatic rebuild is implemented as a Containerfile hash check at `run` time, not a watch process.
 - **Workspace = cwd.** The project/workspace concept of ADR-0004 is dropped. pall8t mounts the current directory rw; if cwd is a git worktree, the main repository's `.git` is auto-mounted so git works inside the container. Cutting worktrees is the caller's responsibility.
-- **Reference repos keep ADR-0004's protection insight.** Repos listed in `pall8t.toml` are duplicated via `git clone --local` (hardlinked objects) and the copy is mounted — protection by duplication, still compensating for apple/container's missing RO mounts ([apple/container#990](https://github.com/apple/container/issues/990)). *(Superseded by [ADR-0009](0009-readonly-reference-mounts.md): #990 had already closed when this was written, and repos are now mounted read-only by default, with duplication as the opt-out.)*
+- **Reference repos keep ADR-0004's protection insight.** Repos listed in `pall8t.toml` are duplicated via `git clone --local` (hardlinked objects) and the copy is mounted — protection by duplication, still compensating for apple/container's missing RO mounts ([apple/container#990](https://github.com/apple/container/issues/990)). *(Amended by [ADR-0009](0009-readonly-reference-mounts.md): #990 had already closed when this was written, so the premise was wrong even then. Duplication remains the default; read-only is now available per entry with `readonly = true`.)*
 - **Home isolation stays.** `~/.pall8t/home` is mounted rw as the container home, keeping host `~/.claude` untouched.
 
 Full requirements in [docs/requirements.md](../requirements.md).

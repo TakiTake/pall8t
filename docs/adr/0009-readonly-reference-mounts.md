@@ -1,4 +1,4 @@
-# ADR-0009: Read-only reference-repo mounts
+# ADR-0009: Read-only reference-repo mounts (opt-in)
 
 - Status: Accepted
 - Date: 2026-08-08
@@ -25,27 +25,31 @@ Enforcement is real, and the two flags are not equivalent. `Parser.volume` split
 
 ## Decision
 
-**Reference repos are mounted read-only by default**, and every mount pall8t emits goes out as `--mount`, never `-v`.
+**Reference repos can be mounted read-only, per entry, opt-in**, and every mount pall8t emits goes out as `--mount`, never `-v`.
 
-- `[[repos]] readonly` (default `true`) selects the mode per entry; `pall8t run --repos-readonly[=BOOL]` overrides every entry for one run. Precedence: flag, then entry, then the read-only default.
-- `readonly = false` keeps the old behavior exactly — a `git clone --local` copy mounted at the source's path — because it is still the only way for an agent to commit or fetch in a reference repo.
-- `~/.pall8t/repos` is created only when some entry actually asks for a copy.
+- `[[repos]] readonly` selects the mode per entry; `pall8t run --repos-readonly[=BOOL]` overrides every entry for one run. Precedence: flag, then entry, then the default.
+- The default is `false`: the `git clone --local` copy mounted at the source's path, exactly as before. Nothing changes for an existing config.
+- `readonly = true` mounts the real checkout and the runtime refuses every write to it. No clone is made, so it costs no disk and cannot drift from its source.
+- `~/.pall8t/repos` is created only when some entry actually needs a copy.
 
-Read-only is the default because a reference repo exists to be read: duplication was an approximation of that, and the runtime now provides the real thing more cheaply. `--mount` over `-v` is a safety choice, not a style one — a typo in a protection flag must fail the run rather than silently produce the unprotected mount, and the table above shows `-v` doing exactly that.
+Read-only is the stronger protection and the cheaper one, and the honest reading of "reference repo" — but it is offered, not imposed. Turning it on for everyone would convert every `git fetch` or `git commit` an existing agent runs inside a reference repo into an `EROFS`, and it would surface at the moment of the write, deep in an agent's session, rather than at the moment of the upgrade. That is a bad trade against a change nobody asked for. Users who want the guarantee are one word away from it; users who were relying on writing to the copy keep working.
+
+`--mount` over `-v` is not the same kind of choice — it is a safety fix that applies to every mount regardless of mode. A typo in a protection flag must fail the run rather than silently produce the unprotected mount, and the table above shows `-v` doing exactly that.
 
 The `--reference` alternates half of ADR-0004's deferred design is **not** adopted, and is now moot: it belonged to the workspace-seeding model that ADR-0006 removed with the TUI. Nothing in today's pall8t clones a repo into a workspace, so there are no alternates to point anywhere.
 
 ## Alternatives considered
 
-- **Keep duplication as the default, read-only opt-in** — rejected: it makes the weaker protection the one users get by accident, and keeps a clone-and-manage subsystem on the default path to deliver less.
+- **Read-only as the default, duplication as the opt-out** — this is what the change originally did, and it was reversed before merging. The argument for it is real: it makes the stronger protection the one users get by accident, and takes a clone-and-manage subsystem off the default path. The argument against it won: it is a silent breaking change. An agent that has always been able to `git fetch` in a reference repo would start failing mid-session, on a machine whose config the user never edited. The cost of the weaker default is paid by whoever does not read the docs; the cost of the stronger one is paid by everyone who upgrades. Offering it costs one line of config.
 - **Read-only with no escape hatch, deleting the clone machinery** — rejected: an agent that must `git fetch` or commit in a reference repo has no route left, and the machinery being deleted is small, already written, and already tested.
 - **Mount the source read-only *and* keep a clone for writes** — rejected: two mounts of one repo at two paths, and the agent has to know which is which. The whole value of the identity path is that there is one answer for where a repo lives.
 - **`-v src:dst:ro`** — rejected on the evidence above. A misspelled option mounting read-write in silence is precisely the failure a protection flag must not have.
 
 ## Consequences
 
-- **`git fetch` and commits inside a read-only reference repo now fail** with `EROFS`, where before they succeeded against a copy. A user who relied on that needs `readonly = false`; the CHANGELOG says so, and each run prints which protection each repo got. Note the copy is *not* discarded at the end of a run — `prepare` reuses an existing clone as-is — so those commits did persist under `~/.pall8t/repos`, just invisibly to anyone looking at the source checkout.
-- **No clone, no clone maintenance.** A read-only entry costs no disk, no `git clone --local` on first use, and cannot go stale against its source — the previous copy was refreshed only by deleting it by hand.
+- **Nothing changes for an existing config.** Every `[[repos]]` entry that does not say `readonly = true` behaves exactly as it did: a `git clone --local` copy mounted at the source's path. That is the point of the default, and it is what keeps this a feature rather than a migration.
+- **`git fetch` and commits fail inside a repo that opts in**, with `EROFS`, which is the guarantee being asked for rather than a surprise. Each run prints which protection each repo got, so the two modes are never ambiguous. Worth knowing when choosing: the copy is *not* discarded at the end of a run — `prepare` reuses an existing clone as-is — so commits made in it persist under `~/.pall8t/repos`, just invisibly to anyone looking at the source checkout.
+- **Opting in costs nothing to run.** A read-only entry makes no clone: no disk, no `git clone --local` on first use, and nothing that can drift from its source — the copy is refreshed only by deleting it by hand.
 - **The `[[repos]]`-overlaps-the-workspace check still applies**, and its error message now covers both modes: mounted as a copy the agent's commits are swallowed; mounted read-only the live checkout turns read-only underneath the agent.
 - **Every mount changed flag**, including the workspace and the container home. They were `-v host:dest` and are now `--mount type=virtiofs,source=…,target=…`. Same semantics, validated parsing, and no dependence on `:` not appearing in a path. `run_argv_shape` pins the exact strings.
 - **The herdr bridge is deliberately untouched.** ADR-0007 copies the verified Linux `herdr` binary per run and mounts the copy writable *because* nothing could be mounted read-only; with that constraint gone, the shared verified cache could be mounted directly and the per-run copy and its pruning retired. That changes the bridge's threat model and wants a live herdr session to test against, so it is left as a follow-up rather than changed in passing.

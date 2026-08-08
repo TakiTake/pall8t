@@ -7,34 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Added
 
-- **Reference repos are now mounted read-only** instead of being
-  duplicated (ADR-0009). A repo listed under `[[repos]]` appears at its
-  own absolute path inside the container as before, but the runtime
-  refuses every write to it, so the agent reads the real checkout and
-  cannot change it. apple/container's read-only mounts turned out to
-  have landed before 1.0.0 ever shipped — pall8t had been carrying a
-  workaround for a limitation no supported version had — and enforcement
-  is verified on 1.2.2.
-  - **Breaking for agents that write to a reference repo.** `git fetch`,
-    `git commit`, and any other write inside one now fail with
-    `Read-only file system` where they previously succeeded against a
-    copy. Set `readonly = false` on the entry (or run `pall8t run
-    --repos-readonly=false`) to get that copy back — it is unchanged,
-    including the `origin` rewrite that makes `git fetch` reach the real
-    upstream, and including the fact that it is kept under
-    `~/.pall8t/repos` and reused by later runs rather than refreshed from
-    the source.
-  - `readonly` is per entry, defaults to `true`, and
-    `--repos-readonly[=BOOL]` on `pall8t run` overrides every entry for
-    one run. A misspelled key now fails the config parse rather than
-    silently falling back to the default.
-  - A read-only entry creates no clone at all: no disk, no first-run
+- **`[[repos]] readonly = true` mounts a reference repo read-only**
+  instead of duplicating it (ADR-0009): the real checkout appears at its
+  own absolute path inside the container and the runtime refuses every
+  write to it, so the agent reads the actual repository and cannot change
+  it. apple/container's read-only mounts turned out to have landed before
+  1.0.0 ever shipped — pall8t had been carrying a workaround for a
+  limitation no supported version had — and enforcement is verified on
+  1.2.2.
+  - **Opt-in; nothing changes unless you ask.** The default stays
+    `false`: a `git clone --local` copy mounted at the source's path,
+    exactly as before, `origin` rewrite included. Making read-only the
+    default would have turned every `git fetch` an existing agent runs
+    inside a reference repo into a `Read-only file system` error,
+    mid-session, on a machine whose config nobody edited.
+  - `pall8t run --repos-readonly[=BOOL]` overrides every entry for one
+    run — handy for trying it before committing to it. Precedence is
+    flag, then entry, then the default. A misspelled `readonly` key now
+    fails the config parse rather than silently falling back.
+  - An entry that opts in creates no clone at all: no disk, no first-run
     `git clone --local`, and nothing that can go stale against its
-    source. `~/.pall8t/repos` is only created when some entry asks for a
-    writable copy; existing clones there are left alone and are reused if
-    you set `readonly = false`.
+    source. `~/.pall8t/repos` is only created when some entry actually
+    needs a copy, and existing clones there are left alone.
   - Each run prints which protection each repo got, since the two modes
     differ in what the agent may do.
   - A read-only entry that is a **linked git worktree** also gets its main
@@ -46,10 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Read-only mounts arrive inside the container owned by root rather
     than by the host user (apple/container applies its uid mapping only
     to writable mounts), which makes git refuse them with "detected
-    dubious ownership". pall8t now marks exactly the paths it mounted
+    dubious ownership". pall8t marks exactly the paths it mounted
     read-only as git `safe.directory` via `GIT_CONFIG_*`, so `git log`
     and `git status` work in a reference repo with no setup. Nothing
     else's ownership check is relaxed.
+
+### Changed
+
 - Mounts are passed to apple/container as `--mount
   type=virtiofs,source=…,target=…` rather than `-v host:dest`. Same
   semantics for every existing mount, but `--mount` directives are

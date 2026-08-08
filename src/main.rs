@@ -22,9 +22,9 @@ enum Cmd {
     /// Rebuild the image if the Containerfile changed, then run the agent
     /// in the sandbox (foreground, cwd mounted as the workspace)
     Run {
-        /// Mount reference repos read-only (default), overriding
-        /// `readonly` on every [[repos]] entry. `--repos-readonly=false`
-        /// mounts a writable copy of each instead
+        /// Mount reference repos read-only, overriding `readonly` on
+        /// every [[repos]] entry. `--repos-readonly=false` forces the
+        /// default instead: a writable copy of each
         #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
         repos_readonly: Option<bool>,
         /// Command to run instead of the configured one (after --)

@@ -86,9 +86,9 @@ pub struct RepoEntry {
     /// Host path of a reference repository, mounted at this same path
     /// inside the container (FR-4).
     pub source: PathBuf,
-    /// Mount the source read-only (the default — see [`repo_readonly`]),
-    /// or `false` to mount a `git clone --local` copy that the agent may
-    /// write to (kept between runs — see [`crate::repos::RepoMount::Copy`]).
+    /// `true` mounts the source read-only; unset or `false` mounts a
+    /// `git clone --local` copy the agent may write to, kept between runs
+    /// (see [`repo_readonly`] and [`crate::repos::RepoMount::Copy`]).
     pub readonly: Option<bool>,
 }
 
@@ -96,15 +96,14 @@ pub struct RepoEntry {
 /// and the `--repos-readonly` override from the command line.
 ///
 /// Precedence is the ordinary one — an explicit flag beats a config file,
-/// a config file beats the default — and the default is read-only. That
-/// default is the whole point of ADR-0009: a reference repo exists to be
-/// read, and until apple/container's read-only mounts were verified,
-/// pall8t could only approximate that by duplicating the repo. Now that
-/// the runtime enforces it, protection by mount is both stronger and
-/// cheaper than protection by copy, so it is what you get unless you ask
-/// for something else.
+/// a config file beats the default — and the default is the writable copy
+/// pall8t has always produced. Read-only is stronger protection and costs
+/// no disk (ADR-0009), but it is opt-in: turning it on by default would
+/// break every agent that fetches or commits in a reference repo, silently
+/// at the point of the write rather than at the point of the upgrade.
+/// Nobody's setup changes until they ask for it.
 pub fn repo_readonly(entry: &RepoEntry, cli_override: Option<bool>) -> bool {
-    cli_override.or(entry.readonly).unwrap_or(true)
+    cli_override.or(entry.readonly).unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -300,12 +299,13 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # container so paths referring to them keep resolving.
 # [[repos]]
 # source = "~/src/some-library"
-# Read-only by default: the runtime refuses every write, so the agent can
-# read the real checkout and cannot change it. Set false to mount a
-# `git clone --local` copy instead, which the agent may commit and fetch
-# in. That copy is kept under ~/.pall8t/repos and reused by later runs —
+# By default the agent gets a `git clone --local` copy, mounted at the
+# path above, so it may commit and fetch without touching the original.
+# That copy is kept under ~/.pall8t/repos and reused by later runs —
 # delete it there to re-clone from the source.
-# readonly = true
+# Set readonly = true to mount the real checkout instead, read-only: the
+# runtime refuses every write, no copy is made, and nothing can go stale.
+# readonly = false
 
 [herdr]
 # What a sandboxed agent may do to the host herdr session when pall8t runs
@@ -346,10 +346,10 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 # list rather than adding to it.
 # [[repos]]
 # source = "~/src/some-library"
-# readonly = true    # false mounts a writable copy instead, kept in
-                     # ~/.pall8t/repos and reused by later runs
+# readonly = false   # default: a writable copy kept in ~/.pall8t/repos.
+                     # true mounts the real checkout read-only instead
 # Override for one run without editing this file:
-#   pall8t run --repos-readonly=false
+#   pall8t run --repos-readonly
 
 [herdr]
 # sandbox = "full"   # or "readonly" / "off" — see ~/.pall8t/config.toml
@@ -609,11 +609,15 @@ mod tests {
         };
 
         assert!(
-            repo_readonly(&unset, None),
-            "read-only is the default: a reference repo exists to be read, and \
-             ADR-0009 makes the runtime enforce that"
+            !repo_readonly(&unset, None),
+            "the writable copy stays the default: read-only is stronger, but \
+             switching it on for everyone would break agents that fetch or \
+             commit in a reference repo, at the write rather than at the upgrade"
         );
-        assert!(!repo_readonly(&writable, None), "the entry opts out");
+        assert!(
+            !repo_readonly(&writable, None),
+            "an entry can state the default explicitly"
+        );
         assert!(repo_readonly(&readonly, None), "the entry opts in");
 
         assert!(

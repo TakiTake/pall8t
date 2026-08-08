@@ -34,7 +34,7 @@ apple/container **1.2.0 or newer**. Below that, `Parser.allEnv` expanded a bare 
 - If cwd is a git worktree, automatically mount the main repository's `.git` as well
 - At run time, compare the Containerfile hash and rebuild before launch if it changed
 - Customization via TOML config (CPU/memory allocation, reference repositories, default command, etc.)
-- Mount reference repositories read-only, protecting the originals by the runtime rather than by copying them (ADR-0009); duplication with `git clone --local` remains available per entry for agents that must write
+- Duplicate reference repositories with `git clone --local` (hardlinked objects) before mounting, protecting the originals; an entry may instead opt into a read-only mount of the real checkout, protected by the runtime (ADR-0009)
 - TTY passthrough and signal forwarding (behave well under tmux / herdr)
 - herdr bridge: inside a herdr pane, expose the host herdr session to the sandboxed agent (env passthrough, socket relay with policy + audit, version-matched Linux CLI) — ADR-0007
 
@@ -75,8 +75,8 @@ apple/container **1.2.0 or newer**. Below that, `Parser.allEnv` expanded a bare 
 
 ### FR-4: Reference repositories
 
-- Mount each repository listed under `[[repos]]` at its own absolute path inside the container, **read-only by default** — the runtime refuses every write, so the agent reads the real checkout and cannot change it (ADR-0009)
-- `readonly = false` on an entry mounts a `git clone --local` duplicate at that path instead, writable, so an agent can commit or fetch. The duplicate lives under `~/.pall8t/repos` and is **kept between runs**: an existing one is reused as-is, never refreshed from the source, so delete it there to re-clone. `pall8t run --repos-readonly[=BOOL]` overrides every entry for one run
+- Mount each repository listed under `[[repos]]` at its own absolute path inside the container. **By default** a `git clone --local` duplicate is mounted there, writable, so an agent can commit or fetch without touching the original. The duplicate lives under `~/.pall8t/repos` and is **kept between runs**: an existing one is reused as-is, never refreshed from the source, so delete it there to re-clone
+- `readonly = true` on an entry mounts the real checkout instead and the runtime refuses every write to it — stronger protection, and no duplicate to store or refresh (ADR-0009). `pall8t run --repos-readonly[=BOOL]` overrides every entry for one run
 - `cp -al` is rejected for that duplicate: it hardlinks the working-tree files, so a write through one modifies the source checkout — the very thing duplication exists to prevent. `git clone --local` hardlinks only the immutable objects under `.git`, and gives the copy its own working tree
 - A `[[repos]]` source overlapping the workspace (or a worktree's main `.git`) is an error under either mode — the mount would cover the live checkout the run works in
 - A read-only source that is itself a linked git worktree also gets the main repository's `.git` mounted read-only, so git can resolve it (same rule as FR-3, applied to reference repos)
@@ -123,8 +123,9 @@ command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
 
 [[repos]]                # reference repos, mounted at this same path inside
 source = "~/src/other-lib"   # the container
-# readonly = true          # default; false mounts a writable git clone --local
-                           # copy (kept under ~/.pall8t/repos) instead
+# readonly = false         # default: a writable git clone --local copy kept
+                           # under ~/.pall8t/repos. true mounts the real
+                           # checkout read-only instead
 ```
 
 ## 6. Non-Functional Requirements
@@ -137,11 +138,11 @@ source = "~/src/other-lib"   # the container
 ## 7. Known Limitations
 
 - **Shared home under parallel execution**: with parallel runs, all containers share `~/.pall8t/home` rw. Claude Code itself has known `~/.claude.json` corruption issues under concurrent sessions (non-atomic read-modify-write) — the same conditions apply when running in parallel on the host. Accepted as a known limitation in v1
-- ~~**No read-only mounts**: apple/container limitation~~ — resolved. apple/container#990 closed before 1.0.0 shipped, enforcement is verified on 1.2.2, and reference repositories are mounted read-only by default (ADR-0009). Duplication remains as the opt-out for agents that need to write
+- ~~**No read-only mounts**: apple/container limitation~~ — resolved. apple/container#990 closed before 1.0.0 shipped and enforcement is verified on 1.2.2; a reference repository opts into it with `readonly = true` (ADR-0009). Duplication stays the default, so an unchanged config still uses the workaround
 - **Workspace isolation is the caller's responsibility**: pall8t does not prevent conflicts when multiple agents run in the same directory (interleaved edits, `.git/index.lock` contention, working trees swapped by branch switches). Worktree-based workflows are recommended
 
 ## 8. Roadmap (post-v1)
 
 1. **Per-run home clones and knowledge aggregation**: give each run a copy of `~/.pall8t/home` to isolate writes, while aggregating knowledge each agent adds at user level (skills etc.) back to the host. Merging knowledge produced in parallel is the essential challenge — a good answer here could become pall8t's core value. Still open: one implementation (the home compositor, `[home] mode = "isolated"`) shipped in 0.3.0 and was removed for lack of use — see [ADR-0008](adr/0008-drop-home-compositor.md); its spec and the evaluation of off-the-shelf tools are kept in `docs/specs/home-compositor*.md` for whoever tries again
-2. ~~**Read-only mounts**: make reference repositories ro once apple/container supports it~~ — **done** (ADR-0009). The remaining piece is the herdr bridge's binary mount, which still uses a writable per-run copy from the era when ro mounts were thought unavailable
+2. ~~**Read-only mounts**: make reference repositories ro once apple/container supports it~~ — **available** (ADR-0009), as a per-entry opt-in rather than a default. Remaining: the herdr bridge's binary mount, which still uses a writable per-run copy from the era when ro mounts were thought unavailable
 3. **Network restrictions**: egress control to strengthen sandbox integrity

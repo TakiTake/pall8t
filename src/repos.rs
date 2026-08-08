@@ -340,17 +340,17 @@ mod tests {
         dir
     }
 
-    /// The read-only path prepares nothing: no clone, no `~/.pall8t/repos`
-    /// entry, just the source itself. Pins ADR-0009's cost claim — a
-    /// read-only entry costs no disk and cannot go stale — which a
-    /// `prepare` that quietly kept cloning would break while every mount
-    /// still looked right.
+    /// A read-only entry prepares nothing: no clone, no `~/.pall8t/repos`
+    /// entry, just the source itself. Pins ADR-0009's cost claim — opting
+    /// in costs no disk and cannot go stale — which a `prepare` that
+    /// quietly kept cloning would break while every mount still looked
+    /// right.
     #[test]
     fn prepare_readonly_entry_clones_nothing() {
         let dir = fake_repo("ro-no-clone");
         let entry = RepoEntry {
             source: dir.clone(),
-            readonly: None,
+            readonly: Some(true),
         };
 
         let mounts = prepare(std::slice::from_ref(&entry), &[], None).unwrap();
@@ -366,7 +366,7 @@ mod tests {
                 assert_eq!(*git_dir, None, "a normal repo keeps its .git inside itself");
             }
             RepoMount::Copy { .. } => {
-                panic!("read-only is the default — a copy here means the default flipped")
+                panic!("the entry asked for read-only, so a copy means the setting was ignored")
             }
         }
         assert!(
@@ -376,6 +376,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An entry that says nothing gets the writable copy — the behavior
+    /// pall8t has always had. Read-only is better protection and ADR-0009
+    /// makes it one word away, but it is opt-in: a default flip would turn
+    /// every `git fetch` inside a reference repo into an `EROFS` at the
+    /// moment of the write, for users who changed nothing.
+    #[test]
+    fn prepare_defaults_to_a_writable_copy() {
+        let root = fake_repo("default-copy");
+        let source = root.join("src");
+        let clones = root.join("clones");
+        std::fs::create_dir_all(&source).unwrap();
+        git(&["init", "-q", &source.to_string_lossy()]).unwrap();
+
+        let unset = RepoEntry {
+            source: source.clone(),
+            readonly: None,
+        };
+        match prepare_in(std::slice::from_ref(&unset), &[], None, &clones)
+            .unwrap()
+            .as_slice()
+        {
+            [RepoMount::Copy { clone, .. }] => assert!(
+                clone.starts_with(&clones) && clone.join(".git").exists(),
+                "the default must produce a real clone: {}",
+                clone.display()
+            ),
+            other => panic!("an unset entry must get the writable copy, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Both directions of `--repos-readonly` must actually decide the mode.
@@ -484,7 +516,7 @@ mod tests {
 
         let entry = RepoEntry {
             source: linked.clone(),
-            readonly: None,
+            readonly: Some(true),
         };
         let prepared = prepare(std::slice::from_ref(&entry), &[], None).unwrap();
 
