@@ -1,5 +1,7 @@
 # Evaluation: home-compositor candidates vs. the spec
 
+> **⚠️ REMOVED (2026-08-08).** The feature evaluated here shipped in 0.3.0 as the experimental `[home] mode = "isolated"` and was removed for lack of use — see [ADR-0008](../adr/0008-drop-home-compositor.md). Every run mounts `~/.pall8t/home` as the container home, unconditionally. Kept for historical reference: the problem it addresses (requirements §8 roadmap item 1) is still open.
+
 Status: 2026-07-08. Companion to [home-compositor.md](home-compositor.md); executes its
 "next step". Three evaluations, one comparison table each: (A) off-the-shelf tools
 against the spec's requirements, (B) fork mechanics for FR-1, (C) versioning/merge

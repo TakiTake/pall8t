@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- The experimental home compositor (`[home] mode = "isolated"`) and the
+  whole `pall8t home` command family (harvest, inbox, show, promote,
+  drop, merge, log, diff, rollback, ls, rm, gc), added in 0.3.0 and
+  unused since — see [ADR-0008](docs/adr/0008-drop-home-compositor.md).
+  `~/.pall8t/home` is now mounted as the container home unconditionally,
+  exactly as `mode = "shared"` (the default) always did, so nothing
+  changes for anyone who never opted in.
+  - A `[home]` section left in a config file is parsed and ignored
+    rather than failing the run; if it sets anything, a warning names
+    the file to clean up. The bare `[home]` header that `pall8t init`
+    used to write (all keys commented out) sets nothing and stays
+    quiet.
+  - **If you ran `mode = "isolated"`, harvest before upgrading**:
+    `pall8t home merge` on 0.3.0 folds pending runs into the base. After
+    upgrading there is no tool to do it. Nothing is deleted — unharvested
+    runs stay in `~/.pall8t/instances/<run>/root/` and unpromoted
+    changesets in `~/.pall8t/inbox/` — but pall8t no longer reads them,
+    so copy out what you want before removing those directories.
+    `~/.pall8t/revisions/*/snapshot/` holds full copies of the base home,
+    credential files included, and is worth clearing once reviewed.
+    `~/.pall8t/home` itself is untouched.
+  - Exit code `2` no longer means "unresolved merge conflict" — the
+    commands that produced it are gone. It is still what clap returns
+    for a usage error, so a script that calls `pall8t home …` now gets
+    `2` for "no such subcommand"; `0` and `1` are unchanged.
+
 ## [0.3.0] - 2026-08-01
 
 ### Added
@@ -106,6 +136,7 @@ container home.
   management (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in
   favor of the shared-home mode.
 
+[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.3.0
 [0.2.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.2.0
 [0.1.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.1.0

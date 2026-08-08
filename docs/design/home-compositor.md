@@ -1,5 +1,7 @@
 # Design: home compositor (`src/home.rs`), Phase 1
 
+> **⚠️ REMOVED (2026-08-08).** The module described here shipped in 0.3.0 as the experimental `[home] mode = "isolated"` and was removed for lack of use — see [ADR-0008](../adr/0008-drop-home-compositor.md). Every run mounts `~/.pall8t/home` as the container home, unconditionally. Kept for historical reference: the problem it addresses (requirements §8 roadmap item 1) is still open.
+
 > Implements Phase 1 (MVP) of [docs/specs/home-compositor.md](../specs/home-compositor.md).
 > The spec is the decision record; this document describes the module as built.
 > (Note: [DESIGN.md](DESIGN.md) is the deprecated TUI architecture — unrelated.)

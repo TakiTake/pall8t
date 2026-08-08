@@ -1,6 +1,5 @@
-use crate::home::{Class, HomeMode, MergeStrategy};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 /// Project-level config directory, rooted at the project directory — the
@@ -36,12 +35,13 @@ pub struct Config {
     pub watch: Vec<PathBuf>,
     pub command: Vec<String>,
     pub repos: Vec<RepoEntry>,
-    /// `[home]` — how the container home is materialized and how a run's
-    /// changes to it are classified (see [`crate::home`]).
-    pub home: HomeConfig,
     /// `[herdr]` — how much of the host herdr session a sandboxed agent
     /// may reach through the relay bridge (see [`crate::relay`]).
     pub herdr: HerdrConfig,
+    /// One message per config file that still carries a setting pall8t no
+    /// longer honors, for the caller to print once per invocation (see
+    /// [`load`]). Empty in the common case.
+    pub deprecations: Vec<String>,
 }
 
 /// Merged `[herdr]` configuration.
@@ -82,55 +82,6 @@ pub struct RepoEntry {
     pub source: PathBuf,
 }
 
-/// Merged `[home]` configuration. `mode` picks today's shared home or the
-/// per-run fork-and-harvest model; `policy` prepends user overrides to the
-/// built-in path classification ([`crate::home::default_rules`]).
-/// `revisions_keep`/`inbox_ttl_days` bound `isolated` mode's disk usage and
-/// staleness warnings (FR-7/FR-9); both are inert in `shared` mode.
-#[derive(Debug, Clone, PartialEq)]
-pub struct HomeConfig {
-    pub mode: HomeMode,
-    pub policy: Vec<PolicyRule>,
-    pub revisions_keep: u32,
-    pub inbox_ttl_days: u32,
-}
-
-impl Default for HomeConfig {
-    /// Matches [`merge`]'s defaults, for callers (the standalone `home`
-    /// subcommands) that fall back to this when the cwd's config can't be
-    /// loaded at all rather than duplicating the default values.
-    fn default() -> Self {
-        HomeConfig {
-            mode: HomeMode::default(),
-            policy: Vec::new(),
-            revisions_keep: crate::home::DEFAULT_REVISIONS_KEEP,
-            inbox_ttl_days: crate::home::DEFAULT_INBOX_TTL_DAYS,
-        }
-    }
-}
-
-/// One `[[home.policy]]` rule: a glob (matched against a `$HOME`-relative
-/// path) mapped to the `class` it forces and/or the merge `strategy` it uses.
-/// First match wins, user overrides before the defaults — see
-/// [`crate::home::classify`]. `class` may be omitted when only overriding the
-/// strategy (it then defaults to `state`); a rule with neither is ignored
-/// (see [`crate::home::validate_policy`]). Also `Serialize`: a revision
-/// records the policy overrides active when it was recorded, so `diff` can
-/// later redact a path that was declared secret at record time even if the
-/// cwd's current policy no longer says so (see [`crate::home::diff`]).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PolicyRule {
-    /// `path` is accepted as an alias so a rule can read naturally
-    /// (`path = ".claude/history.jsonl"`); `glob` is the documented key.
-    #[serde(alias = "path")]
-    pub glob: String,
-    #[serde(default)]
-    pub class: Option<Class>,
-    #[serde(default)]
-    pub strategy: Option<MergeStrategy>,
-}
-
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Raw {
     #[serde(default)]
@@ -138,8 +89,12 @@ struct Raw {
     #[serde(default)]
     run: RawRun,
     repos: Option<Vec<RepoEntry>>,
-    #[serde(default)]
-    home: RawHome,
+    /// `[home]` selected the experimental isolated-home compositor, since
+    /// removed (ADR-0008). Still *parsed* so a config that carries it keeps
+    /// loading — its presence only drives the deprecation warning in
+    /// [`load`]. Accepted as an opaque table so no field of the old schema
+    /// has to survive here.
+    home: Option<toml::Value>,
     #[serde(default)]
     herdr: RawHerdr,
 }
@@ -153,14 +108,6 @@ struct Raw {
 #[serde(deny_unknown_fields)]
 struct RawHerdr {
     sandbox: Option<HerdrSandbox>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct RawHome {
-    mode: Option<HomeMode>,
-    policy: Option<Vec<PolicyRule>>,
-    revisions_keep: Option<u32>,
-    inbox_ttl_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -200,11 +147,63 @@ fn read_raw(path: &Path) -> Result<Option<Raw>> {
     Ok(Some(raw))
 }
 
+/// Warnings for one config file about settings it declares that pall8t no
+/// longer honors — today only `[home]`. Warning rather than failing the
+/// parse: the section only ever selected an experimental, off-by-default
+/// feature, so a stale one is never dangerous — but a leftover
+/// `mode = "isolated"` silently doing nothing would leave the user believing
+/// runs are still isolated, so say it out loud (ADR-0008). Pure so the
+/// detection is testable: [`load`] itself reads the real `~/.pall8t`.
+///
+/// Only a section that actually *sets* something warns. 0.3.0's `init`
+/// skeletons wrote a bare `[home]` header with every key commented out, and
+/// `init` never rewrites an existing file — keying on the header alone would
+/// nag every user who ran `pall8t init` and never opted in, forever.
+///
+/// The message deliberately does not say the leftover directories are safe
+/// to delete: `instances/<run>/root/` is an unharvested run's whole `$HOME`
+/// and `inbox/` holds changesets the user never promoted, so deleting them
+/// unread is exactly the data loss the old `gc` refused to cause.
+fn deprecations_in(raw: &Raw, path: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    // `[[home.policy]]` alone (no `[home]` header) also lands here, as a
+    // table with just that key — still a setting, still worth a warning.
+    let sets_something = raw
+        .home
+        .as_ref()
+        .and_then(toml::Value::as_table)
+        .is_some_and(|t| !t.is_empty());
+    if sets_something {
+        out.push(format!(
+            "[home] in {} is no longer supported and is ignored — the experimental \
+             isolated-home compositor has been removed (every run mounts \
+             ~/.pall8t/home, as `mode = \"shared\"` always did). Delete the section. \
+             If you ran `mode = \"isolated\"`, ~/.pall8t/{{instances,inbox,revisions}} \
+             may still hold runs you never harvested and changesets you never \
+             promoted — pall8t no longer reads them, so copy out what you want \
+             before deleting them.",
+            path.display()
+        ));
+    }
+    out
+}
+
 /// Loads the merged config for a project rooted at `project_dir`.
 pub fn load(project_dir: &Path) -> Result<Config> {
-    let global = read_raw(&global_path()?)?.unwrap_or_default();
-    let project = read_raw(&project_path(project_dir))?.unwrap_or_default();
-    Ok(merge(global, project))
+    let global_path = global_path()?;
+    let project_path = project_path(project_dir);
+    let global = read_raw(&global_path)?.unwrap_or_default();
+    let project = read_raw(&project_path)?.unwrap_or_default();
+    // Both files are reported: a user cleaning up needs to know about each
+    // one that still carries the section, not just the first found.
+    let deprecations = deprecations_in(&global, &global_path)
+        .into_iter()
+        .chain(deprecations_in(&project, &project_path))
+        .collect();
+    Ok(Config {
+        deprecations,
+        ..merge(global, project)
+    })
 }
 
 fn merge(global: Raw, project: Raw) -> Config {
@@ -223,7 +222,7 @@ fn merge(global: Raw, project: Raw) -> Config {
             .container
             .containerfile
             .or(global.container.containerfile),
-        // Replace, not append — like `repos`/`home.policy`: a project's
+        // Replace, not append — like `repos`: a project's
         // watch list fully controls what folds into its own image hash
         // rather than inheriting entries a global config can't guarantee
         // exist in every project.
@@ -238,28 +237,9 @@ fn merge(global: Raw, project: Raw) -> Config {
             .or(global.run.command)
             .unwrap_or_else(|| vec!["claude".to_string()]),
         repos: project.repos.or(global.repos).unwrap_or_default(),
-        home: HomeConfig {
-            mode: project.home.mode.or(global.home.mode).unwrap_or_default(),
-            // Policy overrides replace rather than append (like `repos`), so
-            // a project fully controls its classification without inheriting
-            // global rules it can't see; the built-in defaults always apply
-            // underneath in `classify`.
-            policy: project
-                .home
-                .policy
-                .or(global.home.policy)
-                .unwrap_or_default(),
-            revisions_keep: project
-                .home
-                .revisions_keep
-                .or(global.home.revisions_keep)
-                .unwrap_or(crate::home::DEFAULT_REVISIONS_KEEP),
-            inbox_ttl_days: project
-                .home
-                .inbox_ttl_days
-                .or(global.home.inbox_ttl_days)
-                .unwrap_or(crate::home::DEFAULT_INBOX_TTL_DAYS),
-        },
+        // `[home]` is parsed and ignored; `load` turns its presence into a
+        // deprecation message, which `merge` (path-less) can't produce.
+        deprecations: Vec::new(),
         herdr: HerdrConfig {
             sandbox: project
                 .herdr
@@ -283,32 +263,6 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # Command run by `pall8t run`. --dangerously-skip-permissions is NOT in
 # the default; add it here explicitly if you want it.
 # command = ["claude"]
-
-[home]
-# mode = "shared"    # default: every run mounts ~/.pall8t/home rw (v1 behavior)
-# mode = "isolated"  # per-run fork; harvest changes into an inbox to promote
-#
-# Override the built-in path classification (secret | state | knowledge |
-# ephemeral). First match wins, these before the defaults.
-# [[home.policy]]
-# glob = ".config/my-tool/**"
-# class = "knowledge"
-#
-# `strategy = "union"` line-merges an append-only file (keeps both sides, never
-# conflicts) instead of the class default. `class` may be omitted with a
-# strategy (defaults to state — auto-merged at harvest). `path` is an alias for
-# `glob`.
-# [[home.policy]]
-# glob = ".config/my-tool/log.jsonl"
-# strategy = "union"
-#
-# How much `isolated`-mode history to keep (FR-7). Pruned after each
-# recorded revision and again by `pall8t home gc`.
-# revisions_keep = 20
-#
-# `pall8t home gc` warns (never deletes) about inbox changesets older than
-# this many days — dropping unreviewed knowledge is always a user decision.
-# inbox_ttl_days = 14
 
 [herdr]
 # What a sandboxed agent may do to the host herdr session when pall8t runs
@@ -344,9 +298,6 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 
 [run]
 # command = ["claude"]
-
-[home]
-# mode = "isolated"  # per-run home fork + harvest/promote (default: shared)
 
 [herdr]
 # sandbox = "full"   # or "readonly" / "off" — see ~/.pall8t/config.toml
@@ -420,19 +371,7 @@ mod tests {
         assert!(cfg.watch.is_empty());
         assert_eq!(cfg.command, vec!["claude".to_string()]);
         assert!(cfg.repos.is_empty());
-        assert_eq!(
-            cfg.home.mode,
-            HomeMode::Shared,
-            "shared home is the default"
-        );
-        assert!(cfg.home.policy.is_empty());
-        assert_eq!(cfg.home.revisions_keep, crate::home::DEFAULT_REVISIONS_KEEP);
-        assert_eq!(cfg.home.inbox_ttl_days, crate::home::DEFAULT_INBOX_TTL_DAYS);
-        assert_eq!(
-            cfg.home,
-            HomeConfig::default(),
-            "Default matches merge()'s defaults"
-        );
+        assert!(cfg.deprecations.is_empty());
         assert_eq!(
             cfg.herdr.sandbox,
             HerdrSandbox::Full,
@@ -461,92 +400,82 @@ mod tests {
         );
     }
 
+    /// A config left over from the isolated-home compositor (ADR-0008) must
+    /// still load: `[home]` is parsed and ignored, so an upgrading user gets
+    /// a warning to clean up, never a failed run.
     #[test]
-    fn revisions_keep_and_inbox_ttl_merge_per_field() {
-        let global = parse(
-            r"
-            [home]
-            revisions_keep = 5
-            inbox_ttl_days = 3
-            ",
-        );
-        // Project overrides only one of the two.
-        let project = parse("[home]\nrevisions_keep = 50\n");
-        let cfg = merge(global, project);
-        assert_eq!(cfg.home.revisions_keep, 50, "project field wins");
-        assert_eq!(
-            cfg.home.inbox_ttl_days, 3,
-            "unset project field falls through"
-        );
-    }
-
-    #[test]
-    fn home_mode_and_policy_merge_per_field() {
-        let global = parse(
+    fn stale_home_section_parses_and_is_ignored() {
+        let stale = parse(
             r#"
+            [container]
+            cpus = 2
             [home]
             mode = "isolated"
+            revisions_keep = 5
             [[home.policy]]
             glob = ".config/a/**"
             class = "knowledge"
             "#,
         );
-        // Project omits mode (falls through) but replaces the policy list.
-        let project = parse(
-            r#"
-            [[home.policy]]
-            glob = ".config/b/**"
-            class = "ephemeral"
-            "#,
+
+        let cfg = merge(stale.clone(), Raw::default());
+        assert_eq!(cfg.cpus, 2, "the rest of the file is honored as usual");
+        assert!(
+            cfg.deprecations.is_empty(),
+            "`merge` knows no paths; `load` is what attaches the warning"
         );
-        let cfg = merge(global, project);
+
+        let path = Path::new("/x/.pall8t/config.toml");
+        let warnings = deprecations_in(&stale, path);
         assert_eq!(
-            cfg.home.mode,
-            HomeMode::Isolated,
-            "unset project mode falls through"
+            warnings.len(),
+            1,
+            "a [home] section that sets something must be reported, not silently \
+             ignored — otherwise `mode = \"isolated\"` looks alive while doing nothing"
         );
-        assert_eq!(
-            cfg.home.policy,
-            vec![PolicyRule {
-                glob: ".config/b/**".to_string(),
-                class: Some(Class::Ephemeral),
-                strategy: None,
-            }],
-            "project policy replaces global policy"
+        assert!(
+            warnings[0].contains("/x/.pall8t/config.toml"),
+            "the warning must name the file to edit, or the user hunts between \
+             the global and project configs: {}",
+            warnings[0]
+        );
+        assert!(
+            !warnings[0].contains("safe to"),
+            "the warning must not bless deleting ~/.pall8t/instances|inbox — an \
+             unharvested run's whole $HOME lives there (ADR-0008): {}",
+            warnings[0]
+        );
+
+        assert!(
+            deprecations_in(&parse("[container]\ncpus = 2\n"), path).is_empty(),
+            "a config without [home] must warn about nothing"
         );
     }
 
+    /// Regression pin: 0.3.0's `init` skeletons wrote a bare `[home]` header
+    /// with every key commented out, and `init` never rewrites an existing
+    /// file. Warning on the header alone would nag every user who ran `init`
+    /// and never opted in — on every `run`, forever, about a feature they
+    /// never used.
     #[test]
-    fn policy_strategy_and_path_alias_parse() {
-        // The user's snippet (`path` + `strategy`, no explicit class) parses;
-        // `path` is an alias for `glob`.
-        let cfg = parse(
-            r#"
-            [[home.policy]]
-            path = ".claude/history.jsonl"
-            strategy = "union"
-            "#,
-        );
-        assert_eq!(
-            cfg.home.policy.unwrap(),
-            vec![PolicyRule {
-                glob: ".claude/history.jsonl".to_string(),
-                class: None,
-                strategy: Some(MergeStrategy::Union),
-            }]
-        );
-    }
+    fn empty_home_section_from_the_old_skeleton_does_not_warn() {
+        let path = Path::new("/x/.pall8t/config.toml");
+        for src in [
+            // The 0.3.0 skeleton shape: header present, everything commented.
+            "[container]\n[home]\n# mode = \"shared\"\n[herdr]\n",
+            "[home]\n",
+        ] {
+            assert!(
+                deprecations_in(&parse(src), path).is_empty(),
+                "an empty [home] table sets nothing, so there is nothing to \
+                 warn about: {src:?}"
+            );
+        }
 
-    #[test]
-    fn policy_rejects_invalid_strategy_and_unknown_field() {
-        assert!(
-            toml::from_str::<Raw>("[[home.policy]]\nglob = \".x\"\nstrategy = \"bogus\"\n")
-                .is_err(),
-            "an unknown strategy value must fail to parse"
-        );
-        assert!(
-            toml::from_str::<Raw>("[[home.policy]]\nglob = \".x\"\nclas = \"state\"\n").is_err(),
-            "a misspelled field must fail to parse (deny_unknown_fields)"
+        assert_eq!(
+            deprecations_in(&parse("[[home.policy]]\nglob = \".x\"\n"), path).len(),
+            1,
+            "`[[home.policy]]` without a `[home]` header still sets something"
         );
     }
 

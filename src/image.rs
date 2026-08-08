@@ -496,7 +496,6 @@ fn prune_superseded(resolved: &ResolvedImage, uid: u32, gid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HomeConfig;
     use std::fs;
 
     fn test_cfg(containerfile: Option<PathBuf>) -> Config {
@@ -507,7 +506,7 @@ mod tests {
             watch: vec![],
             command: vec!["claude".to_string()],
             repos: vec![],
-            home: HomeConfig::default(),
+            deprecations: vec![],
             herdr: crate::config::HerdrConfig::default(),
         }
     }
