@@ -219,12 +219,20 @@ fn cmd_run(cli_command: Vec<String>, repos_readonly: Option<bool>) -> Result<()>
     let protected: Vec<_> = mounts.iter().map(|m| m.host.clone()).collect();
     for rm in repos::prepare(&cfg.repos, &protected, repos_readonly)? {
         eprintln!("pall8t: {}", rm.describe());
-        mounts.push(rm.mount());
+        mounts.extend(rm.mounts());
     }
     mounts.push(container::Mount::rw(
         container::home_mount()?,
         "/home/dev".into(),
     ));
+    // A read-only mount arrives inside the container owned by root rather
+    // than the host user, so git refuses to read it until each such path is
+    // marked safe (see `repos::safe_directory_env`).
+    let readonly_paths: Vec<_> = mounts
+        .iter()
+        .filter(|m| m.readonly)
+        .map(|m| m.dest.clone())
+        .collect();
 
     let herdr_env = herdr::detect();
     // An explicit `-- <cmd>` override is user intent and bypasses the
@@ -241,7 +249,7 @@ fn cmd_run(cli_command: Vec<String>, repos_readonly: Option<bool>) -> Result<()>
     // The bridge (ADR-0007) makes the herdr CLI work inside the sandbox:
     // relay + env + Linux binary mount + bootstrap wrap. Best-effort — a
     // bridge failure warns and the run proceeds without it.
-    let mut env_vars = Vec::new();
+    let mut env_vars = repos::safe_directory_env(&readonly_paths);
     if let Some(env) = &herdr_env {
         match herdr::prepare_bridge(env, cfg.herdr.sandbox, &run_name) {
             Ok(Some(bridge)) => {
@@ -251,7 +259,7 @@ fn cmd_run(cli_command: Vec<String>, repos_readonly: Option<bool>) -> Result<()>
                     cfg.herdr.sandbox.as_str()
                 );
                 mounts.extend(bridge.mounts);
-                env_vars = bridge.env;
+                env_vars.extend(bridge.env);
                 command = herdr::wrap_command_for_bridge(command);
             }
             Ok(None) => {}

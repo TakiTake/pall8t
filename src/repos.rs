@@ -55,7 +55,19 @@ pub enum RepoMount {
     /// The source itself, mounted read-only. The guest kernel refuses the
     /// write, so the agent cannot touch the real checkout — protection by
     /// the runtime, the default since ADR-0009.
-    ReadOnly { source: PathBuf },
+    ///
+    /// `git_dir` is the main repository's common `.git` when the source is
+    /// a *linked worktree* ([`crate::worktree::main_git_dir`]), and must be
+    /// mounted alongside it: such a worktree's `.git` is a pointer file
+    /// naming an absolute path outside the source, so mounting the source
+    /// alone yields a directory git cannot read as a repository at all. The
+    /// copy path never needs this — `git clone --local` resolves the
+    /// pointer host-side and produces a standalone repo — which is why it
+    /// only surfaced when read-only became the default.
+    ReadOnly {
+        source: PathBuf,
+        git_dir: Option<PathBuf>,
+    },
     /// A `git clone --local` copy (under `~/.pall8t/repos`) mounted at
     /// `source`'s path, so writes land in the copy and the real checkout is
     /// untouched — protection by duplication, which is what pall8t did for
@@ -71,14 +83,28 @@ pub enum RepoMount {
 }
 
 impl RepoMount {
-    /// Host path to mount and whether it goes in read-only.
-    pub fn mount(&self) -> crate::container::Mount {
+    /// The mounts this repo needs — usually one, two when a read-only
+    /// source is a linked worktree and its main `.git` has to come along
+    /// (see [`RepoMount::ReadOnly`]).
+    pub fn mounts(&self) -> Vec<crate::container::Mount> {
         match self {
-            RepoMount::ReadOnly { source } => {
-                crate::container::Mount::ro(source.clone(), source.clone())
+            RepoMount::ReadOnly { source, git_dir } => {
+                let mut out = vec![crate::container::Mount::ro(source.clone(), source.clone())];
+                if let Some(git_dir) = git_dir {
+                    // Identity path, like the workspace's own worktree mount
+                    // (FR-3): the pointer file's `gitdir:` is absolute, and
+                    // the back-pointer inside it names the worktree by
+                    // absolute path too, so both only resolve if the common
+                    // `.git` appears at the very path it has on the host.
+                    out.push(crate::container::Mount::ro(
+                        git_dir.clone(),
+                        git_dir.clone(),
+                    ));
+                }
+                out
             }
             RepoMount::Copy { source, clone } => {
-                crate::container::Mount::rw(clone.clone(), source.clone())
+                vec![crate::container::Mount::rw(clone.clone(), source.clone())]
             }
         }
     }
@@ -88,9 +114,18 @@ impl RepoMount {
     /// that ambiguous.
     pub fn describe(&self) -> String {
         match self {
-            RepoMount::ReadOnly { source } => {
-                format!("reference repo {} (read-only)", source.display())
-            }
+            RepoMount::ReadOnly {
+                source,
+                git_dir: None,
+            } => format!("reference repo {} (read-only)", source.display()),
+            RepoMount::ReadOnly {
+                source,
+                git_dir: Some(git_dir),
+            } => format!(
+                "reference repo {} (read-only; linked worktree — also mounting {} read-only)",
+                source.display(),
+                git_dir.display()
+            ),
             RepoMount::Copy { source, clone } => format!(
                 "reference repo {} (writable copy — writes hit {}, not the original)",
                 source.display(),
@@ -98,6 +133,41 @@ impl RepoMount {
             ),
         }
     }
+}
+
+/// `GIT_CONFIG_*` environment marking every read-only repo path as a git
+/// `safe.directory`, or empty when there are none.
+///
+/// Necessary because a read-only virtiofs mount does not carry
+/// apple/container's uid/gid remapping: a directory the host shows as
+/// `501:20` appears inside the container as `0:0`, while the writable
+/// workspace mounted beside it appears as `501:20` (measured on 1.2.2).
+/// Contents stay readable — the mode bits are unchanged — but git compares
+/// the repository's owner against its own euid and refuses everything with
+/// "detected dubious ownership" until told otherwise. A reference repo the
+/// agent cannot run `git log` in is not delivering the read access that is
+/// the whole point of mounting it.
+///
+/// Scoped to the exact paths pall8t mounted, via env rather than a config
+/// file: `safe.directory = *` in the image would switch the check off for
+/// every repository the sandbox ever sees, including ones arriving later by
+/// other means, to solve a problem only these mounts have.
+pub fn safe_directory_env(readonly_paths: &[PathBuf]) -> Vec<(String, String)> {
+    if readonly_paths.is_empty() {
+        return Vec::new();
+    }
+    let mut env = vec![(
+        "GIT_CONFIG_COUNT".to_string(),
+        readonly_paths.len().to_string(),
+    )];
+    for (i, path) in readonly_paths.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{i}"), "safe.directory".to_string()));
+        env.push((
+            format!("GIT_CONFIG_VALUE_{i}"),
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    env
 }
 
 /// Root under which reference-repo clones live.
@@ -137,6 +207,18 @@ pub fn prepare(
     protected: &[PathBuf],
     cli_readonly: Option<bool>,
 ) -> Result<Vec<RepoMount>> {
+    prepare_in(entries, protected, cli_readonly, &clones_root()?)
+}
+
+/// [`prepare`] with the clone root as an argument, so the copy path can be
+/// tested against a temp directory instead of the caller's real
+/// `~/.pall8t/repos` (docs/testing.md: dependencies are arguments).
+pub(crate) fn prepare_in(
+    entries: &[RepoEntry],
+    protected: &[PathBuf],
+    cli_readonly: Option<bool>,
+    root: &Path,
+) -> Result<Vec<RepoMount>> {
     if entries.is_empty() {
         return Ok(Vec::new());
     }
@@ -146,25 +228,35 @@ pub fn prepare(
         let source = source
             .canonicalize()
             .with_context(|| format!("reference repo not found: {}", source.display()))?;
-        if let Some(p) = protected.iter().find(|p| overlaps(&source, p)) {
-            return Err(anyhow!(
-                "reference repo {} overlaps {} — mounting it would cover the live \
-                 checkout this run works in, either swallowing the agent's commits \
-                 into a clone or turning the checkout read-only; remove \
-                 it from [[repos]]",
-                source.display(),
-                p.display()
-            ));
-        }
         if !source.join(".git").exists() {
             return Err(anyhow!("not a git repo: {}", source.display()));
         }
-        if crate::config::repo_readonly(entry, cli_readonly) {
-            mounts.push(RepoMount::ReadOnly { source });
+        let readonly = crate::config::repo_readonly(entry, cli_readonly);
+        // A linked worktree drags its main `.git` in with it, and that is a
+        // second mount — so it is resolved before the overlap check, which
+        // has to see every path this entry would cover.
+        let git_dir = if readonly {
+            crate::worktree::main_git_dir(&source)
+        } else {
+            None
+        };
+        for path in std::iter::once(&source).chain(git_dir.iter()) {
+            if let Some(p) = protected.iter().find(|p| overlaps(path, p)) {
+                return Err(anyhow!(
+                    "reference repo {} overlaps {} — mounting it would cover the live \
+                     checkout this run works in, either swallowing the agent's commits \
+                     into a clone or turning the checkout read-only; remove \
+                     it from [[repos]]",
+                    path.display(),
+                    p.display()
+                ));
+            }
+        }
+        if readonly {
+            mounts.push(RepoMount::ReadOnly { source, git_dir });
             continue;
         }
-        let root = clones_root()?;
-        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(root)?;
         // Keyed by the source path (see [`path_key`]), so distinct sources
         // sharing a basename get distinct clones and the mapping is stable
         // across runs.
@@ -237,10 +329,13 @@ mod tests {
 
         assert_eq!(mounts.len(), 1);
         match &mounts[0] {
-            RepoMount::ReadOnly { source } => assert_eq!(
-                *source, canonical,
-                "the source is mounted as it stands, canonicalized"
-            ),
+            RepoMount::ReadOnly { source, git_dir } => {
+                assert_eq!(
+                    *source, canonical,
+                    "the source is mounted as it stands, canonicalized"
+                );
+                assert_eq!(*git_dir, None, "a normal repo keeps its .git inside itself");
+            }
             RepoMount::Copy { .. } => {
                 panic!("read-only is the default — a copy here means the default flipped")
             }
@@ -251,19 +346,159 @@ mod tests {
              the staleness that came with duplication are what ADR-0009 removes"
         );
 
-        // An explicit `--repos-readonly=false` still reaches the copy path,
-        // which is IO-heavy (`git clone --local`) and covered end to end
-        // rather than here; what matters at this seam is that the flag is
-        // what decides, not the entry alone.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both directions of `--repos-readonly` must actually decide the mode.
+    /// A `Some(true)`-only test would pass even if `prepare` ignored a false
+    /// override entirely, since an unset entry is read-only anyway
+    /// (`CodeRabbit`, PR #46).
+    #[test]
+    fn prepare_cli_override_decides_both_ways() {
+        let root = fake_repo("cli-override");
+        let source = root.join("src");
+        let clones = root.join("clones");
+        std::fs::create_dir_all(&source).unwrap();
+        git(&["init", "-q", &source.to_string_lossy()]).unwrap();
+        std::fs::write(source.join("f.txt"), "x").unwrap();
+
+        let asked_for_a_copy = RepoEntry {
+            source: source.clone(),
+            readonly: Some(false),
+        };
+        let asked_for_readonly = RepoEntry {
+            source: source.clone(),
+            readonly: Some(true),
+        };
+
         assert!(
             matches!(
-                prepare(&[entry], &[], Some(true)).unwrap().as_slice(),
+                prepare_in(
+                    std::slice::from_ref(&asked_for_a_copy),
+                    &[],
+                    Some(true),
+                    &clones
+                )
+                .unwrap()
+                .as_slice(),
                 [RepoMount::ReadOnly { .. }]
             ),
-            "--repos-readonly keeps the read-only path"
+            "--repos-readonly overrides an entry that asked for a copy"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let copied = prepare_in(
+            std::slice::from_ref(&asked_for_readonly),
+            &[],
+            Some(false),
+            &clones,
+        )
+        .unwrap();
+        match copied.as_slice() {
+            [RepoMount::Copy { clone, .. }] => {
+                assert!(
+                    clone.starts_with(&clones) && clone.join(".git").exists(),
+                    "--repos-readonly=false must produce a real clone under the \
+                     clone root, not just a differently-shaped mount: {}",
+                    clone.display()
+                );
+                assert!(
+                    source.join("f.txt").exists(),
+                    "…and must not disturb the source it copied from"
+                );
+            }
+            other => panic!("--repos-readonly=false must reach the copy path, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A linked git worktree used as a reference repo needs its main `.git`
+    /// mounted too: its own `.git` is a pointer file naming an absolute
+    /// path outside the source, so mounting the source alone hands the
+    /// sandbox a directory git cannot read as a repository. The copy path
+    /// never had this problem — `git clone --local` resolves the pointer on
+    /// the host — so it appeared only when read-only became the default
+    /// (`CodeRabbit`, PR #46).
+    #[test]
+    fn prepare_readonly_linked_worktree_also_mounts_the_main_git_dir() {
+        let root = fake_repo("linked-worktree");
+        let main = root.join("main");
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        let main_s = main.to_string_lossy().into_owned();
+        git(&["init", "-q", &main_s]).unwrap();
+        std::fs::write(main.join("a.txt"), "a").unwrap();
+        git(&["-C", &main_s, "add", "-A"]).unwrap();
+        git(&[
+            "-C",
+            &main_s,
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ])
+        .unwrap();
+        git(&[
+            "-C",
+            &main_s,
+            "worktree",
+            "add",
+            "-q",
+            &linked.to_string_lossy(),
+            "-b",
+            "feat",
+        ])
+        .unwrap();
+
+        let entry = RepoEntry {
+            source: linked.clone(),
+            readonly: None,
+        };
+        let prepared = prepare(std::slice::from_ref(&entry), &[], None).unwrap();
+
+        let expected_git_dir = main.join(".git").canonicalize().unwrap();
+        match prepared.as_slice() {
+            [RepoMount::ReadOnly {
+                git_dir: Some(dir), ..
+            }] => assert_eq!(
+                *dir, expected_git_dir,
+                "the main repository's common .git is what the pointer file \
+                 resolves through"
+            ),
+            other => panic!("a linked worktree must carry its git dir, got {other:?}"),
+        }
+
+        let mounts = prepared[0].mounts();
+        assert_eq!(mounts.len(), 2, "source plus its git dir");
+        assert!(
+            mounts.iter().all(|m| m.readonly),
+            "both go in read-only — mounting the main .git writable would hand \
+             the sandbox the very checkout the read-only default protects"
+        );
+        assert!(
+            mounts.iter().all(|m| m.host == m.dest),
+            "both are identity mounts: the pointer file and its back-pointer \
+             are absolute host paths and resolve nowhere else"
+        );
+
+        // The same pointer file is why the guard has to see the git dir: a
+        // main repo that *is* the workspace would otherwise be mounted
+        // read-only underneath the agent by way of a reference entry.
+        let err = prepare(
+            std::slice::from_ref(&entry),
+            std::slice::from_ref(&expected_git_dir),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&expected_git_dir.display().to_string()),
+            "the overlap check must cover the git dir, not just the source"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The overlap guard fires under read-only too. Before ADR-0009 the
@@ -318,8 +553,11 @@ mod tests {
 
         let ro = RepoMount::ReadOnly {
             source: source.clone(),
+            git_dir: None,
         }
-        .mount();
+        .mounts();
+        assert_eq!(ro.len(), 1, "a normal repo needs one mount");
+        let ro = &ro[0];
         assert_eq!(ro.host, source);
         assert_eq!(
             ro.dest, source,
@@ -333,7 +571,9 @@ mod tests {
             source: source.clone(),
             clone: clone.clone(),
         }
-        .mount();
+        .mounts();
+        assert_eq!(copy.len(), 1, "a copy is one mount: the clone");
+        let copy = copy.into_iter().next().unwrap();
         assert_eq!(
             (copy.host, copy.dest),
             (clone, source),
@@ -348,15 +588,56 @@ mod tests {
         );
     }
 
+    /// The env has to be exactly what git reads: a count, and contiguous
+    /// `KEY_n`/`VALUE_n` pairs from zero. Git stops at the count, so an
+    /// off-by-one silently drops the last exception and that repo goes back
+    /// to failing with "dubious ownership".
+    #[test]
+    fn safe_directory_env_table() {
+        assert!(
+            safe_directory_env(&[]).is_empty(),
+            "no read-only mounts, no git config to inject"
+        );
+
+        let env = safe_directory_env(&[PathBuf::from("/a"), PathBuf::from("/b/c")]);
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map_or_else(|| panic!("{k} missing from {env:?}"), |(_, v)| v.clone())
+        };
+        assert_eq!(get("GIT_CONFIG_COUNT"), "2");
+        assert_eq!(get("GIT_CONFIG_KEY_0"), "safe.directory");
+        assert_eq!(get("GIT_CONFIG_VALUE_0"), "/a");
+        assert_eq!(get("GIT_CONFIG_KEY_1"), "safe.directory");
+        assert_eq!(get("GIT_CONFIG_VALUE_1"), "/b/c");
+        assert_eq!(
+            env.len(),
+            5,
+            "the count plus one key/value pair per path, and nothing else: {env:?}"
+        );
+    }
+
     #[test]
     fn repo_mount_describe_names_the_protection() {
         let ro = RepoMount::ReadOnly {
             source: "/Users/me/src/lib".into(),
+            git_dir: None,
         }
         .describe();
         assert!(
             ro.contains("/Users/me/src/lib") && ro.contains("read-only"),
             "the line must say which repo and that it cannot be written: {ro}"
+        );
+
+        let linked = RepoMount::ReadOnly {
+            source: "/Users/me/src/lib".into(),
+            git_dir: Some("/Users/me/src/main/.git".into()),
+        }
+        .describe();
+        assert!(
+            linked.contains("/Users/me/src/main/.git"),
+            "a linked worktree pulls in a second mount, and a run that mounts \
+             something the user never listed must say so: {linked}"
         );
 
         let copy = RepoMount::Copy {

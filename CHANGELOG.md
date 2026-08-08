@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     you set `readonly = false`.
   - Each run prints which protection each repo got, since the two modes
     differ in what the agent may do.
+  - A read-only entry that is a **linked git worktree** also gets its main
+    repository's `.git` mounted read-only, the same way `pall8t run`
+    already handles a worktree workspace (FR-3). Without it the sandbox
+    would see a directory git cannot read as a repository at all, since
+    such a worktree's `.git` is a pointer file naming a path outside the
+    source.
+  - Read-only mounts arrive inside the container owned by root rather
+    than by the host user (apple/container applies its uid mapping only
+    to writable mounts), which makes git refuse them with "detected
+    dubious ownership". pall8t now marks exactly the paths it mounted
+    read-only as git `safe.directory` via `GIT_CONFIG_*`, so `git log`
+    and `git status` work in a reference repo with no setup. Nothing
+    else's ownership check is relaxed.
 - Mounts are passed to apple/container as `--mount
   type=virtiofs,source=…,target=…` rather than `-v host:dest`. Same
   semantics for every existing mount, but `--mount` directives are

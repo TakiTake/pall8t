@@ -74,6 +74,8 @@ Adding a TUI, attach/detach, and other session-management features was turning p
 - `readonly = false` on an entry mounts a `git clone --local` duplicate at that path instead, writable, so an agent can commit or fetch. The duplicate lives under `~/.pall8t/repos` and is **kept between runs**: an existing one is reused as-is, never refreshed from the source, so delete it there to re-clone. `pall8t run --repos-readonly[=BOOL]` overrides every entry for one run
 - `cp -al` is rejected for that duplicate: it hardlinks the working-tree files, so a write through one modifies the source checkout — the very thing duplication exists to prevent. `git clone --local` hardlinks only the immutable objects under `.git`, and gives the copy its own working tree
 - A `[[repos]]` source overlapping the workspace (or a worktree's main `.git`) is an error under either mode — the mount would cover the live checkout the run works in
+- A read-only source that is itself a linked git worktree also gets the main repository's `.git` mounted read-only, so git can resolve it (same rule as FR-3, applied to reference repos)
+- Read-only mounts appear root-owned inside the container, so pall8t marks exactly those paths as git `safe.directory` (via `GIT_CONFIG_*`); without it git refuses to read them at all (ADR-0009)
 
 ### FR-5: Container management
 
