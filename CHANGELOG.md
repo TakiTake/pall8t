@@ -35,6 +35,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     for a usage error, so a script that calls `pall8t home …` now gets
     `2` for "no such subcommand"; `0` and `1` are unchanged.
 
+### Fixed
+
+- `pall8t run` from a workspace with a long directory name now works on
+  apple/container 1.2.0+. 1.2.0 started rejecting any container name over
+  63 characters (`ManagedContainer.nameValid`, apple/container#1956),
+  which `container run` checks before it launches anything — so a
+  workspace whose name pushed `pall8t-<slug>-<hash>-<pid>` past the cap
+  failed outright with "container ID ... is not a valid container ID"
+  where 1.0.0 had accepted it. The slug is now capped at 32 characters;
+  the path hash already carried the uniqueness, so nothing else changes.
+  - Only paths whose basename slugs past 32 characters are affected, and
+    for those the key is shortened, never re-derived: shorter names come
+    out byte for byte identical. An affected workspace gets a new image
+    tag base and a new `~/.pall8t/repos/<key>` clone directory, so its
+    next run rebuilds the image once and re-clones the reference repo.
+    Neither predecessor is cleaned up — image pruning is scoped to the
+    current tag base, so the old image and the old clone directory stay
+    until you delete them (`container image delete <old tag>`,
+    `rm -rf ~/.pall8t/repos/<old key>`).
+
 ## [0.3.0] - 2026-08-01
 
 ### Added

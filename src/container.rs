@@ -722,6 +722,70 @@ pub fn default_containerfile_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// apple/container's own rule, transcribed from
+    /// `ManagedContainer.nameValid` (Sources/ContainerResource/Container/
+    /// ManagedContainer.swift, 1.2.x):
+    ///
+    /// ```swift
+    /// guard name.count <= 63 else { return false }   // DNS label length
+    /// let pattern = #"^[a-zA-Z0-9][a-zA-Z0-9_.-]+$"#
+    /// ```
+    ///
+    /// `container run` checks this client-side before it reaches the API
+    /// server, so a name that fails here fails the run outright with
+    /// "container ID ... is not a valid container ID". A test oracle, not
+    /// production logic — pall8t constructs names that satisfy it rather
+    /// than validating them.
+    fn upstream_name_valid(name: &str) -> bool {
+        let mut chars = name.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        // `[...]+` after the leading class: a one-character name never matches.
+        let rest: Vec<char> = chars.collect();
+        name.chars().count() <= 63
+            && first.is_ascii_alphanumeric()
+            && !rest.is_empty()
+            && rest
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    }
+
+    /// Regression pin for the 1.2.0 name cap: a workspace whose basename is
+    /// far longer than the whole budget still has to produce a runnable
+    /// `--name`. Before the [`crate::repos`] slug cap this ran on 1.0.0 and
+    /// died on 1.2.0.
+    #[test]
+    fn run_name_stays_within_the_container_name_cap() {
+        let long = "a-very-long-workspace-directory-name-".repeat(6);
+        for (label, path) in [
+            (
+                "a pathological basename",
+                PathBuf::from("/Users/me").join(&long),
+            ),
+            ("an ordinary one", PathBuf::from("/Users/me/src/pall8t")),
+            (
+                "a basename that is all separators",
+                PathBuf::from("/Users/me").join("-".repeat(80)),
+            ),
+        ] {
+            let name = run_name(&path);
+            assert!(
+                name.chars().count() <= 63,
+                "{label}: apple/container 1.2.0 rejects a name over 63 chars \
+                 (ManagedContainer.nameValid), and `container run` checks it \
+                 before launching, so an over-long name is a dead run: \
+                 {name:?} is {} chars",
+                name.chars().count()
+            );
+            assert!(
+                upstream_name_valid(&name),
+                "{label}: {name:?} must satisfy apple/container's whole name rule, \
+                 not just its length"
+            );
+        }
+    }
+
     #[test]
     fn parse_exec_wrapper_homebrew_shape() {
         // Verbatim from a live Homebrew install of apple/container 1.0.0_1.
