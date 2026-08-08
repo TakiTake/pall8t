@@ -109,9 +109,14 @@ fn ensure_container_system() -> Result<()> {
         }
         container::SystemStatus::Stopped => {
             eprintln!("pall8t: starting the container system service…");
-            let started = container::system_start();
+            // `?` before the warning, deliberately: a failed start aborts the
+            // command, and stacking "your runtime is old" onto the error the
+            // user has to act on buys nothing — the version is not why the
+            // service failed. Ordering it this way makes the wrong order
+            // unrepresentable rather than merely unwritten.
+            container::system_start()?;
             warn_if_container_outdated();
-            started
+            Ok(())
         }
         // No version probe here: with no CLI to ask, the install message is
         // the whole answer.
