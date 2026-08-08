@@ -19,8 +19,10 @@ Run AI coding agents inside [apple/container](https://github.com/apple/container
 
 ## Requirements
 
-- macOS on Apple silicon, [apple/container](https://github.com/apple/container) installed
+- macOS on Apple silicon, [apple/container](https://github.com/apple/container) **1.2.0 or newer** installed
 - git
+
+pall8t runs on older apple/container builds and warns once per invocation instead of refusing, but 1.2.0 is where the sandbox boundary it documents actually holds. Before it, a bare `ENV NAME` (no value) in an image config was filled in from *your* host environment and injected into the container ([apple/container#2027](https://github.com/apple/container/pull/2027)) — a base image could pull a host token or path into the sandbox, and nothing pall8t does on its side prevents that.
 
 ## Install & quickstart
 

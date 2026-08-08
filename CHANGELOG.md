@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- apple/container **1.2.0 or newer** is now the documented baseline, and
+  `pall8t run`/`build`/`ls`/`exec`/`stop` warn once on stderr when the
+  installed CLI is older. Older runtimes still work — the warning never
+  blocks a run — but 1.2.0 is where apple/container#2027 stopped a bare
+  `ENV NAME` (no value) in an *image config* from being expanded out of
+  the host process's environment and injected into the container. That
+  expansion happens host-side, before pall8t's argv exists, so on an
+  older runtime a base image could pull a host token or path into the
+  sandbox and pall8t's "forwards nothing from the host environment by
+  default" could not stop it. An unrecognized version banner warns about
+  nothing.
+
 ### Removed
 
 - The experimental home compositor (`[home] mode = "isolated"`) and the

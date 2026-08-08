@@ -103,15 +103,40 @@ fn run() -> Result<()> {
 
 fn ensure_container_system() -> Result<()> {
     match container::system_status() {
-        container::SystemStatus::Running => Ok(()),
+        container::SystemStatus::Running => {
+            warn_if_container_outdated();
+            Ok(())
+        }
         container::SystemStatus::Stopped => {
             eprintln!("pall8t: starting the container system service…");
-            container::system_start()
+            let started = container::system_start();
+            warn_if_container_outdated();
+            started
         }
+        // No version probe here: with no CLI to ask, the install message is
+        // the whole answer.
         container::SystemStatus::CliMissing => Err(anyhow!(
             "the `container` CLI is not available — install apple/container from \
              https://github.com/apple/container/releases"
         )),
+    }
+}
+
+/// Warns once per invocation when the installed apple/container predates
+/// the version pall8t's sandbox boundary depends on (see
+/// [`container::version_warning_for_installed`]). A warning, never an
+/// error: pall8t still works on older runtimes, and refusing to run would
+/// be a worse trade than telling the user what is weaker. Goes to stderr,
+/// so `ls --json`'s stdout stays clean JSON.
+///
+/// Deliberately not surfaced in `pall8t herdr doctor`: that diagnostic is
+/// scoped to the herdr bridge (env, socket, Linux binary), reports a JSON
+/// shape herdr itself consumes, and never launches a container. This
+/// warning instead rides the runtime path — every command that actually
+/// talks to apple/container reaches it.
+fn warn_if_container_outdated() {
+    if let Some(msg) = container::version_warning_for_installed() {
+        eprintln!("{msg}");
     }
 }
 
