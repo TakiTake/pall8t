@@ -21,8 +21,12 @@
   outputs = { self, nixpkgs, rust-overlay }:
     let
       # The sandbox VM is aarch64-linux (apple/container on Apple silicon);
-      # the darwin systems cover developing on the Mac host directly.
-      systems = [ "aarch64-linux" "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ];
+      # aarch64-darwin covers developing on the Mac host directly, and
+      # x86_64-linux other Linux dev machines. No x86_64-darwin: the pinned
+      # nixpkgs (26.11) dropped that platform — every eval throws — and
+      # apple/container needs Apple silicon, so pall8t can't run there
+      # anyway.
+      systems = [ "aarch64-linux" "x86_64-linux" "aarch64-darwin" ];
       forEach = f:
         nixpkgs.lib.genAttrs systems (system:
           f (import nixpkgs {
@@ -40,6 +44,23 @@
           extensions = [ "rust-analyzer" "rust-src" ];
           targets = [ "aarch64-apple-darwin" ];
         };
+
+        # Userland tools for the sandbox image: .pall8t/Containerfile builds
+        # this into /usr/local/tools, so the whole set is pinned by
+        # flake.lock instead of floating with apt/NodeSource/GitHub-CLI
+        # repository state at image-build time. node feeds the npm install
+        # of the claude CLI (which stays npm so the image gets the current
+        # CLI, not a nixpkgs snapshot). What the image deliberately keeps on
+        # apt instead: bootstrap (ca-certificates/curl fetch nix itself),
+        # sudo (setuid — a nix-store binary can't be), openssh-client (owns
+        # /etc/ssh, where GitHub's host keys are baked), and the C link
+        # chain cc/pkg-config/mold (linking stays on the distro toolchain —
+        # see the Containerfile).
+        sandbox-tools = pkgs.buildEnv {
+          name = "pall8t-sandbox-tools";
+          paths = with pkgs; [ git ripgrep jq less vim tmux socat gh nodejs_22 ];
+        };
+
         default = rust-toolchain;
       });
 

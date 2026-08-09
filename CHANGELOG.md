@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`flake.nix` + `flake.lock`) instead of `mise.toml`: `nix develop` on the
   host and the dev-container image (`.pall8t/Containerfile`) both provision
   Rust from the same lock file.
+- The dev image's userland tools (git, ripgrep, jq, less, vim, tmux, socat,
+  gh, node) also come from the flake now (`#sandbox-tools`), pinned by
+  `flake.lock` instead of floating apt/NodeSource/GitHub-CLI repository
+  state; the NodeSource and GitHub-CLI apt repositories are gone from the
+  image. apt keeps only what nix can't cover: the bootstrap pair
+  (ca-certificates/curl), setuid sudo, openssh-client, and the distro C
+  link chain (cc/pkg-config/mold). The claude CLI is still npm-installed
+  at image build time, now on the flake's node with a `/usr/local/npm`
+  prefix.
 
 ## [0.4.0] - 2026-08-09
 
