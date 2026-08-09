@@ -71,19 +71,12 @@ as a stray diff in the next unrelated PR.
 `## [$VERSION] - YYYY-MM-DD` using **today's real date** (`date +%F`; never
 a guessed one), and open a fresh, empty `## [Unreleased]` above it.
 
-That heading format is load-bearing, not style. `release.yml` extracts the
-release notes with:
-
-```awk
-# verline is passed in with -v verline="## [<version>] -"; awk never
-# expands a shell variable inside its own program text
-/^## \[/ { if (found) exit; if (index($0, verline) == 1) { found=1; next } }
-```
-
-It matches from the start of the line and expects the ` - ` separator, so
-`## [0.4.0]` or `##  [0.4.0] -` silently yields empty notes and fails the
-release job *after* the tag is public. Changing the format here means
-changing the workflow too.
+That heading format is load-bearing, not style. `scripts/release-notes.sh`
+matches the heading from the start of the line and expects the ` - `
+separator before the date, so `## [0.4.0]` or `##  [0.4.0] -` yields no
+notes at all — and `release.yml` runs that same script to build the
+Release body, so a heading it cannot find fails the release job *after*
+the tag is public.
 
 Then the link footer at the bottom:
 
@@ -100,20 +93,19 @@ what is wrong; do not invent entries for changes nobody wrote down.
 
 ## 4. Prove the release job will find the notes
 
-Do not hand this to a tag and hope. Run the workflow's own extraction
-against the file:
+Do not hand this to a tag and hope. Run the very script `release.yml`
+runs:
 
 ```sh
-VERSION=0.4.0   # the version being released; awk cannot expand it for you
-awk -v verline="## [$VERSION] -" '
-  /^## \[/ { if (found) exit; if (index($0, verline) == 1) { found=1; next } }
-  found { print }
-' CHANGELOG.md | sed -e '/^\[.*\]: http/d' -e '/./,$!d'
+scripts/release-notes.sh $VERSION
 ```
 
-Empty output means the release job would fail on a tag that is already
-public and unpushable-over. Non-empty output is the release notes users
-will actually see — read them once as a stranger would.
+It exits non-zero, saying what heading it expected, when nothing matches
+— which is the release job failing, discovered here instead of against a
+public tag that cannot be pushed over. CI runs the same script on every
+push as a backstop, but this is the earliest point, and the only one
+where you also *read* the output: on success it is the release notes
+users will actually see, so read them once as a stranger would.
 
 Also confirm the two version sources agree, which is what `release.yml`
 checks after the fact:

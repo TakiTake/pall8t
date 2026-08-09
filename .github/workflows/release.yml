@@ -35,11 +35,9 @@ jobs:
       - name: Extract release notes from CHANGELOG.md
         run: |
           set -eu
-          NOTES="$(awk -v verline="## [$VERSION] -" '
-            /^## \[/ { if (found) exit; if (index($0, verline) == 1) { found=1; next } }
-            found { print }
-          ' CHANGELOG.md | sed -e '/^\[.*\]: http/d' -e '/./,$!d')"
-          if [ -z "$NOTES" ]; then
+          # scripts/release-notes.sh is the single implementation, so the
+          # preflight check in /bump runs exactly what this job runs.
+          if ! NOTES="$(scripts/release-notes.sh "$VERSION")"; then
             echo "::error::no CHANGELOG.md section found for version $VERSION" >&2
             exit 1
           fi
