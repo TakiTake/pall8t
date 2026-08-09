@@ -25,8 +25,12 @@ cargo fmt --check
 echo "lint: cargo clippy --all-targets (host)"
 cargo clippy --all-targets -- -D warnings
 
-if command -v rustup >/dev/null 2>&1 && \
-   ! rustup target list --installed | grep -qx "$CROSS_TARGET"; then
+# Only consult rustup when the active toolchain actually lacks the target
+# std: on a host that runs the flake toolchain but still has a leftover
+# rustup, an unconditional `rustup target add` would download a std the
+# lint below never uses.
+if [ ! -d "$(rustc --print target-libdir --target "$CROSS_TARGET")" ] && \
+   command -v rustup >/dev/null 2>&1; then
     echo "lint: installing missing cross-lint target $CROSS_TARGET"
     rustup target add "$CROSS_TARGET"
 fi
