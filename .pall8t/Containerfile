@@ -3,66 +3,100 @@ FROM ubuntu:24.04
 ARG UID=501
 ARG GID=501
 
-# Base tools + node + claude CLI + gh + jq (agents post-process `gh --json`);
-# dev user with host UID/GID (same as the default pall8t image), plus a Rust
-# toolchain for developing pall8t. GitHub's SSH host keys are baked in from the
-# authenticated api.github.com/meta (not ssh-keyscan/TOFU) so git-over-SSH works
-# without an interactive host-key prompt.
+# Minimal apt layer — only what nix cannot provide or what must exist before
+# nix does. ca-certificates + curl bootstrap the nix installer below; sudo is
+# setuid root (a nix-store binary can't be); openssh-client owns /etc/ssh,
+# where GitHub's SSH host keys get baked in (from the authenticated
+# api.github.com/meta, not ssh-keyscan/TOFU, so git-over-SSH works without an
+# interactive host-key prompt); build-essential + pkg-config + mold stay
+# distro because linking deliberately uses the distro C toolchain (see the
+# cargo config below — and pkg-config belongs with the cc it serves, so it
+# finds apt-installed -dev libraries). Every other userland tool (git,
+# ripgrep, jq, gh, node, ...) comes from the repo's nix flake in the RUN
+# below, pinned by flake.lock. Dev user with host UID/GID (same as the
+# default pall8t image).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git sudo ripgrep less vim openssh-client tmux jq socat \
+      ca-certificates curl sudo openssh-client \
       build-essential pkg-config mold && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list && \
-    apt-get update && apt-get install -y --no-install-recommends gh && \
-    curl -fsSL https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com \(.)"' \
-      >> /etc/ssh/ssh_known_hosts && \
     (getent group ${GID} || groupadd -g ${GID} dev) && \
     useradd -m -u ${UID} -g ${GID} -s /bin/bash dev && \
     echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
 
-# tmux ships for Claude Code's agent-teams split-pane display (README:
-# "Claude Code agent teams (split panes)"); keep the chrome minimal by default.
+# tmux (from the flake tools below — nixpkgs builds it with sysconfdir=/etc,
+# so it reads this file) ships for Claude Code's agent-teams split-pane
+# display (README: "Claude Code agent teams (split panes)"); keep the chrome
+# minimal by default.
 RUN printf '%s\n' \
       '# pall8t: keep the tmux chrome minimal inside agent sessions.' \
       '# Users can override in ~/.tmux.conf (persistent home).' \
       'set -g status off' \
       > /etc/tmux.conf
 
-# Rust goes to /usr/local, NOT /home/dev: pall8t mounts a persistent home
-# over /home/dev at runtime, which would shadow a ~/.cargo install. The
-# aarch64-apple-darwin target is added for the cross-target clippy gate on
-# cfg(target_os = "macos") code (the build host is Linux). rust-analyzer (the
-# LSP) plus rust-src (which it needs to resolve std) are added on top of the
-# default profile's rustc/cargo/rustfmt/clippy for editor/IDE tooling. mold is
-# wired in as the default linker for the Linux host targets only via a global
-# cargo config in CARGO_HOME (not shadowed by the persistent /home/dev mount);
-# the darwin cross-target is left on the default linker since mold can't emit
-# Mach-O. Caveat: `target.<triple>.rustflags` and `build.rustflags` are
-# mutually exclusive in cargo — a project that sets its own `build.rustflags`
-# would have it silently ignored under this config. That's a non-issue here:
-# this is pall8t's *own* dev image and pall8t sets no `build.rustflags`; the
-# image shipped to arbitrary user projects is the repo-root Containerfile,
-# which carries none of this.
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
-RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | \
-      sh -s -- -y --no-modify-path --default-toolchain 1.96 --profile default && \
-    rustup target add aarch64-apple-darwin && \
-    rustup component add rust-analyzer rust-src && \
+# The Rust toolchain AND the userland tools come from the repo's nix flake,
+# so the sandbox builds with the exact versions flake.lock pins — the Rust
+# side being the same one `nix develop` gives on the host. The COPY works
+# because pall8t's build context for a project Containerfile is the project
+# root (ADR-0010), and `container.watch` in .pall8t/config.toml rebuilds
+# this image whenever either file changes.
+#
+# Nix itself is installed with the Determinate installer in container mode
+# (`--init none`: there is no init system inside an image build) with nix's
+# own build sandbox off (it needs privileges `container build` doesn't
+# grant). `--no-update-lock-file` makes a flake.nix/flake.lock mismatch fail
+# the build instead of silently resolving fresh inputs.
+#
+# Everything user-facing lands under /usr/local, NOT /home/dev: pall8t
+# mounts a persistent home over /home/dev at runtime, which would shadow
+# anything installed there. /usr/local/rust and /usr/local/tools are
+# GC-rooted out-links to store paths (the Rust toolchain — rustc/cargo/
+# rustfmt/clippy plus rust-analyzer + rust-src for editor tooling and the
+# aarch64-apple-darwin std for scripts/lint.sh's cross-target clippy gate —
+# and the #sandbox-tools env: git, ripgrep, jq, less, vim, tmux, socat, gh,
+# node; see flake.nix); the closures are self-contained (RPATH into
+# /nix/store), so they run on Ubuntu as-is. `nix store gc` then drops the
+# build-time-only paths (flake inputs, eval caches) the out-links don't
+# root. The claude CLI is npm-installed on top of the flake's node —
+# NPM_CONFIG_PREFIX points npm's global root at /usr/local/npm because the
+# node package itself lives in the read-only nix store.
+#
+# Linking still uses the distro toolchain: build-essential provides cc, and
+# mold is wired in as the default linker for the Linux host targets via a
+# global cargo config in CARGO_HOME (also /usr/local, not shadowed by the
+# home mount); the darwin cross-target is left on the default linker since
+# mold can't emit Mach-O. Caveat: `target.<triple>.rustflags` and
+# `build.rustflags` are mutually exclusive in cargo — a project that sets
+# its own `build.rustflags` would have it silently ignored under this
+# config. That's a non-issue here: this is pall8t's *own* dev image and
+# pall8t sets no `build.rustflags`; the image shipped to arbitrary user
+# projects is the repo-root Containerfile, which carries none of this.
+COPY flake.nix flake.lock /opt/pall8t/toolchain/
+ENV CARGO_HOME=/usr/local/cargo \
+    NPM_CONFIG_PREFIX=/usr/local/npm \
+    PATH=/usr/local/rust/bin:/usr/local/tools/bin:/usr/local/npm/bin:/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://install.determinate.systems/nix | \
+      sh -s -- install linux --init none --no-confirm --extra-conf "sandbox = false" && \
+    /nix/var/nix/profiles/default/bin/nix \
+      --extra-experimental-features 'nix-command flakes' \
+      build 'path:/opt/pall8t/toolchain#rust-toolchain' \
+      --no-update-lock-file --out-link /usr/local/rust && \
+    /nix/var/nix/profiles/default/bin/nix \
+      --extra-experimental-features 'nix-command flakes' \
+      build 'path:/opt/pall8t/toolchain#sandbox-tools' \
+      --no-update-lock-file --out-link /usr/local/tools && \
+    /nix/var/nix/profiles/default/bin/nix store gc --quiet && \
+    npm install -g @anthropic-ai/claude-code && \
+    curl -fsSL https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com \(.)"' \
+      >> /etc/ssh/ssh_known_hosts && \
+    mkdir -p /usr/local/cargo && \
     printf '%s\n' \
       '[target.x86_64-unknown-linux-gnu]' \
       'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
       '[target.aarch64-unknown-linux-gnu]' \
       'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
       > /usr/local/cargo/config.toml && \
-    chown -R ${UID}:${GID} /usr/local/rustup /usr/local/cargo && \
-    echo 'export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH' \
-      > /etc/profile.d/rust.sh
+    chown -R ${UID}:${GID} /usr/local/cargo && \
+    echo 'export CARGO_HOME=/usr/local/cargo NPM_CONFIG_PREFIX=/usr/local/npm PATH=/usr/local/rust/bin:/usr/local/tools/bin:/usr/local/npm/bin:/usr/local/cargo/bin:$PATH' \
+      > /etc/profile.d/pall8t.sh
 
 # Serena: an MCP server that gives the agent LSP-powered semantic code tools
 # (find_symbol, find_referencing_symbols, ...) so it navigates by symbols

@@ -69,6 +69,18 @@ local review failed to catch first (source PRs noted).
   is silent exactly where a confused user looks first (a `doctor`-style
   diagnostic).
 
+**Fallback to a secondary tool** (PR #50)
+- A fallback that invokes a manager/helper tool (`rustup`, `nvm`, a
+  package manager) to repair the active environment must first check the
+  tool actually *governs* that environment — presence on PATH is not
+  governance. Enumerate the split-brain states: manager present but
+  managing nothing (its commands fail, and under `set -e` that aborts the
+  script on exactly the path meant to be forgiving), and manager managing
+  a *different* copy than the one on PATH (the "fix" lands where nothing
+  reads it). lint.sh hit both with a leftover rustup next to the nix
+  toolchain; the check that ties them together is whether the active
+  tool's root (`rustc --print sysroot`) lives under the manager's home.
+
 **Docs the diff touches** (PR #43)
 - Markdown lint is part of the review even when CI doesn't run it:
   adjacent blockquotes separated by a blank line (MD028) is the one this

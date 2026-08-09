@@ -4,8 +4,11 @@ Guidance for Claude Code (and other agents) working in this repo.
 
 ## Build & verify
 
-Run directly with `cargo` — `mise` is not installed in the dev container, even
-though `mise.toml` defines tasks for local use.
+The Rust toolchain is pinned by the repo-top nix flake (`flake.nix` +
+`flake.lock`, replacing the old `mise.toml`). Inside the pall8t dev
+container it is preinstalled — the image builds from the same lock file
+(`.pall8t/Containerfile`); on the host, `nix develop` opens a shell with
+it. Run checks directly with `cargo`:
 
 ```sh
 cargo check
@@ -18,17 +21,17 @@ A lint pass on the host triple alone can miss a warning on the other side of
 a `#[cfg(target_os = ...)]` gate — the tree has no such branches right now
 (the last ones went with the home module, ADR-0008), but the cross-lint stays
 as the guard that catches the next one. Lint the non-host target before
-considering a change clean:
+considering a change clean (the flake toolchain already includes the target
+std; only a rustup toolchain needs the `target add`):
 
 ```sh
-rustup target add aarch64-apple-darwin   # once
 cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
 ```
 
 (`scripts/lint.sh` runs both and is what the pre-commit hook uses — but the
 hook is opt-in, not automatic: enable it once per checkout with
-`mise run setup-hooks` or `git config core.hooksPath .githooks`. On a fresh
-clone/worktree, run `scripts/lint.sh` or `mise run lint` by hand.)
+`git config core.hooksPath .githooks`. On a fresh clone/worktree, run
+`scripts/lint.sh` by hand.)
 
 Read [docs/testing.md](docs/testing.md) **before writing tests** — it
 records the conventions the suite follows (pure-function seams, table

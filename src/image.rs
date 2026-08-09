@@ -16,6 +16,13 @@ pub struct ResolvedImage {
     /// Tag base, scoping the post-build prune of superseded siblings.
     pub base: String,
     pub containerfile: PathBuf,
+    /// Directory passed to `container build` as the build context. For a
+    /// project Containerfile (explicit config or `.pall8t/Containerfile`)
+    /// this is the project directory itself, so `COPY` reaches project
+    /// files — e.g. the repo-top lock files `container.watch` tracks
+    /// (ADR-0010). The shared default image keeps building from
+    /// `~/.pall8t`, the Containerfile's own directory.
+    pub ctx_dir: PathBuf,
     /// Content hash embedded in `tag` at resolve time.
     pub hash: String,
     /// `container.watch` entries resolved at resolve time, so the
@@ -38,11 +45,14 @@ pub struct ResolvedImage {
 /// project on the default image reuses one build. `cfg.container.watch`
 /// (issue #35) folds extra project files' paths and contents into the same
 /// hash, so a project's own Containerfile is required when it's set — see
-/// the error below.
+/// the error below. A project Containerfile builds with the project
+/// directory as its build context (ADR-0010), so `COPY` paths are relative
+/// to the project root and can reach the files `container.watch` tracks;
+/// the shared default builds from `~/.pall8t` as before.
 pub fn resolve(cwd: &Path, cfg: &Config, uid: u32, gid: u32) -> Result<ResolvedImage> {
     let watch = resolve_watch_paths(cwd, &cfg.watch)?;
-    let (containerfile, base) = match probe_containerfile(cwd, cfg)? {
-        Some(found) => found,
+    let (containerfile, base, ctx_dir) = match probe_containerfile(cwd, cfg)? {
+        Some((containerfile, base)) => (containerfile, base, cwd.to_path_buf()),
         // The default image builds from ~/.pall8t, so project files can't
         // affect it, and giving it a project-specific tag would make
         // `prune_superseded` delete other projects' images sharing
@@ -53,17 +63,21 @@ pub fn resolve(cwd: &Path, cfg: &Config, uid: u32, gid: u32) -> Result<ResolvedI
                  — add .pall8t/Containerfile or set container.containerfile"
             ));
         }
-        None => (
-            container::default_containerfile_path()
-                .context("cannot write the default Containerfile")?,
-            "pall8t-base".to_string(),
-        ),
+        None => {
+            let containerfile = container::default_containerfile_path()
+                .context("cannot write the default Containerfile")?;
+            let ctx_dir = containerfile
+                .parent()
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            (containerfile, "pall8t-base".to_string(), ctx_dir)
+        }
     };
     let hash = hash_with_retry(&containerfile, &watch)?;
     Ok(ResolvedImage {
         tag: container::image_tag_hashed(&base, uid, gid, &hash),
         base,
         containerfile,
+        ctx_dir,
         hash,
         watch,
     })
@@ -326,30 +340,56 @@ fn project_base(cwd: &Path) -> String {
     format!("pall8t-{}", util::path_key(cwd))
 }
 
+/// How [`ensure_built`] decides whether (and how) to run `container build`.
+/// One enum instead of two bools because "skip the build but also bypass
+/// its cache" is not a thing — this makes that combination
+/// unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildMode {
+    /// Build only when no image for the current content hash exists
+    /// (`pall8t run`).
+    IfMissing,
+    /// Build unconditionally (`pall8t build`) — e.g. to pick up an updated
+    /// base image the hash can't see. The builder's layer cache still
+    /// applies.
+    Force,
+    /// Build unconditionally AND pass `--no-cache`, re-running every `RUN`
+    /// step (`pall8t build --no-cache`) — for steps that fetch "latest"
+    /// (the claude CLI npm install) and would otherwise be served from the
+    /// layer cache forever, their instruction text never changing.
+    ForceNoCache,
+}
+
+impl BuildMode {
+    /// Whether this mode forwards `--no-cache` to `container build`.
+    fn no_cache(self) -> bool {
+        self == BuildMode::ForceNoCache
+    }
+}
+
 /// Resolves and, if no image for the current Containerfile content exists,
-/// builds before returning (FR-2). Set `force` to build unconditionally
-/// (`pall8t build` — e.g. to pick up updated base images or packages the
-/// hash can't see). On build failure the error propagates and nothing is
-/// launched.
+/// builds before returning (FR-2); `mode` escalates that to an
+/// unconditional or cache-bypassing build (see [`BuildMode`]). On build
+/// failure the error propagates and nothing is launched.
 pub fn ensure_built(
     cwd: &Path,
     cfg: &Config,
     uid: u32,
     gid: u32,
-    force: bool,
+    mode: BuildMode,
 ) -> Result<ResolvedImage> {
     let resolved = resolve(cwd, cfg, uid, gid)?;
-    if !force && container::image_exists(&resolved.tag) {
+    if mode == BuildMode::IfMissing && container::image_exists(&resolved.tag) {
         return Ok(resolved);
     }
-    match try_build(&resolved, uid, gid)? {
+    match try_build(&resolved, uid, gid, mode.no_cache())? {
         BuildAttempt::Done => Ok(resolved),
         BuildAttempt::Poisoned => {
             // The Containerfile changed while building. Retry ONCE against
             // freshly re-resolved content — bounded, so a file edited
             // faster than it can be built fails loudly instead of looping.
             let retry = resolve(cwd, cfg, uid, gid)?;
-            match try_build(&retry, uid, gid)? {
+            match try_build(&retry, uid, gid, mode.no_cache())? {
                 BuildAttempt::Done => Ok(retry),
                 BuildAttempt::Poisoned => {
                     let what = if retry.watch.is_empty() {
@@ -383,14 +423,20 @@ enum BuildAttempt {
 /// [`BuildAttempt::Poisoned`]. Otherwise, best-effort prunes superseded
 /// builds under `resolved.base`, excluding images any existing container
 /// currently runs (parallel `pall8t run`s may still be on an older tag).
-fn try_build(resolved: &ResolvedImage, uid: u32, gid: u32) -> Result<BuildAttempt> {
-    let ctx_dir = resolved.containerfile.parent().unwrap_or(Path::new("."));
+fn try_build(resolved: &ResolvedImage, uid: u32, gid: u32, no_cache: bool) -> Result<BuildAttempt> {
     eprintln!(
         "pall8t: building {} from {} (this can take a few minutes):",
         resolved.tag,
         resolved.containerfile.display()
     );
-    container::build_image(&resolved.containerfile, ctx_dir, &resolved.tag, uid, gid)?;
+    container::build_image(
+        &resolved.containerfile,
+        &resolved.ctx_dir,
+        &resolved.tag,
+        uid,
+        gid,
+        no_cache,
+    )?;
 
     // A byte-cap-exceeded `Err` here is folded into "poisoned" alongside a
     // hash mismatch: the watched files fit under the cap when `resolve`
@@ -809,6 +855,62 @@ mod tests {
         fs::write(cwd.join("flake.lock"), "v1").unwrap();
         let reverted = resolve(&cwd, &cfg, 501, 20).unwrap();
         assert_eq!(reverted.tag, first.tag);
+
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn build_mode_no_cache_mapping() {
+        // Table: (mode, forwards --no-cache). Only ForceNoCache may bypass
+        // the layer cache — IfMissing/Force keeping it is what makes
+        // routine `run`/`build` rebuilds fast.
+        for (mode, expect) in [
+            (BuildMode::IfMissing, false),
+            (BuildMode::Force, false),
+            (BuildMode::ForceNoCache, true),
+        ] {
+            assert_eq!(
+                mode.no_cache(),
+                expect,
+                "{mode:?} must {}forward --no-cache",
+                if expect { "" } else { "not " }
+            );
+        }
+    }
+
+    // -- build context (ADR-0010) -----------------------------------------
+
+    #[test]
+    fn resolve_project_containerfile_builds_from_project_dir() {
+        let cwd = tmp_dir("ctx-project-dir");
+        let dot_pall8t = cwd.join(".pall8t");
+        fs::create_dir_all(&dot_pall8t).unwrap();
+        fs::write(dot_pall8t.join("Containerfile"), "FROM scratch\n").unwrap();
+
+        let resolved = resolve(&cwd, &test_cfg(None), 501, 20).unwrap();
+        assert_eq!(
+            resolved.ctx_dir, cwd,
+            "a .pall8t/Containerfile must build with the project dir as context — \
+             not .pall8t/ — so COPY reaches repo-top files like flake.lock"
+        );
+
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn resolve_explicit_containerfile_builds_from_project_dir() {
+        let cwd = tmp_dir("ctx-explicit-subdir");
+        fs::create_dir_all(cwd.join("images")).unwrap();
+        fs::write(cwd.join("images/Containerfile"), "FROM scratch\n").unwrap();
+
+        let cfg = test_cfg(Some(PathBuf::from("images/Containerfile")));
+        let resolved = resolve(&cwd, &cfg, 501, 20).unwrap();
+        assert_eq!(
+            resolved.ctx_dir, cwd,
+            "an explicit containerfile in a subdirectory must still use the project \
+             dir as context, so COPY paths mean the same thing for every project \
+             Containerfile location"
+        );
 
         let _ = fs::remove_dir_all(&cwd);
     }

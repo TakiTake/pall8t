@@ -32,7 +32,14 @@ enum Cmd {
         command: Vec<String>,
     },
     /// Build the image explicitly (unconditionally)
-    Build,
+    Build {
+        /// Bypass the builder's layer cache, re-running every RUN step —
+        /// picks up "latest" fetches (the claude CLI npm install) that an
+        /// unchanged Containerfile line would otherwise keep serving from
+        /// cache
+        #[arg(long)]
+        no_cache: bool,
+    },
     /// List containers started by pall8t
     Ls {
         /// Machine-readable output (for herdr etc.)
@@ -98,7 +105,7 @@ fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Init => cmd_init(),
         Cmd::Run { readonly, command } => cmd_run(command, readonly),
-        Cmd::Build => cmd_build(),
+        Cmd::Build { no_cache } => cmd_build(no_cache),
         Cmd::Ls { json } => cmd_ls(json),
         Cmd::Exec { id, command } => cmd_exec(&id, &command),
         Cmd::Stop { id } => cmd_stop(&id),
@@ -163,7 +170,7 @@ fn stdin_is_tty() -> bool {
 /// reported even on a machine where the `container` CLI is missing — the
 /// user fixing one shouldn't have to fix the other first to hear about it.
 fn workspace_image(
-    force: bool,
+    mode: image::BuildMode,
 ) -> Result<(
     std::path::PathBuf,
     config::Config,
@@ -178,7 +185,7 @@ fn workspace_image(
     warn_deprecations(&cfg);
     ensure_container_system()?;
     let (uid, gid) = container::host_ids();
-    let resolved = image::ensure_built(&cwd, &cfg, uid, gid, force)?;
+    let resolved = image::ensure_built(&cwd, &cfg, uid, gid, mode)?;
     Ok((cwd, cfg, uid, gid, resolved))
 }
 
@@ -230,7 +237,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 }
 
 fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
-    let (cwd, cfg, uid, gid, resolved) = workspace_image(false)?;
+    let (cwd, cfg, uid, gid, resolved) = workspace_image(image::BuildMode::IfMissing)?;
     let run_name = container::run_name(&cwd);
 
     let mut mounts = vec![container::Mount::identity(cwd.clone())];
@@ -314,8 +321,13 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
     exec_container(&container::run_argv(&spec), herdr_agent.as_deref())
 }
 
-fn cmd_build() -> Result<()> {
-    let (_, _, _, _, resolved) = workspace_image(true)?;
+fn cmd_build(no_cache: bool) -> Result<()> {
+    let mode = if no_cache {
+        image::BuildMode::ForceNoCache
+    } else {
+        image::BuildMode::Force
+    };
+    let (_, _, _, _, resolved) = workspace_image(mode)?;
     println!("built {}", resolved.tag);
     Ok(())
 }

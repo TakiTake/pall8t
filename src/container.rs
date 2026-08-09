@@ -509,23 +509,44 @@ pub fn build_image(
     tag: &str,
     uid: u32,
     gid: u32,
+    no_cache: bool,
 ) -> Result<()> {
     run_streaming(
-        [
-            "build".to_string(),
-            "-f".to_string(),
-            containerfile.to_string_lossy().into_owned(),
-            "-t".to_string(),
-            tag.to_string(),
-            "--build-arg".to_string(),
-            format!("UID={uid}"),
-            "--build-arg".to_string(),
-            format!("GID={gid}"),
-            ctx_dir.to_string_lossy().into_owned(),
-        ],
+        build_argv(containerfile, ctx_dir, tag, uid, gid, no_cache),
         Stdio::null(),
     )?;
     Ok(())
+}
+
+/// argv (after `container`) for `container build`. `no_cache` forwards
+/// `--no-cache` to the builder, re-running every `RUN` step — the escape
+/// hatch for steps that fetch "latest" (an npm install, `apt-get update`),
+/// which an unchanged instruction line would otherwise serve from the
+/// layer cache forever. Flags stay ahead of the positional context dir.
+pub fn build_argv(
+    containerfile: &Path,
+    ctx_dir: &Path,
+    tag: &str,
+    uid: u32,
+    gid: u32,
+    no_cache: bool,
+) -> Vec<String> {
+    let mut argv = vec![
+        "build".to_string(),
+        "-f".to_string(),
+        containerfile.to_string_lossy().into_owned(),
+        "-t".to_string(),
+        tag.to_string(),
+        "--build-arg".to_string(),
+        format!("UID={uid}"),
+        "--build-arg".to_string(),
+        format!("GID={gid}"),
+    ];
+    if no_cache {
+        argv.push("--no-cache".to_string());
+    }
+    argv.push(ctx_dir.to_string_lossy().into_owned());
+    argv
 }
 
 /// One bind mount of a [`RunSpec`], rendered as `--mount` by
@@ -1421,6 +1442,47 @@ mod tests {
             "no -t without a terminal — apple/container 1.0.0 fails on -t sans TTY"
         );
         assert!(scripted.contains(&"-i".to_string()));
+    }
+
+    #[test]
+    fn build_argv_shape() {
+        let cf = PathBuf::from("/Users/me/src/x/.pall8t/Containerfile");
+        let ctx = PathBuf::from("/Users/me/src/x");
+        let cached = build_argv(&cf, &ctx, "pall8t-x:501-20-abc123456789", 501, 20, false);
+        assert_eq!(cached[0], "build");
+        let f = cached.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(
+            cached[f + 1],
+            "/Users/me/src/x/.pall8t/Containerfile",
+            "the Containerfile path rides -f; the context dir is positional (ADR-0010 \
+             decides them independently, so they must not be conflated)"
+        );
+        assert_eq!(
+            cached.last(),
+            Some(&"/Users/me/src/x".to_string()),
+            "the build context is the trailing positional argument"
+        );
+        assert!(
+            cached.contains(&"UID=501".to_string()) && cached.contains(&"GID=20".to_string()),
+            "host ids reach the build as --build-arg so the image's dev user matches \
+             the mounted workspace's owner"
+        );
+        assert!(
+            !cached.contains(&"--no-cache".to_string()),
+            "a default build must NOT pass --no-cache — the layer cache is what \
+             keeps routine rebuilds fast"
+        );
+
+        let uncached = build_argv(&cf, &ctx, "pall8t-x:501-20-abc123456789", 501, 20, true);
+        let pos = uncached
+            .iter()
+            .position(|a| a == "--no-cache")
+            .expect("no_cache: true must emit --no-cache — it is the whole contract of `pall8t build --no-cache`");
+        assert!(
+            pos < uncached.len() - 1,
+            "--no-cache must precede the positional context dir, or the CLI parses \
+             it as part of the context path"
+        );
     }
 
     #[test]
