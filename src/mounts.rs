@@ -20,6 +20,48 @@ fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
+/// What an existing mount does to a path pall8t wants to add.
+#[derive(Debug, PartialEq, Eq)]
+enum Coverage {
+    /// The path is already reachable, and reading it there yields the same
+    /// host directory — so adding another mount would be redundant.
+    SamePath,
+    /// Something else is mounted over that path. Named by its target, for
+    /// the error.
+    Conflict(PathBuf),
+}
+
+/// Whether `path` is already covered inside the container by an existing
+/// mount or a protected path, and if so whether the content behind it is
+/// the same directory.
+///
+/// "Same" is decided by walking the covering mount's own mapping: a mount
+/// of `/a` at `/a` reaches `/a/b/.git` as exactly that host path, while a
+/// mount of `/elsewhere` at `/a` reaches something entirely different by
+/// the same container path.
+fn covering_mount(mounts: &[Mount], protected: &[PathBuf], path: &Path) -> Option<Coverage> {
+    if let Some(p) = protected.iter().find(|p| path.starts_with(p)) {
+        // The workspace and the worktree git dir are identity-mounted, and
+        // the container home is pall8t's own — a path under any of them is
+        // already there, as itself.
+        return Some(if path == p || p == Path::new("/home/dev") {
+            Coverage::Conflict(p.clone())
+        } else {
+            Coverage::SamePath
+        });
+    }
+    let m = mounts.iter().find(|m| path.starts_with(&m.dest))?;
+    let reached = path
+        .strip_prefix(&m.dest)
+        .map(|rest| m.host.join(rest))
+        .unwrap_or_else(|_| m.host.clone());
+    Some(if reached == path {
+        Coverage::SamePath
+    } else {
+        Coverage::Conflict(m.dest.clone())
+    })
+}
+
 /// Resolves configured entries into mounts, in order.
 ///
 /// `protected` are the *container-side* paths this run has already
@@ -44,23 +86,40 @@ pub fn resolve(
         let source = source
             .canonicalize()
             .with_context(|| format!("mount source not found: {}", source.display()))?;
+        // `canonicalize` is happy with a regular file, and apple/container
+        // only objects once the container is starting ("path ... is not a
+        // directory") — after a build, with a mount line already printed
+        // claiming it worked. Say it here instead.
+        if !source.is_dir() {
+            return Err(anyhow!(
+                "mount source must be a directory: {} — [[mounts]] mounts \
+                 directories, not individual files",
+                source.display()
+            ));
+        }
         let target = match &entry.target {
             // An identity mount is the default because it is what keeps
             // absolute paths meaningful on both sides: git metadata, build
             // outputs, and anything the agent reports back all resolve the
             // same way on the host.
             None => source.clone(),
-            Some(t) => {
-                let t = expand_tilde(t);
-                if !t.is_absolute() {
-                    return Err(anyhow!(
-                        "mount target must be an absolute container path: {} (for source {})",
-                        t.display(),
-                        source.display()
-                    ));
-                }
-                t
+            // Deliberately *not* tilde-expanded: `target` is a path inside
+            // the container, and `~` there is the container's home, not the
+            // host's. Expanding it would quietly turn `~/notes` into
+            // `/Users/you/notes` — a host path, on the wrong side of the
+            // boundary, differing per machine. Rejecting it as non-absolute
+            // says so instead.
+            Some(t) if !t.is_absolute() => {
+                return Err(anyhow!(
+                    "mount target must be an absolute container path: {} (for source {}). \
+                     `~` is not expanded in a target — it would mean the host's home, \
+                     not the container's; write the container path you want, e.g. \
+                     /home/dev/notes",
+                    t.display(),
+                    source.display()
+                ));
             }
+            Some(t) => t.clone(),
         };
         let readonly = crate::config::mount_readonly(entry, cli_readonly);
 
@@ -98,18 +157,37 @@ pub fn resolve(
         };
 
         mounts.push(Mount {
-            host: source,
+            host: source.clone(),
             dest: target,
             readonly,
         });
         if let Some(git_dir) = git_dir {
-            // Inherits `readonly`: a writable worktree needs to write refs
-            // and the index into the main `.git`, so mounting it read-only
-            // would break exactly the commits the writable mount is for.
-            if !protected.iter().any(|p| overlaps(&git_dir, p))
-                && !mounts.iter().any(|m| m.dest == git_dir)
-            {
-                mounts.push(Mount::new(git_dir.clone(), git_dir, readonly));
+            // This mount is pall8t's idea, not the user's, so it defers to
+            // anything already covering that path rather than stacking a
+            // second mount inside it. Nesting is not harmless: an earlier
+            // writable mount of the main checkout plus a later read-only
+            // worktree would land a read-only `.git` inside the writable
+            // checkout, and commits there would start failing for a reason
+            // nothing in the config hints at.
+            match covering_mount(&mounts, protected, &git_dir) {
+                // Already reachable, with the same content behind it.
+                Some(Coverage::SamePath) => {}
+                Some(Coverage::Conflict(dest)) => {
+                    return Err(anyhow!(
+                        "{} is a linked git worktree, so its main git directory {} has to \
+                         be mounted for git to work — but {} is already mounted over that \
+                         path with different contents; mount the main checkout at its own \
+                         path, or drop the worktree entry",
+                        source.display(),
+                        git_dir.display(),
+                        dest.display()
+                    ));
+                }
+                // Inherits `readonly`: a writable worktree needs to write
+                // refs and the index into the main `.git`, so mounting it
+                // read-only would break exactly the commits the writable
+                // mount is for.
+                None => mounts.push(Mount::new(git_dir.clone(), git_dir, readonly)),
             }
         }
     }
@@ -366,6 +444,163 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// `canonicalize` accepts a regular file, and apple/container only
+    /// objects while starting the container — after a build, and after
+    /// pall8t has already printed a mount line saying it worked
+    /// (CodeRabbit, PR #46).
+    #[test]
+    fn resolve_rejects_a_file_as_a_source() {
+        let dir = tmp_dir("file-source");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        let err = resolve(&[entry(&file)], &[], None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must be a directory") && msg.contains("a.txt"),
+            "the error must name the file and say what was expected, rather than \
+             leaving the runtime to fail later: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `~` in a *target* would mean the container's home, not the host's,
+    /// so expanding it host-side produced a `/Users/...` path on the wrong
+    /// side of the boundary — silently, and differently per machine
+    /// (CodeRabbit, PR #46).
+    #[test]
+    fn resolve_does_not_expand_tilde_in_a_target() {
+        let dir = tmp_dir("tilde-target");
+        let e = MountEntry {
+            source: dir.clone(),
+            target: Some("~/notes".into()),
+            readonly: None,
+        };
+
+        let err = resolve(&[e], &[], None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("absolute") && msg.contains('~'),
+            "rejecting it is only useful if the message explains why a target is \
+             not tilde-expanded: {msg}"
+        );
+        assert!(
+            !msg.contains(&dirs::home_dir().unwrap().display().to_string()),
+            "and the host's home must not appear in the target at all: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The generated git-dir mount skipped the overlap checks the
+    /// configured ones get. Mounting a main checkout and then its linked
+    /// worktree would nest a `.git` mount inside the checkout's mount —
+    /// and with differing modes, land a read-only `.git` inside a writable
+    /// checkout, breaking commits there for a reason nothing in the config
+    /// hints at (CodeRabbit, PR #46).
+    #[test]
+    fn resolve_does_not_nest_a_git_dir_inside_an_existing_mount() {
+        let root = tmp_dir("nested-gitdir");
+        let main = root.join("main");
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        let main_s = main.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let argv: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
+            crate::util::run_ok("git", &argv).unwrap()
+        };
+        git(&["init", "-q", &main_s]);
+        std::fs::write(main.join("a.txt"), "a").unwrap();
+        git(&["-C", &main_s, "add", "-A"]);
+        git(&[
+            "-C",
+            &main_s,
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        git(&[
+            "-C",
+            &main_s,
+            "worktree",
+            "add",
+            "-q",
+            &linked.to_string_lossy(),
+            "-b",
+            "feat",
+        ]);
+
+        // Main checkout writable, then the worktree read-only: the git dir
+        // lives inside the first mount and is already reachable there.
+        let mut worktree = entry(&linked);
+        worktree.readonly = Some(true);
+        let mounts = resolve(&[entry(&main), worktree], &[], None).unwrap();
+
+        assert_eq!(
+            mounts.len(),
+            2,
+            "one mount per entry and no generated third: the main checkout \
+             already exposes its own .git — {mounts:?}"
+        );
+        let git_dir = main.join(".git").canonicalize().unwrap();
+        assert!(
+            !mounts.iter().any(|m| m.dest == git_dir),
+            "a nested .git mount would make the main checkout's git directory \
+             read-only inside a writable checkout"
+        );
+
+        // Two linked worktrees of the same repository resolve to the same
+        // main `.git`. The second must not emit a duplicate mount: two
+        // virtiofs entries with the same source and target are at best
+        // redundant and are rejected outright by some runtime versions
+        // (CodeRabbit, PR #46).
+        let second = root.join("linked2");
+        git(&[
+            "-C",
+            &main_s,
+            "worktree",
+            "add",
+            "-q",
+            &second.to_string_lossy(),
+            "-b",
+            "feat2",
+        ]);
+        let mounts = resolve(&[entry(&linked), entry(&second)], &[], None).unwrap();
+        assert_eq!(
+            mounts.len(),
+            3,
+            "two worktrees plus one shared git dir, not two: {mounts:?}"
+        );
+        let git_mounts = mounts.iter().filter(|m| m.dest == git_dir).count();
+        assert_eq!(
+            git_mounts, 1,
+            "the shared git dir must be mounted exactly once — a duplicate \
+             source/target pair is redundant at best and rejected at worst"
+        );
+
+        // Something else mounted over the git dir's path is not a mount
+        // pall8t can silently skip: git would resolve to the wrong content.
+        // The target is spelled canonically because container-side paths
+        // are compared as written — the host cannot canonicalize a path
+        // that only exists inside the container.
+        let mut over = entry(&root);
+        over.target = Some(git_dir.clone());
+        let mut worktree = entry(&linked);
+        worktree.readonly = Some(true);
+        let err = resolve(&[over, worktree], &[], None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("already mounted over"),
+            "a conflicting cover must be reported, not silently accepted: {err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

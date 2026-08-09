@@ -131,12 +131,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Only paths whose basename slugs past 32 characters are affected, and
     for those the key is shortened, never re-derived: shorter names come
     out byte for byte identical. An affected workspace gets a new image
-    tag base and a new `~/.pall8t/repos/<key>` clone directory, so its
-    next run rebuilds the image once and re-clones the reference repo.
-    Neither predecessor is cleaned up — image pruning is scoped to the
-    current tag base, so the old image and the old clone directory stay
-    until you delete them (`container image delete <old tag>`,
-    `rm -rf ~/.pall8t/repos/<old key>`).
+    tag base, so its next run rebuilds the image once. The old image is
+    not cleaned up — pruning is scoped to the current tag base — so it
+    stays until you delete it (`container image delete <old tag>`).
 
 ## [0.3.0] - 2026-08-01
 

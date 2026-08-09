@@ -126,10 +126,15 @@ local review failed to catch first (source PRs noted).
   after running a tool sweeps in whatever that tool wrote —
   `cargo mutants` leaves `mutants.out/` and `mutants.out.old/`, and
   `mutants.out/lock.json` carries the developer's hostname and username.
-  Anything a build or analysis tool generates belongs in `.gitignore`
-  before it belongs in a commit. On an unmerged branch, amend rather than
-  adding a removal commit — a "remove the artifact" commit still merges
-  the artifact's contents into `main`'s history forever.
+  An *incidental* local output like that belongs in `.gitignore` before
+  it belongs in a commit — which is not the same as "never commit
+  generated files": plenty of repos version lockfiles, schemas, or
+  generated sources on purpose, and those stay in review like any other
+  code. The question is whether the file is a deliberate artifact of the
+  project or a byproduct of the tool you happened to run. On an unmerged
+  branch, amend rather than adding a removal commit — a "remove the
+  artifact" commit still merges the artifact's contents into `main`'s
+  history forever.
 - A committed report also *attracts* review findings about its own
   contents (bots read `missed.txt` as if it were source), which buries
   the real findings.

@@ -258,6 +258,19 @@ fn repos_removed_error(raw: &Raw, path: &Path) -> Option<String> {
     ))
 }
 
+/// Every config file still declaring `[[repos]]`, in one message.
+///
+/// Reported together rather than one at a time: a user with the section
+/// in both the global and the project file would otherwise fix the first,
+/// rerun, and only then be told about the second.
+fn repos_removed_errors(files: &[(&Raw, &Path)]) -> Option<String> {
+    let msgs: Vec<_> = files
+        .iter()
+        .filter_map(|(raw, path)| repos_removed_error(raw, path))
+        .collect();
+    (!msgs.is_empty()).then(|| msgs.join("\n\n"))
+}
+
 /// Loads the merged config for a project rooted at `project_dir`.
 pub fn load(project_dir: &Path) -> Result<Config> {
     let global_path = global_path()?;
@@ -268,10 +281,11 @@ pub fn load(project_dir: &Path) -> Result<Config> {
     // one that still carries the section, not just the first found.
     // Before anything else: a config still on the old key gets a message,
     // not a run with a mount silently missing.
-    for (raw, path) in [(&global, &global_path), (&project, &project_path)] {
-        if let Some(msg) = repos_removed_error(raw, path) {
-            return Err(anyhow!(msg));
-        }
+    if let Some(msg) = repos_removed_errors(&[
+        (&global, global_path.as_path()),
+        (&project, project_path.as_path()),
+    ]) {
+        return Err(anyhow!(msg));
     }
     let deprecations = deprecations_in(&global, &global_path)
         .into_iter()
@@ -745,6 +759,39 @@ mod tests {
             repos_removed_error(&parse("[[mounts]]\nsource = \"~/src/a\"\n"), path),
             None,
             "a config already migrated must load without complaint"
+        );
+    }
+
+    /// Both files at once, not one per run: a user with the section in the
+    /// global *and* the project config would otherwise fix one, rerun, and
+    /// only then hear about the other (CodeRabbit, PR #46).
+    #[test]
+    fn both_legacy_config_files_are_reported_together() {
+        let global_path = Path::new("/home/u/.pall8t/config.toml");
+        let project_path = Path::new("/proj/.pall8t/config.toml");
+        let legacy = parse("[[repos]]\nsource = \"~/src/a\"\n");
+        let migrated = parse("[[mounts]]\nsource = \"~/src/a\"\n");
+
+        let msg = repos_removed_errors(&[(&legacy, global_path), (&legacy, project_path)])
+            .expect("two legacy files must be reported");
+        assert!(
+            msg.contains("/home/u/.pall8t/config.toml")
+                && msg.contains("/proj/.pall8t/config.toml"),
+            "both paths must appear, or the second one is a surprise on the next \
+             run: {msg}"
+        );
+
+        let one = repos_removed_errors(&[(&migrated, global_path), (&legacy, project_path)])
+            .expect("one legacy file must still be reported");
+        assert!(
+            !one.contains("/home/u/.pall8t/config.toml"),
+            "a migrated file must not be named as a problem: {one}"
+        );
+
+        assert_eq!(
+            repos_removed_errors(&[(&migrated, global_path), (&migrated, project_path)]),
+            None,
+            "nothing legacy, nothing to say"
         );
     }
 
