@@ -64,6 +64,7 @@ apple/container **1.2.0 or newer**. Below that, `Parser.allEnv` expanded a bare 
 
 - On `run`, compare the Containerfile hash against the last build; if it changed, build before launching
 - `container.watch` extends the same hash with a list of extra project files (literal paths, no globs; a project Containerfile is required) so editing a file the Containerfile `COPY`s in — e.g. a lockfile — also triggers a rebuild; a listed file that doesn't exist is a hard error, never silently hashed as empty
+- A project Containerfile (`container.containerfile` or `.pall8t/Containerfile`) builds with the **project directory** as the build context, so `COPY` paths are relative to the project root and reach the files `container.watch` tracks (ADR-0010); the shared default image builds from `~/.pall8t`
 - On build failure, do not launch the agent; exit non-zero
 - `pall8t build` performs an explicit build
 - Build output streams live to stderr by default (not captured/hidden), kept off pall8t's own stdout so `built <tag>` and `ls --json` stay machine-readable

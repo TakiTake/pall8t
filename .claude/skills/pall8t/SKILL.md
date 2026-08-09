@@ -19,7 +19,7 @@ You are running inside a Linux VM (apple/container) launched by **pall8t**, a he
 
 ## Developing pall8t itself
 
-The pall8t repo ships `.pall8t/Containerfile` — the default probe pall8t resolves to for its own sandbox — so a sandbox launched in that repo already has Rust (`cargo`, `clippy`, `rustfmt` at `/usr/local/cargo/bin`). Build checks:
+The pall8t repo ships `.pall8t/Containerfile` — the default probe pall8t resolves to for its own sandbox — so a sandbox launched in that repo already has Rust (`cargo`, `clippy`, `rustfmt` at `/usr/local/rust/bin`, provisioned from the repo-top nix flake at image build time). Build checks:
 
 ```sh
 cargo check
@@ -27,7 +27,7 @@ cargo clippy -- -D warnings && cargo fmt --check
 cargo test
 ```
 
-(`mise` is not installed in the container; run cargo directly.) Requirements: `docs/requirements.md`; decisions in `docs/adr/`. Keep both updated when you change architecture-relevant behavior.
+(Run cargo directly; the toolchain version comes from `flake.lock`, and editing `flake.nix`/`flake.lock` triggers an image rebuild on the next `pall8t run`.) Requirements: `docs/requirements.md`; decisions in `docs/adr/`. Keep both updated when you change architecture-relevant behavior.
 
 ## Being a good sandbox citizen
 

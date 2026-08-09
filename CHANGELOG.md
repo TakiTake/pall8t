@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A project Containerfile now builds with the project directory as its
+  build context** (ADR-0010), instead of the Containerfile's own directory.
+  `COPY` paths resolve relative to the project root, so a
+  `.pall8t/Containerfile` can bake in repo-top files — e.g. the
+  `flake.nix`/`flake.lock` a `container.watch` entry tracks — and rebuild
+  when they change. The shared default image still builds from `~/.pall8t`.
+  A Containerfile that `COPY`d paths relative to `.pall8t/` must adjust
+  them; projects with a large tree can add a `<containerfile>.dockerignore`
+  next to their Containerfile (the location apple/container reads ignore
+  patterns from) to keep the context small.
+- pall8t's own dev toolchain is now pinned by a nix flake at the repo top
+  (`flake.nix` + `flake.lock`) instead of `mise.toml`: `nix develop` on the
+  host and the dev-container image (`.pall8t/Containerfile`) both provision
+  Rust from the same lock file.
+
 ## [0.4.0] - 2026-08-09
 
 ### Added

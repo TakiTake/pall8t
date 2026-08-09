@@ -389,7 +389,11 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 # Containerfile used for this project's image. Default (usually no need to
 # set this): .pall8t/Containerfile if present, else the built-in default
 # image. Only set this to point somewhere else — relative to the project
-# dir (absolute paths and ~ also work):
+# dir (absolute paths and ~ also work). A project Containerfile builds with
+# the project directory as its build context, so COPY paths are relative to
+# the project root; if the tree is large, add ignore patterns in
+# <containerfile>.dockerignore, next to and named after the Containerfile
+# (the location apple/container reads them from):
 # containerfile = "path/to/other/Containerfile"
 #
 # Extra project files whose contents also decide whether to rebuild the

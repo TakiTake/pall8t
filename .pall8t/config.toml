@@ -3,6 +3,12 @@
 # sandbox needs Rust, which comes from .pall8t/Containerfile — the default
 # probe, so it doesn't need to be named here explicitly.
 
+[container]
+# The Containerfile COPYs the repo-top flake files and installs the Rust
+# toolchain they pin (via nix), so editing either must rebuild the image
+# rather than silently reusing a stale toolchain.
+watch = ["flake.nix", "flake.lock"]
+
 # Upstreams this project reads but must never modify: pall8t wraps
 # apple/container's CLI and bridges to herdr, and both questions ("what
 # does the runtime actually do here?", "what shape does herdr expect?")

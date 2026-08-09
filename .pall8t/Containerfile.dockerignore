@@ -1,0 +1,12 @@
+# pall8t builds .pall8t/Containerfile with the project root as the build
+# context (ADR-0010) so the Containerfile can COPY the repo-top flake files.
+# Keep the context down to roughly what that COPY needs — without this,
+# target/ (gigabytes) would be shipped to the builder on every image build.
+#
+# apple/container reads the ignore file from `<containerfile>.dockerignore`,
+# next to the Containerfile named after it (BuildCommand.swift) — NOT from a
+# `.dockerignore` at the context root, where docker would also look.
+# Patterns are still relative to the context root (the project dir).
+*
+!flake.nix
+!flake.lock
