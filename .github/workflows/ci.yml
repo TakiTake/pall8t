@@ -28,3 +28,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # Catches a Cargo.toml version with no matching CHANGELOG section on
+      # every push, instead of in release.yml against a tag that is already
+      # public and cannot be pushed over. Runs the same script release.yml
+      # runs, on both runners.
+      - name: CHANGELOG has a section for the current version
+        run: scripts/release-notes.sh "$(cargo pkgid | sed 's/.*[@#]//')" > /dev/null
