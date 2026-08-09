@@ -42,13 +42,13 @@ pub(crate) fn sha256_hex_prefix(bytes: &[u8], n: usize) -> String {
         })
 }
 
-/// pall8t-<path key of cwd>-<pid> (see [`crate::repos::path_key`]). The
+/// pall8t-<path key of cwd>-<pid> (see [`crate::util::path_key`]). The
 /// pid keeps parallel runs from the same directory from colliding on
 /// `--name`.
 pub fn run_name(workspace: &Path) -> String {
     format!(
         "pall8t-{}-{}",
-        crate::repos::path_key(workspace),
+        crate::util::path_key(workspace),
         std::process::id()
     )
 }
@@ -530,6 +530,7 @@ pub fn build_image(
 
 /// One bind mount of a [`RunSpec`], rendered as `--mount` by
 /// [`run_argv`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
     pub host: PathBuf,
     pub dest: PathBuf,
@@ -540,6 +541,15 @@ pub struct Mount {
 }
 
 impl Mount {
+    /// Explicit constructor for callers that already know all three.
+    pub fn new(host: PathBuf, dest: PathBuf, readonly: bool) -> Self {
+        Mount {
+            host,
+            dest,
+            readonly,
+        }
+    }
+
     /// Identity-path mount, writable: `host` is visible at the same
     /// absolute path inside the container, so git metadata and path
     /// references stay valid on both sides (ADR-0004's insight, retained
@@ -883,7 +893,7 @@ mod tests {
 
     /// Regression pin for the 1.2.0 name cap: a workspace whose basename is
     /// far longer than the whole budget still has to produce a runnable
-    /// `--name`. Before the [`crate::repos`] slug cap this ran on 1.0.0 and
+    /// `--name`. Before the [`crate::util`] slug cap this ran on 1.0.0 and
     /// died on 1.2.0.
     #[test]
     fn run_name_stays_within_the_container_name_cap() {

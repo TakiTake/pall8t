@@ -2,3 +2,10 @@
 # is the embedded default sandbox image (no Rust toolchain); this project's
 # sandbox needs Rust, which comes from .pall8t/Containerfile — the default
 # probe, so it doesn't need to be named here explicitly.
+[[repos]]
+source = "~/ghq/github.com/apple/container"
+readonly = true
+
+[[repos]]
+source = "~/ghq/github.com/herdrdev/herdr"
+readonly = true

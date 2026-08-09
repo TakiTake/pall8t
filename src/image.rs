@@ -1,6 +1,6 @@
 use crate::{
     config::{self, Config},
-    container, repos,
+    container, util,
 };
 use anyhow::{anyhow, Context, Result};
 use std::path::{Component, Path, PathBuf};
@@ -75,7 +75,7 @@ pub fn resolve(cwd: &Path, cfg: &Config, uid: u32, gid: u32) -> Result<ResolvedI
 /// default image.
 fn probe_containerfile(cwd: &Path, cfg: &Config) -> Result<Option<(PathBuf, String)>> {
     if let Some(p) = &cfg.containerfile {
-        let p = repos::expand_tilde(p);
+        let p = util::expand_tilde(p);
         let p = if p.is_absolute() { p } else { cwd.join(p) };
         if !p.is_file() {
             return Err(anyhow!(
@@ -323,7 +323,7 @@ fn hash_with_retry(containerfile: &Path, watch: &[WatchFile]) -> Result<String> 
 }
 
 fn project_base(cwd: &Path) -> String {
-    format!("pall8t-{}", repos::path_key(cwd))
+    format!("pall8t-{}", util::path_key(cwd))
 }
 
 /// Resolves and, if no image for the current Containerfile content exists,
@@ -505,7 +505,7 @@ mod tests {
             containerfile,
             watch: vec![],
             command: vec!["claude".to_string()],
-            repos: vec![],
+            mounts: vec![],
             deprecations: vec![],
             herdr: crate::config::HerdrConfig::default(),
         }

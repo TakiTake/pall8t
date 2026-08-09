@@ -9,46 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`[[repos]] readonly = true` mounts a reference repo read-only**
-  instead of duplicating it (ADR-0009): the real checkout appears at its
-  own absolute path inside the container and the runtime refuses every
-  write to it, so the agent reads the actual repository and cannot change
-  it. apple/container's read-only mounts turned out to have landed before
-  1.0.0 ever shipped — pall8t had been carrying a workaround for a
-  limitation no supported version had — and enforcement is verified on
-  1.2.2.
-  - **Opt-in; nothing changes unless you ask.** The default stays
-    `false`: a `git clone --local` copy mounted at the source's path,
-    exactly as before, `origin` rewrite included. Making read-only the
-    default would have turned every `git fetch` an existing agent runs
-    inside a reference repo into a `Read-only file system` error,
-    mid-session, on a machine whose config nobody edited.
-  - `pall8t run --repos-readonly[=BOOL]` overrides every entry for one
-    run — handy for trying it before committing to it. Precedence is
-    flag, then entry, then the default. A misspelled `readonly` key now
-    fails the config parse rather than silently falling back.
-  - An entry that opts in creates no clone at all: no disk, no first-run
-    `git clone --local`, and nothing that can go stale against its
-    source. `~/.pall8t/repos` is only created when some entry actually
-    needs a copy, and existing clones there are left alone.
-  - Each run prints which protection each repo got, since the two modes
-    differ in what the agent may do. Passing `--repos-readonly` with no
-    `[[repos]]` configured warns that it has no effect, rather than
-    looking like it did something: the flag governs reference repos
-    only, and the workspace and container home are always writable.
-  - A read-only entry that is a **linked git worktree** also gets its main
-    repository's `.git` mounted read-only, the same way `pall8t run`
-    already handles a worktree workspace (FR-3). Without it the sandbox
-    would see a directory git cannot read as a repository at all, since
-    such a worktree's `.git` is a pointer file naming a path outside the
-    source.
-  - Read-only mounts arrive inside the container owned by root rather
-    than by the host user (apple/container applies its uid mapping only
-    to writable mounts), which makes git refuse them with "detected
-    dubious ownership". pall8t marks exactly the paths it mounted
-    read-only as git `safe.directory` via `GIT_CONFIG_*`, so `git log`
-    and `git status` work in a reference repo with no setup. Nothing
-    else's ownership check is relaxed.
+- **`[[mounts]]` — mount any host directory into the sandbox**
+  (ADR-0009), replacing `[[repos]]`. A mount is literal: the directory
+  named by `source` appears inside the container at `target`, writable
+  unless `readonly = true`. No cloning, no git requirement.
+
+  ```toml
+  [[mounts]]
+  source = "~/notes"       # any directory, git repo or not
+  target = "/notes"        # optional; defaults to the source's own path
+  readonly = true          # optional; defaults to false
+  ```
+
+  - `readonly = true` mounts the real directory read-only and the runtime
+    refuses every write — how you give an agent a checkout it may read
+    and must not change. apple/container's read-only mounts turned out to
+    have landed before 1.0.0 ever shipped, so pall8t had been cloning to
+    work around a limitation no supported version had; enforcement is
+    verified on 1.2.2.
+  - `pall8t run --readonly[=BOOL]` overrides every entry for one run.
+    Precedence is flag, then entry, then the default. Passing it with no
+    `[[mounts]]` configured warns that it has no effect, rather than
+    looking like it did something.
+  - `target` defaults to `source`, so absolute paths keep meaning the
+    same thing on both sides. Note `~` expands **host-side**: `~/x` lands
+    at `/Users/you/x` inside the container, not `/home/dev/x`.
+  - A target may not cover the workspace, a worktree's `.git`, or the
+    container home, and two targets may not cover each other. Hiding the
+    home would take out the agent's own config and session history.
+  - A linked git worktree mounted at its own path also gets its main
+    repository's `.git` mounted, same mode, so git can resolve it —
+    otherwise the sandbox sees a directory git cannot read as a
+    repository at all.
+  - Read-only mounts arrive owned by root rather than by the host user
+    (apple/container applies its uid mapping only to writable mounts),
+    which makes git refuse them with "detected dubious ownership".
+    pall8t marks exactly those targets as git `safe.directory` via
+    `GIT_CONFIG_*`, so `git log` and `git status` work with no setup.
+    Nothing else's ownership check is relaxed.
 
 ### Changed
 
@@ -71,6 +69,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing.
 
 ### Removed
+
+- **`[[repos]]` is gone** — replaced by `[[mounts]]` (ADR-0009).
+  **Breaking:** a config still declaring it fails to load, with a message
+  naming the replacement.
+
+  This is deliberately not auto-translated. `[[repos]] source = X`
+  mounted a `git clone --local` *copy* of X, so an agent's writes never
+  reached your checkout; `[[mounts]] source = X` mounts X itself, where
+  the same writes land on your files. Mapping one to the other would pick
+  a protection level on your behalf — weaker than you had, or stricter
+  than you chose. Reference material that used to rely on the copy for
+  protection wants `readonly = true`:
+
+  ```toml
+  [[mounts]]
+  source = "~/src/lib"
+  readonly = true
+  ```
+
+  Clones under `~/.pall8t/repos` are no longer read or written by pall8t
+  and can be deleted. Note anything an agent committed inside one lives
+  there and nowhere else — check before removing it.
 
 - The experimental home compositor (`[home] mode = "isolated"`) and the
   whole `pall8t home` command family (harvest, inbox, show, promote,

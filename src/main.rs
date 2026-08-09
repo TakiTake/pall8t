@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use pall8t::{config, container, herdr, image, repos, worktree};
+use pall8t::{config, container, herdr, image, mounts, worktree};
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Run AI coding agents in apple/container sandboxes. Headless: pall8t is
 /// a well-behaved foreground CLI for tmux/herdr to spawn — TTY
@@ -22,11 +22,11 @@ enum Cmd {
     /// Rebuild the image if the Containerfile changed, then run the agent
     /// in the sandbox (foreground, cwd mounted as the workspace)
     Run {
-        /// Mount reference repos read-only, overriding `readonly` on
-        /// every [[repos]] entry. `--repos-readonly=false` forces the
-        /// default instead: a writable copy of each
+        /// Mount every [[mounts]] entry read-only for this run,
+        /// overriding each entry's own `readonly`. `--readonly=false`
+        /// forces them all writable instead
         #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
-        repos_readonly: Option<bool>,
+        readonly: Option<bool>,
         /// Command to run instead of the configured one (after --)
         #[arg(last = true)]
         command: Vec<String>,
@@ -97,10 +97,7 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Init => cmd_init(),
-        Cmd::Run {
-            repos_readonly,
-            command,
-        } => cmd_run(command, repos_readonly),
+        Cmd::Run { readonly, command } => cmd_run(command, readonly),
         Cmd::Build => cmd_build(),
         Cmd::Ls { json } => cmd_ls(json),
         Cmd::Exec { id, command } => cmd_exec(&id, &command),
@@ -232,7 +229,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(cli_command: Vec<String>, repos_readonly: Option<bool>) -> Result<()> {
+fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
     let (cwd, cfg, uid, gid, resolved) = workspace_image(false)?;
     let run_name = container::run_name(&cwd);
 
@@ -244,23 +241,25 @@ fn cmd_run(cli_command: Vec<String>, repos_readonly: Option<bool>) -> Result<()>
         );
         mounts.push(container::Mount::identity(git_dir));
     }
-    // The live identity-mounted paths assembled so far (cwd, worktree git
-    // dir) are exactly what a reference-repo mount must never shadow.
-    let protected: Vec<_> = mounts.iter().map(|m| m.host.clone()).collect();
-    if let Some(msg) = repos::no_repos_warning(repos_readonly, cfg.repos.len()) {
+    let home_dest = PathBuf::from("/home/dev");
+    // Container-side paths this run is built on, which no configured mount
+    // may cover: the workspace, a worktree's git directory, and the home —
+    // hiding the home would take out the agent's own config and session
+    // history. Compared against mount *targets*, since that is where a
+    // mount actually lands.
+    let mut protected: Vec<_> = mounts.iter().map(|m| m.dest.clone()).collect();
+    protected.push(home_dest.clone());
+    if let Some(msg) = mounts::no_mounts_warning(readonly, cfg.mounts.len()) {
         eprintln!("{msg}");
     }
-    for rm in repos::prepare(&cfg.repos, &protected, repos_readonly)? {
-        eprintln!("pall8t: {}", rm.describe());
-        mounts.extend(rm.mounts());
+    for m in mounts::resolve(&cfg.mounts, &protected, readonly)? {
+        eprintln!("pall8t: {}", mounts::describe(&m));
+        mounts.push(m);
     }
-    mounts.push(container::Mount::rw(
-        container::home_mount()?,
-        "/home/dev".into(),
-    ));
+    mounts.push(container::Mount::rw(container::home_mount()?, home_dest));
     // A read-only mount arrives inside the container owned by root rather
     // than the host user, so git refuses to read it until each such path is
-    // marked safe (see `repos::safe_directory_env`).
+    // marked safe (see `mounts::safe_directory_env`).
     let readonly_paths: Vec<_> = mounts
         .iter()
         .filter(|m| m.readonly)
@@ -282,7 +281,7 @@ fn cmd_run(cli_command: Vec<String>, repos_readonly: Option<bool>) -> Result<()>
     // The bridge (ADR-0007) makes the herdr CLI work inside the sandbox:
     // relay + env + Linux binary mount + bootstrap wrap. Best-effort — a
     // bridge failure warns and the run proceeds without it.
-    let mut env_vars = repos::safe_directory_env(&readonly_paths);
+    let mut env_vars = mounts::safe_directory_env(&readonly_paths);
     if let Some(env) = &herdr_env {
         match herdr::prepare_bridge(env, cfg.herdr.sandbox, &run_name) {
             Ok(Some(bridge)) => {

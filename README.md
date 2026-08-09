@@ -15,7 +15,7 @@ Run AI coding agents inside [apple/container](https://github.com/apple/container
 - **Host non-pollution.** `~/.pall8t/home` is mounted as the container home — the agent's login and config live there, and your host `~/.claude` is never touched.
 - **Automatic rebuilds, no daemon.** At `run` time the Containerfile's content hash picks the image tag; a change means a rebuild before launch. No watch process, no state file.
 - **Worktree-aware.** If your cwd is a git worktree, the main repository's `.git` is mounted too, so git inside the container works exactly as on the host.
-- **Reference repos, protected two ways.** Repos listed in config appear at their own absolute path inside the container. By default the agent gets a `git clone --local` copy at that path — it may commit and fetch, and the original is untouched; the copy lives under `~/.pall8t/repos` and is reused by later runs, so work in it persists until you delete it. Set `readonly = true` on an entry and the real checkout is mounted instead, with the runtime refusing every write: stronger protection, no copy, nothing that can go stale ([ADR-0009](docs/adr/0009-readonly-reference-mounts.md)).
+- **Mount anything the agent should see.** `[[mounts]]` puts any host directory inside the container — a reference checkout, a notes folder, a dataset. It lands at its own absolute path by default, so paths mean the same thing on both sides, or at a `target` you choose. `readonly = true` hands it over read-only and the runtime refuses every write, which is how you let an agent read a checkout it must not change ([ADR-0009](docs/adr/0009-explicit-mounts.md)).
 
 ## Requirements
 
@@ -69,15 +69,15 @@ memory = "8g"
 command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
                          # Users who want it must set it explicitly.
 
-[[repos]]                     # reference repos, mounted at this same path
-source = "~/src/other-lib"    # inside the container
-# readonly = false            # default: a writable `git clone --local` copy,
-                              # kept under ~/.pall8t/repos and reused by
-                              # later runs. true mounts the real checkout
-                              # read-only instead — no copy, no writes.
+[[mounts]]                    # any host directory, git repo or not
+source = "~/src/other-lib"
+# target = "/src/other-lib"   # optional; defaults to the source's own path
+# readonly = true             # optional; defaults to false (writable)
 ```
 
-Override for a single run without editing the file: `pall8t run --repos-readonly` (or `--repos-readonly=false` to force the default). The flag wins over every entry's own setting.
+Override for a single run without editing the file: `pall8t run --readonly` (or `--readonly=false` to force them all writable). The flag wins over every entry's own setting.
+
+Note that `~` expands on the **host**, and an identity mount lands at that same absolute path inside the container — `~/src/other-lib` is `/Users/you/src/other-lib` in the sandbox, not `/home/dev/src/other-lib`. Set `target` if you want it somewhere friendlier.
 
 ### Customizing the Containerfile
 
@@ -130,7 +130,7 @@ then, inside the container (one-time, persists in the container home), add `"tea
 ## Known limitations (v1)
 
 - **Shared home under parallel runs.** All containers share `~/.pall8t/home` rw; Claude Code has known `~/.claude.json` corruption issues under concurrent sessions — the same conditions as parallel agents on the host. The experimental per-run home fork that 0.3.0 offered as a way out (`[home] mode = "isolated"`) was removed for lack of use — see [ADR-0008](docs/adr/0008-drop-home-compositor.md). A leftover `[home]` section is now ignored with a warning; if you actually ran isolated mode, fold pending runs in with `pall8t home merge` **before** upgrading, since nothing after the upgrade can read them (see the [CHANGELOG](CHANGELOG.md)).
-- **A reference repo's writable copy drifts from its source.** The default `git clone --local` copy under `~/.pall8t/repos` is reused across runs, never refreshed, so it ages until you delete it. `readonly = true` avoids that entirely by mounting the real checkout — at the cost of the agent not being able to fetch or commit in it.
+- **A writable mount is the real directory.** `[[mounts]]` no longer clones anything, so an agent can modify what you mount unless you set `readonly = true`. Mount reference material read-only; mount only what you're willing to have changed.
 - **Workspace isolation is the caller's responsibility.** Two agents in the same directory will step on each other; use worktrees.
 
 Full requirements in [docs/requirements.md](docs/requirements.md); architecture decisions in [docs/adr/](docs/adr/); release process in [docs/release.md](docs/release.md).

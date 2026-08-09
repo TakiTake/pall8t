@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::os::fd::AsFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Runs `program` with `args`, capturing stdout. A spawn failure or
@@ -88,9 +88,140 @@ pub fn ensure_file(path: &Path, content: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Expands a leading `~` against the host's home directory. Config paths
+/// are written the way a user types them; every consumer needs the real
+/// path.
+pub fn expand_tilde(path: &Path) -> PathBuf {
+    if let Ok(rest) = path.strip_prefix("~") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Lowercase, ASCII-alphanumeric-or-dash rendering of `name`, trimmed of
+/// leading/trailing dashes. `"workspace"` when nothing survives.
+pub fn slug(name: &str) -> String {
+    let s: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed = s.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "workspace".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Longest slug a [`path_key`] carries. apple/container 1.2.0 rejects any
+/// container name longer than 63 characters (`ManagedContainer.nameValid`,
+/// apple/container#1956); 1.0.0 checked the shape only, so a workspace with
+/// a long basename ran there and fails here. [`crate::container::run_name`]
+/// spends 7 characters on `pall8t-`, 9 on the `-` and the hash, and one
+/// more `-` before the pid, so a 32-character slug leaves 14 digits of pid
+/// headroom against the cap — far more than any OS hands out.
+const SLUG_MAX: usize = 32;
+
+/// Stable short key for a path: `<slug(basename)>-<sha256(path)[..8hex]>`,
+/// the slug capped at [`SLUG_MAX`]. The hash keeps two paths sharing a
+/// basename distinct — and carries that uniqueness by itself, so capping
+/// the slug costs readability, never correctness. Shared by container names
+/// and image tag bases so the derivation can't drift between them.
+pub(crate) fn path_key(path: &Path) -> String {
+    let name = path.file_name().map_or_else(
+        || "workspace".to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    format!(
+        "{}-{}",
+        capped_slug(&name),
+        crate::container::sha256_hex_prefix(path.to_string_lossy().as_bytes(), 4)
+    )
+}
+
+/// [`slug`], cut to [`SLUG_MAX`]. Counted in `char`s, the way
+/// apple/container counts them (`name.count`, over Swift Characters) — the
+/// slug is ASCII either way, so the two agree. A cut landing inside a run
+/// of `-` would leave `--` in front of the hash, so the tail is re-trimmed;
+/// `slug` trims both ends, so the slug starts with an alphanumeric and at
+/// least that first character always survives.
+fn capped_slug(name: &str) -> String {
+    let s = slug(name);
+    if s.chars().count() <= SLUG_MAX {
+        return s;
+    }
+    s.chars()
+        .take(SLUG_MAX)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slug_table() {
+        assert_eq!(slug("My Repo"), "my-repo");
+        assert_eq!(slug("--x--"), "x");
+        assert_eq!(slug(""), "workspace");
+        assert_eq!(slug("日本語"), "workspace");
+    }
+
+    #[test]
+    fn capped_slug_table() {
+        let at_cap = "a".repeat(SLUG_MAX);
+        assert_eq!(
+            capped_slug(&at_cap),
+            at_cap,
+            "a slug exactly at the cap is untouched"
+        );
+        assert_eq!(
+            capped_slug(&format!("{at_cap}b")),
+            at_cap,
+            "one character over is cut to the cap"
+        );
+        assert_eq!(
+            capped_slug("short-name"),
+            "short-name",
+            "the common case must round-trip byte for byte — capping may not \
+             churn existing image tags and clone dirs"
+        );
+
+        // The cut lands inside the run of dashes `slug` left behind for the
+        // spaces, which would otherwise put `--` in front of the hash.
+        let cut_on_a_dash = format!("{}   tail", "a".repeat(SLUG_MAX - 1));
+        assert_eq!(
+            capped_slug(&cut_on_a_dash),
+            "a".repeat(SLUG_MAX - 1),
+            "a cut landing in a run of separators must not leave a trailing dash"
+        );
+    }
+
+    #[test]
+    fn path_key_is_bounded_and_still_separates_paths() {
+        let long = "a-very-long-workspace-directory-name-".repeat(6);
+        let a = Path::new("/Users/me/one").join(&long);
+        let b = Path::new("/Users/me/two").join(&long);
+
+        for p in [&a, &b] {
+            assert!(
+                path_key(p).chars().count() <= SLUG_MAX + 1 + 8,
+                "the key is the capped slug, a dash, and 8 hex characters: {}",
+                path_key(p)
+            );
+        }
+        assert_ne!(
+            path_key(&a),
+            path_key(&b),
+            "two paths sharing a truncated basename must stay distinct — the \
+             hash is what carries uniqueness once the slug is cut"
+        );
+    }
 
     // The property that actually matters here — a child's stdout lands on
     // *our* stderr, never on our real stdout — isn't safely testable
