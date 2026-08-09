@@ -14,22 +14,23 @@ instead.
 
 ## 1. (agent) Preflight and release-prep PR
 
-- Confirm `main` is clean and CI is green (`gh run list --branch main --limit 1`).
-- Decide the version (`$VERSION`, e.g. `0.2.0`) — from this skill's argument
-  if given, otherwise ask.
-- In a worktree (`.claude/worktrees/release-$VERSION`, branch
-  `chore/release-$VERSION`):
-  - Bump `Cargo.toml`'s `version`, run `cargo check` so `Cargo.lock` picks it up.
-  - Add a `CHANGELOG.md` section — `## [$VERSION] - YYYY-MM-DD` summarizing
-    what actually shipped since the last release (don't fabricate history),
-    plus its link-reference footer entry
-    (`[$VERSION]: .../releases/tag/v$VERSION`). The `## [x.y.z] - ` heading
-    format is not just style — `release.yml` parses it verbatim to extract
-    release notes; changing the format here means updating the workflow too.
-  - Run the quality gates from `CLAUDE.md` (fmt/clippy/test, both targets).
-  - Run the review loop (`/code-review`, `/skeptical-review`); fix findings;
-    repeat until both come back clean.
-  - Push, open a PR, report the PR number. **Do not merge it.**
+Run **`/bump $VERSION`** — it owns this step: version resolution (including
+what a pre-1.0 breaking change means for the number), preflight, the
+`Cargo.toml`/`Cargo.lock`/`CHANGELOG.md` edits, a check that `release.yml`'s
+extractor will actually find the notes, the quality gates, and the PR.
+
+Kept there rather than repeated here so the two can't drift — the changelog
+heading format is parsed verbatim by `release.yml`, and one description of
+it is enough.
+
+Two things this skill adds on top:
+
+- Decide `$VERSION` from this skill's argument if given, otherwise ask
+  before invoking `/bump`.
+- After `/bump` opens the PR, run the review loop (`/code-review`,
+  `/skeptical-review`) and fix findings until both come back clean.
+
+**Do not merge the PR.**
 
 ## 2. (user) Merge and tag
 
