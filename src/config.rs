@@ -764,7 +764,7 @@ mod tests {
 
     /// Both files at once, not one per run: a user with the section in the
     /// global *and* the project config would otherwise fix one, rerun, and
-    /// only then hear about the other (CodeRabbit, PR #46).
+    /// only then hear about the other (`CodeRabbit`, PR #46).
     #[test]
     fn both_legacy_config_files_are_reported_together() {
         let global_path = Path::new("/home/u/.pall8t/config.toml");

@@ -53,8 +53,7 @@ fn covering_mount(mounts: &[Mount], protected: &[PathBuf], path: &Path) -> Optio
     let m = mounts.iter().find(|m| path.starts_with(&m.dest))?;
     let reached = path
         .strip_prefix(&m.dest)
-        .map(|rest| m.host.join(rest))
-        .unwrap_or_else(|_| m.host.clone());
+        .map_or_else(|_| m.host.clone(), |rest| m.host.join(rest));
     Some(if reached == path {
         Coverage::SamePath
     } else {
@@ -449,7 +448,7 @@ mod tests {
     /// `canonicalize` accepts a regular file, and apple/container only
     /// objects while starting the container — after a build, and after
     /// pall8t has already printed a mount line saying it worked
-    /// (CodeRabbit, PR #46).
+    /// (`CodeRabbit`, PR #46).
     #[test]
     fn resolve_rejects_a_file_as_a_source() {
         let dir = tmp_dir("file-source");
@@ -470,7 +469,7 @@ mod tests {
     /// `~` in a *target* would mean the container's home, not the host's,
     /// so expanding it host-side produced a `/Users/...` path on the wrong
     /// side of the boundary — silently, and differently per machine
-    /// (CodeRabbit, PR #46).
+    /// (`CodeRabbit`, PR #46).
     #[test]
     fn resolve_does_not_expand_tilde_in_a_target() {
         let dir = tmp_dir("tilde-target");
@@ -500,7 +499,7 @@ mod tests {
     /// worktree would nest a `.git` mount inside the checkout's mount —
     /// and with differing modes, land a read-only `.git` inside a writable
     /// checkout, breaking commits there for a reason nothing in the config
-    /// hints at (CodeRabbit, PR #46).
+    /// hints at (`CodeRabbit`, PR #46).
     #[test]
     fn resolve_does_not_nest_a_git_dir_inside_an_existing_mount() {
         let root = tmp_dir("nested-gitdir");
@@ -560,7 +559,7 @@ mod tests {
         // main `.git`. The second must not emit a duplicate mount: two
         // virtiofs entries with the same source and target are at best
         // redundant and are rejected outright by some runtime versions
-        // (CodeRabbit, PR #46).
+        // (`CodeRabbit`, PR #46).
         let second = root.join("linked2");
         git(&[
             "-C",
