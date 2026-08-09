@@ -17,12 +17,27 @@ set -eu
 VERSION="${1:?usage: release-notes.sh <version> [changelog-path]}"
 CHANGELOG="${2:-CHANGELOG.md}"
 
-# The heading format is a contract, not a style choice: matched from the
-# start of the line, with the " - " before the date. `## [1.2.3]` with no
-# date, or extra leading space, matches nothing.
+# The heading format is a contract, not a style choice, and this enforces
+# all of it: `## [<version>] - YYYY-MM-DD`, matched from the start of the
+# line. A prefix match alone would accept `## [1.2.3] -` with no date and
+# `## [1.2.3] -nonsense`, publishing a release from a heading the format
+# says is malformed. `## [1.2.3]` with no date, or extra leading space,
+# matches nothing.
 NOTES="$(
   awk -v verline="## [$VERSION] -" '
-    /^## \[/ { if (found) exit; if (index($0, verline) == 1) { found = 1; next } }
+    /^## \[/ {
+      if (found) exit
+      if (index($0, verline) == 1) {
+        rest = substr($0, length(verline) + 1)
+        # " YYYY-MM-DD", trailing blanks tolerated. Digits spelled out
+        # rather than {4}: interval expressions are not portable across
+        # the awks this runs on (GNU on CI ubuntu, BWK on macOS).
+        if (rest ~ /^ [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] *$/) {
+          found = 1
+          next
+        }
+      }
+    }
     found { print }
   ' "$CHANGELOG" |
     # Drop the link-reference footer, then trim leading blank lines.
