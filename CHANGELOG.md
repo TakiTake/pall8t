@@ -7,8 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`[[mounts]]` — mount any host directory into the sandbox**
+  (ADR-0009), replacing `[[repos]]`. A mount is literal: the directory
+  named by `source` appears inside the container at `target`, writable
+  unless `readonly = true`. No cloning, no git requirement.
+
+  ```toml
+  [[mounts]]
+  source = "~/notes"       # any directory, git repo or not
+  target = "/notes"        # optional; defaults to the source's own path
+  readonly = true          # optional; defaults to false
+  ```
+
+  - `readonly = true` mounts the real directory read-only and the runtime
+    refuses every write — how you give an agent a checkout it may read
+    and must not change. apple/container's read-only mounts turned out to
+    have landed before 1.0.0 ever shipped, so pall8t had been cloning to
+    work around a limitation no supported version had; enforcement is
+    verified on 1.2.2.
+  - `pall8t run --readonly[=BOOL]` overrides every entry for one run.
+    Precedence is flag, then entry, then the default. Passing it with no
+    `[[mounts]]` configured warns that it has no effect, rather than
+    looking like it did something.
+  - `target` defaults to `source`, so absolute paths keep meaning the
+    same thing on both sides. Note `~` expands **host-side**: `~/x` lands
+    at `/Users/you/x` inside the container, not `/home/dev/x`.
+  - A target may not cover the workspace, a worktree's `.git`, or the
+    container home, and two targets may not cover each other. Hiding the
+    home would take out the agent's own config and session history.
+  - A linked git worktree mounted at its own path also gets its main
+    repository's `.git` mounted, same mode, so git can resolve it —
+    otherwise the sandbox sees a directory git cannot read as a
+    repository at all.
+  - Read-only mounts arrive owned by root rather than by the host user
+    (apple/container applies its uid mapping only to writable mounts),
+    which makes git refuse them with "detected dubious ownership".
+    pall8t marks exactly those targets as git `safe.directory` via
+    `GIT_CONFIG_*`, so `git log` and `git status` work with no setup.
+    Nothing else's ownership check is relaxed.
+
 ### Changed
 
+- Mounts are passed to apple/container as `--mount
+  type=virtiofs,source=…,target=…` rather than `-v host:dest`. Same
+  semantics for every existing mount, but `--mount` directives are
+  validated by the runtime: on 1.2.2 a typo'd `-v src:dst:readonlyy`
+  mounts read-write in silence, while `--mount …,readonlyy` fails the run
+  before it starts. A protection flag must not fail quietly.
 - apple/container **1.2.0 or newer** is now the documented baseline, and
   `pall8t run`/`build`/`ls`/`exec`/`stop` warn once on stderr when the
   installed CLI is older. Older runtimes still work — the warning never
@@ -22,6 +69,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing.
 
 ### Removed
+
+- **`[[repos]]` is gone** — replaced by `[[mounts]]` (ADR-0009).
+  **Breaking:** a config still declaring it fails to load, with a message
+  naming the replacement.
+
+  This is deliberately not auto-translated. `[[repos]] source = X`
+  mounted a `git clone --local` *copy* of X, so an agent's writes never
+  reached your checkout; `[[mounts]] source = X` mounts X itself, where
+  the same writes land on your files. Mapping one to the other would pick
+  a protection level on your behalf — weaker than you had, or stricter
+  than you chose. Reference material that used to rely on the copy for
+  protection wants `readonly = true`:
+
+  ```toml
+  [[mounts]]
+  source = "~/src/lib"
+  readonly = true
+  ```
+
+  Clones under `~/.pall8t/repos` are no longer read or written by pall8t
+  and can be deleted. Note anything an agent committed inside one lives
+  there and nowhere else — check before removing it.
 
 - The experimental home compositor (`[home] mode = "isolated"`) and the
   whole `pall8t home` command family (harvest, inbox, show, promote,
@@ -62,12 +131,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Only paths whose basename slugs past 32 characters are affected, and
     for those the key is shortened, never re-derived: shorter names come
     out byte for byte identical. An affected workspace gets a new image
-    tag base and a new `~/.pall8t/repos/<key>` clone directory, so its
-    next run rebuilds the image once and re-clones the reference repo.
-    Neither predecessor is cleaned up — image pruning is scoped to the
-    current tag base, so the old image and the old clone directory stay
-    until you delete them (`container image delete <old tag>`,
-    `rm -rf ~/.pall8t/repos/<old key>`).
+    tag base, so its next run rebuilds the image once. The old image is
+    not cleaned up — pruning is scoped to the current tag base — so it
+    stays until you delete it (`container image delete <old tag>`).
 
 ## [0.3.0] - 2026-08-01
 

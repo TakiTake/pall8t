@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -15,9 +15,9 @@ pub fn project_path(project_dir: &Path) -> PathBuf {
 /// `~/.pall8t/config.toml` overlaid by the project's `.pall8t/config.toml`
 /// (requirements §5). Merging is per-field: a field the project file sets
 /// wins, one it omits falls through to the global file, then to the
-/// built-in default. `repos` is treated as one field — a project that
-/// declares any `[[repos]]` replaces the global list rather than
-/// appending to it, so a global convenience repo can't force itself into
+/// built-in default. `mounts` is treated as one field — a project that
+/// declares any `[[mounts]]` replaces the global list rather than
+/// appending to it, so a global convenience mount can't force itself into
 /// every project.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -34,7 +34,7 @@ pub struct Config {
     /// path validation and [`crate::image::combined_hash`] for the hash.
     pub watch: Vec<PathBuf>,
     pub command: Vec<String>,
-    pub repos: Vec<RepoEntry>,
+    pub mounts: Vec<MountEntry>,
     /// `[herdr]` — how much of the host herdr session a sandboxed agent
     /// may reach through the relay bridge (see [`crate::relay`]).
     pub herdr: HerdrConfig,
@@ -75,11 +75,38 @@ impl HerdrSandbox {
     }
 }
 
+/// One `[[mounts]]` entry: a host directory made visible inside the
+/// container.
+///
+/// `deny_unknown_fields` for the same reason [`RawHerdr`] has it: these
+/// keys decide whether an agent can write to a real directory, and a
+/// config that misspells one (`read_only`, `dest`) would otherwise be
+/// accepted while pall8t quietly used the default. A user who typed an
+/// intent must never have it dropped in silence.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-pub struct RepoEntry {
-    /// Host path of a reference repository; duplicated via
-    /// `git clone --local` and the copy mounted at this path (FR-4).
+#[serde(deny_unknown_fields)]
+pub struct MountEntry {
+    /// Host path to mount. `~` expands against the host's home.
     pub source: PathBuf,
+    /// Absolute path inside the container. Defaults to `source` itself —
+    /// an identity mount, so absolute paths mean the same thing on both
+    /// sides (git metadata, build output, anything the agent reports).
+    pub target: Option<PathBuf>,
+    /// `true` mounts it read-only and the runtime refuses every write.
+    /// Defaults to `false` (see [`mount_readonly`]).
+    pub readonly: Option<bool>,
+}
+
+/// Whether one mount is read-only, given the entry's own `readonly` and
+/// the `--readonly` override from the command line.
+///
+/// Precedence is the ordinary one — an explicit flag beats a config file,
+/// a config file beats the default — and the default is writable. A mount
+/// primitive that silently refused writes would surprise anyone who did
+/// not ask for it; read-only is the stronger protection and is one word
+/// away (ADR-0009).
+pub fn mount_readonly(entry: &MountEntry, cli_override: Option<bool>) -> bool {
+    cli_override.or(entry.readonly).unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -88,7 +115,13 @@ struct Raw {
     container: RawContainer,
     #[serde(default)]
     run: RawRun,
-    repos: Option<Vec<RepoEntry>>,
+    mounts: Option<Vec<MountEntry>>,
+    /// `[[repos]]` was the previous, git-only form of `[[mounts]]`. Parsed
+    /// as an opaque value purely so [`load`] can fail with a message that
+    /// names the replacement: its semantics do not map onto a mount
+    /// (it cloned the repo and mounted the copy), so honoring it silently
+    /// would give a protection level the user never chose.
+    repos: Option<toml::Value>,
     /// `[home]` selected the experimental isolated-home compositor, since
     /// removed (ADR-0008). Still *parsed* so a config that carries it keeps
     /// loading — its presence only drives the deprecation warning in
@@ -125,8 +158,8 @@ struct RawRun {
 }
 
 /// `~/.pall8t` — the root under which everything pall8t owns lives
-/// (config, container home, default Containerfile, reference-repo
-/// clones). The single place that knows the app-dir location.
+/// (config, container home, default Containerfile). The single place
+/// that knows the app-dir location.
 pub(crate) fn pall8t_root() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("cannot determine home directory")?
@@ -195,6 +228,49 @@ fn deprecations_in(raw: &Raw, path: &Path) -> Vec<String> {
     out
 }
 
+/// Fails when a config file still declares `[[repos]]`, naming the
+/// replacement.
+///
+/// A hard error rather than the parse-and-warn `[home]` gets (ADR-0008),
+/// because the two settings fail differently. An ignored `[home]` left a
+/// feature switched off; an ignored `[[repos]]` would leave a repository
+/// the user believes is mounted absent from the sandbox entirely — and
+/// silently honoring it as a mount would be worse still, since
+/// `[[repos]]` mounted a *clone* and a mount is the real directory. The
+/// old key cannot be translated without choosing a protection level on
+/// the user's behalf, so it asks.
+fn repos_removed_error(raw: &Raw, path: &Path) -> Option<String> {
+    raw.repos.as_ref()?;
+    Some(format!(
+        "[[repos]] in {} is no longer supported — it has been replaced by \
+         [[mounts]], which mounts any directory rather than cloning a git \
+         repository first (ADR-0009).\n\n\
+         Replace each entry:\n\n    \
+         [[repos]]\n    source = \"~/src/lib\"\n\n\
+         with the mount you actually want:\n\n    \
+         [[mounts]]\n    source = \"~/src/lib\"\n    readonly = true   \
+         # the agent reads it and cannot change it\n\n\
+         Note the difference: [[repos]] mounted a disposable `git clone --local` \
+         copy, so writes never reached your checkout. A [[mounts]] entry mounts \
+         the real directory — `readonly = true` is what protects it now. \
+         Any clones under ~/.pall8t/repos are no longer used and can be deleted.",
+        path.display()
+    ))
+}
+
+/// Every config file still declaring `[[repos]]`, in one message.
+///
+/// Reported together rather than one at a time: a user with the section
+/// in both the global and the project file would otherwise fix the first,
+/// rerun, and only then be told about the second.
+fn repos_removed_errors(files: &[(&Raw, &Path)]) -> Option<String> {
+    let msgs: Vec<_> = files
+        .iter()
+        .filter_map(|(raw, path)| repos_removed_error(raw, path))
+        .collect();
+    (!msgs.is_empty()).then(|| msgs.join("\n\n"))
+}
+
 /// Loads the merged config for a project rooted at `project_dir`.
 pub fn load(project_dir: &Path) -> Result<Config> {
     let global_path = global_path()?;
@@ -203,6 +279,14 @@ pub fn load(project_dir: &Path) -> Result<Config> {
     let project = read_raw(&project_path)?.unwrap_or_default();
     // Both files are reported: a user cleaning up needs to know about each
     // one that still carries the section, not just the first found.
+    // Before anything else: a config still on the old key gets a message,
+    // not a run with a mount silently missing.
+    if let Some(msg) = repos_removed_errors(&[
+        (&global, global_path.as_path()),
+        (&project, project_path.as_path()),
+    ]) {
+        return Err(anyhow!(msg));
+    }
     let deprecations = deprecations_in(&global, &global_path)
         .into_iter()
         .chain(deprecations_in(&project, &project_path))
@@ -243,7 +327,7 @@ fn merge(global: Raw, project: Raw) -> Config {
             .command
             .or(global.run.command)
             .unwrap_or_else(|| vec!["claude".to_string()]),
-        repos: project.repos.or(global.repos).unwrap_or_default(),
+        mounts: project.mounts.or(global.mounts).unwrap_or_default(),
         // `[home]` is parsed and ignored; `load` turns its presence into a
         // deprecation message, which `merge` (path-less) can't produce.
         deprecations: Vec::new(),
@@ -270,6 +354,18 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # Command run by `pall8t run`. --dangerously-skip-permissions is NOT in
 # the default; add it here explicitly if you want it.
 # command = ["claude"]
+
+# Directories from the host, made visible inside the container. Mount
+# anything — a reference checkout, a notes folder, a dataset.
+# [[mounts]]
+# source = "~/src/some-library"
+# Where it appears inside the container. Defaults to the same absolute
+# path as the source, so paths mean the same thing on both sides.
+# target = "/src/some-library"
+# Writable by default. true mounts the real directory read-only and the
+# runtime refuses every write to it — the way to let an agent read a
+# checkout it must not change.
+# readonly = false
 
 [herdr]
 # What a sandboxed agent may do to the host herdr session when pall8t runs
@@ -305,6 +401,15 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 
 [run]
 # command = ["claude"]
+
+# Mounts for this project. Declaring any here replaces the global list
+# rather than adding to it.
+# [[mounts]]
+# source = "~/src/some-library"
+# target = "/src/some-library"   # optional; defaults to the source path
+# readonly = true                # optional; defaults to false (writable)
+# Override for one run without editing this file:
+#   pall8t run --readonly
 
 [herdr]
 # sandbox = "full"   # or "readonly" / "off" — see ~/.pall8t/config.toml
@@ -377,7 +482,7 @@ mod tests {
         assert_eq!(cfg.containerfile, None);
         assert!(cfg.watch.is_empty());
         assert_eq!(cfg.command, vec!["claude".to_string()]);
-        assert!(cfg.repos.is_empty());
+        assert!(cfg.mounts.is_empty());
         assert!(cfg.deprecations.is_empty());
         assert_eq!(
             cfg.herdr.sandbox,
@@ -524,25 +629,169 @@ mod tests {
     }
 
     #[test]
-    fn project_repos_replace_global_repos() {
-        let global = parse("[[repos]]\nsource = \"~/src/a\"\n");
-        let project = parse("[[repos]]\nsource = \"~/src/b\"\n");
+    fn project_mounts_replace_global_mounts() {
+        let global = parse("[[mounts]]\nsource = \"~/src/a\"\n");
+        let project = parse("[[mounts]]\nsource = \"~/src/b\"\n");
         let cfg = merge(global, project);
         assert_eq!(
-            cfg.repos,
-            vec![RepoEntry {
-                source: "~/src/b".into()
-            }]
+            cfg.mounts,
+            vec![MountEntry {
+                source: "~/src/b".into(),
+                target: None,
+                readonly: None
+            }],
+            "a project's list replaces the global one rather than appending, so a \
+             global convenience mount can't force itself into every project"
         );
 
-        let global = parse("[[repos]]\nsource = \"~/src/a\"\n");
+        let global = parse("[[mounts]]\nsource = \"~/src/a\"\n");
         let cfg = merge(global, Raw::default());
         assert_eq!(
-            cfg.repos,
-            vec![RepoEntry {
-                source: "~/src/a".into()
+            cfg.mounts,
+            vec![MountEntry {
+                source: "~/src/a".into(),
+                target: None,
+                readonly: None
             }],
-            "global repos apply when the project declares none"
+            "global mounts apply when the project declares none"
+        );
+    }
+
+    #[test]
+    fn mount_entry_parses_all_three_keys() {
+        let cfg = merge(
+            parse("[[mounts]]\nsource = \"~/notes\"\ntarget = \"/notes\"\nreadonly = true\n"),
+            Raw::default(),
+        );
+        assert_eq!(
+            cfg.mounts,
+            vec![MountEntry {
+                source: "~/notes".into(),
+                target: Some("/notes".into()),
+                readonly: Some(true)
+            }]
+        );
+    }
+
+    #[test]
+    fn mount_readonly_precedence_table() {
+        let unset = MountEntry {
+            source: "~/src/a".into(),
+            target: None,
+            readonly: None,
+        };
+        let writable = MountEntry {
+            readonly: Some(false),
+            ..unset.clone()
+        };
+        let readonly = MountEntry {
+            readonly: Some(true),
+            ..unset.clone()
+        };
+
+        assert!(
+            !mount_readonly(&unset, None),
+            "writable is the default: a mount primitive that silently refused \
+             writes would surprise anyone who did not ask for read-only"
+        );
+        assert!(
+            !mount_readonly(&writable, None),
+            "an entry can state the default explicitly"
+        );
+        assert!(mount_readonly(&readonly, None), "the entry opts in");
+
+        assert!(
+            !mount_readonly(&readonly, Some(false)),
+            "--readonly=false beats an entry that asked for read-only — an \
+             explicit flag is the more recent, more specific intent"
+        );
+        assert!(
+            mount_readonly(&writable, Some(true)),
+            "--readonly beats an entry that asked for writable"
+        );
+    }
+
+    #[test]
+    fn mount_entry_rejects_misspelled_keys() {
+        for bad in [
+            "[[mounts]]\nsource = \"~/a\"\nread_only = true\n",
+            "[[mounts]]\nsource = \"~/a\"\ndest = \"/a\"\n",
+        ] {
+            assert!(
+                toml::from_str::<Raw>(bad).is_err(),
+                "a misspelled key must fail the parse: silently ignoring it hands \
+                 back a default the user did not choose, and they find out only \
+                 when a write succeeds that should not have: {bad:?}"
+            );
+        }
+        assert!(
+            toml::from_str::<Raw>("[[mounts]]\nsource = \"~/a\"\nreadonly = \"yes\"\n").is_err(),
+            "readonly is a boolean; a string is a miswrite, not a truthy value"
+        );
+    }
+
+    /// `[[repos]]` is gone, and a config still carrying it must say so
+    /// rather than run with the mount missing. Not the parse-and-warn
+    /// treatment `[home]` got: an ignored `[home]` left a feature off,
+    /// while an ignored `[[repos]]` leaves a directory the user believes is
+    /// mounted simply absent.
+    #[test]
+    fn removed_repos_section_is_reported_with_its_replacement() {
+        let path = Path::new("/x/.pall8t/config.toml");
+        let msg = repos_removed_error(&parse("[[repos]]\nsource = \"~/src/a\"\n"), path)
+            .expect("[[repos]] must be reported");
+        assert!(
+            msg.contains("/x/.pall8t/config.toml"),
+            "the message must name the file to edit: {msg}"
+        );
+        assert!(
+            msg.contains("[[mounts]]") && msg.contains("readonly = true"),
+            "it must show the replacement, not just refuse: {msg}"
+        );
+        assert!(
+            msg.contains("clone"),
+            "and must say the semantics changed — [[repos]] mounted a copy, a \
+             mount is the real directory — or a user pastes the new form and \
+             quietly loses the protection they had: {msg}"
+        );
+
+        assert_eq!(
+            repos_removed_error(&parse("[[mounts]]\nsource = \"~/src/a\"\n"), path),
+            None,
+            "a config already migrated must load without complaint"
+        );
+    }
+
+    /// Both files at once, not one per run: a user with the section in the
+    /// global *and* the project config would otherwise fix one, rerun, and
+    /// only then hear about the other (`CodeRabbit`, PR #46).
+    #[test]
+    fn both_legacy_config_files_are_reported_together() {
+        let global_path = Path::new("/home/u/.pall8t/config.toml");
+        let project_path = Path::new("/proj/.pall8t/config.toml");
+        let legacy = parse("[[repos]]\nsource = \"~/src/a\"\n");
+        let migrated = parse("[[mounts]]\nsource = \"~/src/a\"\n");
+
+        let msg = repos_removed_errors(&[(&legacy, global_path), (&legacy, project_path)])
+            .expect("two legacy files must be reported");
+        assert!(
+            msg.contains("/home/u/.pall8t/config.toml")
+                && msg.contains("/proj/.pall8t/config.toml"),
+            "both paths must appear, or the second one is a surprise on the next \
+             run: {msg}"
+        );
+
+        let one = repos_removed_errors(&[(&migrated, global_path), (&legacy, project_path)])
+            .expect("one legacy file must still be reported");
+        assert!(
+            !one.contains("/home/u/.pall8t/config.toml"),
+            "a migrated file must not be named as a problem: {one}"
+        );
+
+        assert_eq!(
+            repos_removed_errors(&[(&migrated, global_path), (&migrated, project_path)]),
+            None,
+            "nothing legacy, nothing to say"
         );
     }
 

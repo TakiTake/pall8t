@@ -33,8 +33,8 @@ apple/container **1.2.0 or newer**. Below that, `Parser.allEnv` expanded a bare 
 - Mount the current directory rw as the workspace
 - If cwd is a git worktree, automatically mount the main repository's `.git` as well
 - At run time, compare the Containerfile hash and rebuild before launch if it changed
-- Customization via TOML config (CPU/memory allocation, reference repositories, default command, etc.)
-- Duplicate reference repositories with `git clone --local` (hardlinked objects) before mounting, protecting the originals
+- Customization via TOML config (CPU/memory allocation, mounts, default command, etc.)
+- Mount arbitrary host directories into the container via `[[mounts]]`, at their own path or a chosen one, writable or read-only (ADR-0009)
 - TTY passthrough and signal forwarding (behave well under tmux / herdr)
 - herdr bridge: inside a herdr pane, expose the host herdr session to the sandboxed agent (env passthrough, socket relay with policy + audit, version-matched Linux CLI) — ADR-0007
 
@@ -73,11 +73,16 @@ apple/container **1.2.0 or newer**. Below that, `Parser.allEnv` expanded a bare 
 - If cwd's `.git` is a pointer file (worktree), detect the main repository's common `.git` directory and mount it so the path structure inside the container matches
 - git operations inside the worktree (status / commit / diff) must work as they do on the host
 
-### FR-4: Reference repositories
+### FR-4: Mounts
 
-- Duplicate each repository listed under `[[repos]]` in the config via `git clone --local` and mount the copy
-- `cp -al` is rejected: hardlinks don't apply to directories, and hardlinked working-tree files risk corrupting the original via in-place writes
-- Positioned as the workaround for apple/container's lack of read-only mounts
+- `[[mounts]]` makes a host directory visible inside the container. Any directory — a git checkout, a notes folder, a dataset; there is no requirement that it be a repository (ADR-0009)
+- `source` is the host path (`~` expands host-side). `target` is where it appears inside the container and must be absolute; it defaults to `source`, an identity mount, so absolute paths mean the same thing on both sides
+- `readonly` defaults to `false`. `true` mounts it read-only and the runtime refuses every write — the way to give an agent a checkout it may read and must not change. `pall8t run --readonly[=BOOL]` overrides every entry for one run
+- A source that does not exist is a hard error, never a silently empty mount
+- A target may not overlap the workspace, a worktree's main `.git`, or the container home, and two targets may not overlap each other — a covering mount would hide what the run is built on, or silently win over the mount before it
+- A linked git worktree mounted at its own path also gets the main repository's `.git` mounted, with the same mode, so git can resolve it (FR-3's rule, applied to mounts). Not for a retargeted mount, where the worktree's absolute pointer paths no longer line up
+- Read-only mounts appear root-owned inside the container, so pall8t marks exactly those targets as git `safe.directory` (via `GIT_CONFIG_*`); without it git refuses to read them at all (ADR-0009)
+- `[[repos]]`, which cloned a git repository and mounted the copy, is removed. A config still declaring it fails to load with a message naming the replacement and stating the semantic difference — a mount is the real directory, so protection now comes from `readonly = true` rather than from the copy
 
 ### FR-5: Container management
 
@@ -118,8 +123,10 @@ memory = "8g"
 command = ["claude"]     # --dangerously-skip-permissions is NOT in the default.
                          # Users who want it must set it explicitly.
 
-[[repos]]                # reference repos (duplicated via git clone --local, then mounted)
+[[mounts]]               # any host directory, mounted into the container
 source = "~/src/other-lib"
+# target = "/src/other-lib"  # optional; defaults to the source's own path
+# readonly = true            # optional; defaults to false (writable)
 ```
 
 ## 6. Non-Functional Requirements
@@ -132,11 +139,11 @@ source = "~/src/other-lib"
 ## 7. Known Limitations
 
 - **Shared home under parallel execution**: with parallel runs, all containers share `~/.pall8t/home` rw. Claude Code itself has known `~/.claude.json` corruption issues under concurrent sessions (non-atomic read-modify-write) — the same conditions apply when running in parallel on the host. Accepted as a known limitation in v1
-- **No read-only mounts**: apple/container limitation. Reference repositories are protected via `git clone --local` duplication instead
+- ~~**No read-only mounts**: apple/container limitation~~ — resolved. apple/container#990 closed before 1.0.0 shipped and enforcement is verified on 1.2.2; `[[mounts]] readonly = true` mounts a directory read-only (ADR-0009). A writable mount is the real directory, so what the clone used to protect is now protected by `readonly = true`
 - **Workspace isolation is the caller's responsibility**: pall8t does not prevent conflicts when multiple agents run in the same directory (interleaved edits, `.git/index.lock` contention, working trees swapped by branch switches). Worktree-based workflows are recommended
 
 ## 8. Roadmap (post-v1)
 
 1. **Per-run home clones and knowledge aggregation**: give each run a copy of `~/.pall8t/home` to isolate writes, while aggregating knowledge each agent adds at user level (skills etc.) back to the host. Merging knowledge produced in parallel is the essential challenge — a good answer here could become pall8t's core value. Still open: one implementation (the home compositor, `[home] mode = "isolated"`) shipped in 0.3.0 and was removed for lack of use — see [ADR-0008](adr/0008-drop-home-compositor.md); its spec and the evaluation of off-the-shelf tools are kept in `docs/specs/home-compositor*.md` for whoever tries again
-2. **Read-only mounts**: make reference repositories ro once apple/container supports it
+2. ~~**Read-only mounts**: make reference repositories ro once apple/container supports it~~ — **done** (ADR-0009), as `[[mounts]] readonly`. Remaining: the herdr bridge's binary mount, which still uses a writable per-run copy from the era when ro mounts were thought unavailable; and a copy-style mount for agents that must commit against a repo they may not modify, if that use case resurfaces
 3. **Network restrictions**: egress control to strengthen sandbox integrity

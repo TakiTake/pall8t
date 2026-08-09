@@ -120,6 +120,51 @@ local review failed to catch first (source PRs noted).
   review output and fall back to `rg` — silently degraded coverage reads
   as full coverage.
 
+**What the commit actually contains** (PR #46)
+- `git status --short` is step 0 for a reason: read the staged file list
+  before committing, not just the diff you meant to write. `git add -A`
+  after running a tool sweeps in whatever that tool wrote —
+  `cargo mutants` leaves `mutants.out/` and `mutants.out.old/`, and
+  `mutants.out/lock.json` carries the developer's hostname and username.
+  An *incidental* local output like that belongs in `.gitignore` before
+  it belongs in a commit — which is not the same as "never commit
+  generated files": plenty of repos version lockfiles, schemas, or
+  generated sources on purpose, and those stay in review like any other
+  code. The question is whether the file is a deliberate artifact of the
+  project or a byproduct of the tool you happened to run. On an unmerged
+  branch, amend rather than adding a removal commit — a "remove the
+  artifact" commit still merges the artifact's contents into `main`'s
+  history forever.
+- A committed report also *attracts* review findings about its own
+  contents (bots read `missed.txt` as if it were source), which buries
+  the real findings.
+
+**Changing a default** (PR #46)
+- A default change is not one behavior change, it is one per input shape
+  the old default used to handle. Enumerate them: which layouts, formats,
+  or states did the old path absorb that the new one meets directly?
+  Read-only mounts broke *linked git worktrees* as reference repos —
+  their `.git` is a pointer file to a path outside the source — precisely
+  because the old path laundered them through `git clone --local` and the
+  new one does not.
+- A new mechanism may not inherit the properties of the one it replaces.
+  Check identity, permissions, and ownership across the boundary, not
+  just the behavior you were aiming at: apple/container applies its
+  uid/gid remapping to writable mounts only, so read-only mounts arrive
+  root-owned and git refuses them — the feature "worked" while being
+  useless for its main purpose.
+- Verify the new default on the real runtime with the tool the users use
+  (`git`, not `cat`). A read check that only opens a file will not notice
+  that every VCS operation fails.
+
+**Lifecycle claims in docs** (PR #46)
+- Before writing what happens to something "at the end of the run" —
+  discarded, cleaned up, disposable, temporary — find the code that
+  removes it. If there is no such code, it persists. The clone under
+  `~/.pall8t/repos` was called disposable in four documents while
+  `prepare`'s own doc comment two lines away said an existing one is
+  reused as-is.
+
 **Tests** (standing)
 - Per docs/testing.md: new tests use table form with reasoned assertion
   messages; each bug fix and each refuted review finding gets a pin;

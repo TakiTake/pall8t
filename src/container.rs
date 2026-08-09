@@ -42,13 +42,13 @@ pub(crate) fn sha256_hex_prefix(bytes: &[u8], n: usize) -> String {
         })
 }
 
-/// pall8t-<path key of cwd>-<pid> (see [`crate::repos::path_key`]). The
+/// pall8t-<path key of cwd>-<pid> (see [`crate::util::path_key`]). The
 /// pid keeps parallel runs from the same directory from colliding on
 /// `--name`.
 pub fn run_name(workspace: &Path) -> String {
     format!(
         "pall8t-{}-{}",
-        crate::repos::path_key(workspace),
+        crate::util::path_key(workspace),
         std::process::id()
     )
 }
@@ -528,21 +528,78 @@ pub fn build_image(
     Ok(())
 }
 
-/// One `-v host:dest` bind mount of a [`RunSpec`].
+/// One bind mount of a [`RunSpec`], rendered as `--mount` by
+/// [`run_argv`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
     pub host: PathBuf,
     pub dest: PathBuf,
+    /// Mount it read-only. Enforced by the guest kernel — a write inside
+    /// the container fails with `EROFS` — verified on apple/container
+    /// 1.2.2 and pinned by ADR-0009.
+    pub readonly: bool,
 }
 
 impl Mount {
-    /// Identity-path mount: `host` is visible at the same absolute path
-    /// inside the container, so git metadata and path references stay
-    /// valid on both sides (ADR-0004's insight, retained by ADR-0006).
+    /// Explicit constructor for callers that already know all three.
+    pub fn new(host: PathBuf, dest: PathBuf, readonly: bool) -> Self {
+        Mount {
+            host,
+            dest,
+            readonly,
+        }
+    }
+
+    /// Identity-path mount, writable: `host` is visible at the same
+    /// absolute path inside the container, so git metadata and path
+    /// references stay valid on both sides (ADR-0004's insight, retained
+    /// by ADR-0006).
     pub fn identity(path: PathBuf) -> Self {
         Mount {
             host: path.clone(),
             dest: path,
+            readonly: false,
         }
+    }
+
+    /// Writable mount of `host` at `dest`.
+    pub fn rw(host: PathBuf, dest: PathBuf) -> Self {
+        Mount {
+            host,
+            dest,
+            readonly: false,
+        }
+    }
+
+    /// Read-only mount of `host` at `dest` — the sandbox can read it and
+    /// cannot change it (ADR-0009).
+    pub fn ro(host: PathBuf, dest: PathBuf) -> Self {
+        Mount {
+            host,
+            dest,
+            readonly: true,
+        }
+    }
+
+    /// The `--mount` value for this mount.
+    ///
+    /// `--mount`, not `-v host:dest[:opts]`, and that is a safety choice
+    /// rather than a style one: apple/container validates `--mount`
+    /// directives and rejects an unknown one outright, while `-v` passes
+    /// its third field through to the filesystem options unchecked. On
+    /// 1.2.2, `-v src:dst:readonlyy` mounts **read-write in silence**,
+    /// where `--mount …,readonlyy` fails the run before it starts. A typo
+    /// in a protection flag must not be the quiet outcome (ADR-0009).
+    fn spec(&self) -> String {
+        let mut s = format!(
+            "type=virtiofs,source={},target={}",
+            self.host.display(),
+            self.dest.display()
+        );
+        if self.readonly {
+            s.push_str(",ro");
+        }
+        s
     }
 }
 
@@ -577,8 +634,8 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
     }
     argv.extend(["--rm".into(), "--name".into(), spec.name.clone()]);
     for m in &spec.mounts {
-        argv.push("-v".into());
-        argv.push(format!("{}:{}", m.host.display(), m.dest.display()));
+        argv.push("--mount".into());
+        argv.push(m.spec());
     }
     for (k, v) in &spec.env {
         argv.push("-e".into());
@@ -836,7 +893,7 @@ mod tests {
 
     /// Regression pin for the 1.2.0 name cap: a workspace whose basename is
     /// far longer than the whole budget still has to produce a runnable
-    /// `--name`. Before the [`crate::repos`] slug cap this ran on 1.0.0 and
+    /// `--name`. Before the [`crate::util`] slug cap this ran on 1.0.0 and
     /// died on 1.2.0.
     #[test]
     fn run_name_stays_within_the_container_name_cap() {
@@ -1294,10 +1351,14 @@ mod tests {
             workdir: PathBuf::from("/Users/me/src/x"),
             mounts: vec![
                 Mount::identity(PathBuf::from("/Users/me/src/x")),
-                Mount {
-                    host: PathBuf::from("/Users/me/.pall8t/home"),
-                    dest: PathBuf::from("/home/dev"),
-                },
+                Mount::rw(
+                    PathBuf::from("/Users/me/.pall8t/home"),
+                    PathBuf::from("/home/dev"),
+                ),
+                Mount::ro(
+                    PathBuf::from("/Users/me/src/lib"),
+                    PathBuf::from("/Users/me/src/lib"),
+                ),
             ],
             cpus: 4,
             memory: "8g".into(),
@@ -1318,8 +1379,31 @@ mod tests {
         assert!(argv.contains(&"-i".to_string()));
         assert!(argv.contains(&"-t".to_string()), "tty: true requests -t");
         assert!(argv.contains(&"--rm".to_string()));
-        assert!(argv.contains(&"/Users/me/src/x:/Users/me/src/x".to_string()));
-        assert!(argv.contains(&"/Users/me/.pall8t/home:/home/dev".to_string()));
+        // `--mount`, not `-v`: apple/container validates these directives and
+        // rejects an unknown one, where `-v src:dst:<opts>` passes the
+        // options through unchecked — on 1.2.2 a typo'd `-v src:dst:readonlyy`
+        // mounts read-write in silence (ADR-0009). The exact strings are the
+        // contract with another process, so they are asserted, not summarized.
+        assert!(argv
+            .contains(&"type=virtiofs,source=/Users/me/src/x,target=/Users/me/src/x".to_string()));
+        assert!(argv
+            .contains(&"type=virtiofs,source=/Users/me/.pall8t/home,target=/home/dev".to_string()));
+        assert!(
+            argv.contains(
+                &"type=virtiofs,source=/Users/me/src/lib,target=/Users/me/src/lib,ro".to_string()
+            ),
+            "a read-only mount carries `,ro` — without it the mount is silently \
+             writable, which is the whole failure this flag exists to prevent"
+        );
+        assert!(
+            !argv.contains(&"-v".to_string()),
+            "no mount may go out as `-v`: its options are unvalidated"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--mount").count(),
+            3,
+            "every mount emits exactly one --mount flag"
+        );
         assert_eq!(
             argv.last(),
             Some(&"claude".to_string()),

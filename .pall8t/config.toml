@@ -2,3 +2,20 @@
 # is the embedded default sandbox image (no Rust toolchain); this project's
 # sandbox needs Rust, which comes from .pall8t/Containerfile — the default
 # probe, so it doesn't need to be named here explicitly.
+
+# Upstreams this project reads but must never modify: pall8t wraps
+# apple/container's CLI and bridges to herdr, and both questions ("what
+# does the runtime actually do here?", "what shape does herdr expect?")
+# are answered by their source. Read-only, so an agent can read them and
+# cannot touch the checkouts.
+#
+# ghq paths, so they only exist on a machine that has cloned them — a
+# missing source is a hard error, not a skipped mount. Comment these out
+# (or clone the repos) if you are working on pall8t without them.
+[[mounts]]
+source = "~/ghq/github.com/apple/container"
+readonly = true
+
+[[mounts]]
+source = "~/ghq/github.com/herdrdev/herdr"
+readonly = true
