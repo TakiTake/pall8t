@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-09
+
 ### Added
 
 - **`[[mounts]]` — mount any host directory into the sandbox**
@@ -34,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `target` defaults to `source`, so absolute paths keep meaning the
     same thing on both sides. Note `~` expands **host-side**: `~/x` lands
     at `/Users/you/x` inside the container, not `/home/dev/x`.
+  - Bad input fails before anything is built, rather than inside the
+    runtime with a mount line already printed: a `source` that is not a
+    directory, a `source` that does not exist, and a `target` that is not
+    an absolute container path. `~` is deliberately *not* expanded in a
+    `target` — there it would mean the container's home, not the host's,
+    so it is rejected rather than quietly turned into a host path.
   - A target may not cover the workspace, a worktree's `.git`, or the
     container home, and two targets may not cover each other. Hiding the
     home would take out the agent's own config and session history.
@@ -236,7 +244,8 @@ container home.
   management (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in
   favor of the shared-home mode.
 
-[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.4.0
 [0.3.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.3.0
 [0.2.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.2.0
 [0.1.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.1.0
