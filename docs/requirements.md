@@ -66,7 +66,7 @@ apple/container **1.2.0 or newer**. Below that, `Parser.allEnv` expanded a bare 
 - `container.watch` extends the same hash with a list of extra project files (literal paths, no globs; a project Containerfile is required) so editing a file the Containerfile `COPY`s in — e.g. a lockfile — also triggers a rebuild; a listed file that doesn't exist is a hard error, never silently hashed as empty
 - A project Containerfile (`container.containerfile` or `.pall8t/Containerfile`) builds with the **project directory** as the build context, so `COPY` paths are relative to the project root and reach the files `container.watch` tracks (ADR-0010); the shared default image builds from `~/.pall8t`
 - On build failure, do not launch the agent; exit non-zero
-- `pall8t build` performs an explicit build
+- `pall8t build` performs an explicit build; `pall8t build --no-cache` additionally forwards `--no-cache` to `container build`, re-running every `RUN` step — the escape hatch for steps that fetch "latest" and would otherwise be served stale from the layer cache
 - Build output streams live to stderr by default (not captured/hidden), kept off pall8t's own stdout so `built <tag>` and `ls --json` stay machine-readable
 
 ### FR-3: git worktree support
@@ -102,7 +102,7 @@ apple/container **1.2.0 or newer**. Below that, `Parser.allEnv` expanded a bare 
 ```
 pall8t init              # generate ~/.pall8t/home, config skeletons, example Containerfile
 pall8t run [-- cmd...]   # hash check → build if needed → run (TTY passthrough)
-pall8t build             # explicit build
+pall8t build [--no-cache]  # explicit build (--no-cache re-runs every RUN step)
 pall8t ls [--json]       # list running containers
 pall8t exec <id> -- cmd  # run command inside container
 pall8t stop <id>         # stop container

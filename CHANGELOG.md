@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `pall8t build --no-cache`: bypass the builder's layer cache and re-run
+  every `RUN` step. `pall8t build` alone already rebuilds unconditionally,
+  but a step whose instruction text didn't change — e.g. the claude CLI's
+  `npm install -g` in the dev image — was still served from the layer
+  cache, so "latest" fetches never actually refreshed.
+
 ### Changed
 
 - **A project Containerfile now builds with the project directory as its
