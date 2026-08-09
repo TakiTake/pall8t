@@ -5,8 +5,8 @@ vs. user), run `/release` — see [`.claude/skills/release/SKILL.md`](../.claude
 
 1. Bump the version in `Cargo.toml`, run `cargo check` so `Cargo.lock` picks it
    up, and add a new section to `CHANGELOG.md` (`## [x.y.z] - YYYY-MM-DD`,
-   plus its link-reference footer entry). `/bump <version>` does all of this
-   and opens the PR — including a check that `release.yml`'s note extractor
+   plus its link-reference footer entry). `/bump <version | major | minor | patch>`
+   does all of this and opens the PR — including a check that `release.yml`'s note extractor
    finds the new section, which is otherwise only discovered after the tag is
    public.
 2. Get that PR merged.

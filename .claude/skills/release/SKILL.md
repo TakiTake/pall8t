@@ -29,6 +29,9 @@ Two things this skill adds on top:
   before invoking `/bump`.
 - After `/bump` opens the PR, run the review loop (`/code-review`,
   `/skeptical-review`) and fix findings until both come back clean.
+  `/bump` runs `local-review` on the diff it creates; every revision you
+  push on top of that is a diff nobody has reviewed, so run it again
+  before each push, per `CLAUDE.md`.
 
 **Do not merge the PR.**
 

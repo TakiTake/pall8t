@@ -67,7 +67,8 @@ stop there.
 ## Pointers
 
 - Release process: [docs/release.md](docs/release.md) (or run `/release`;
-  `/bump <version>` alone does just the version/changelog PR)
+  `/bump <version | major | minor | patch>` alone does just the
+  version/changelog PR)
 - Homebrew formula: [TakiTake/homebrew-tap](https://github.com/TakiTake/homebrew-tap)
 - Requirements: [docs/requirements.md](docs/requirements.md)
 - Architecture decisions: [docs/adr/](docs/adr/)

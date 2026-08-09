@@ -30,13 +30,31 @@ Refuse, with the reason, if:
   anything else fails at manifest parse, and `release.yml` compares the
   pushed tag against `cargo pkgid`'s version,
 - it is not strictly greater than the current version, or
-- a `v$VERSION` tag already exists (`git tag -l "v$VERSION"`, and
-  `gh release view v$VERSION` for one published without a local tag).
+- a `v$VERSION` tag already exists **on `origin`** — check the remote, not
+  just your clone: `git ls-remote --tags origin "refs/tags/v$VERSION"`.
+  A local `git tag -l` misses a tag pushed from anywhere else, and the
+  cost of missing it is discovering the collision at the tag push, after
+  the PR is merged. `gh release view v$VERSION` additionally catches a
+  release published without a tag reaching your clone.
 
 ## 2. Preflight
 
 - `main` is clean and up to date with `origin/main`.
-- CI on `main` is green: `gh run list --branch main --limit 1`.
+- CI is green **for the exact commit you are releasing**, scoped to
+  `ci.yml`:
+
+  ```sh
+  gh run list --workflow ci.yml --branch main --limit 1 \
+    --json headSha,status,conclusion
+  ```
+
+  Its `headSha` must equal `git rev-parse origin/main`, with
+  `status=completed` and `conclusion=success`. Both halves matter: an
+  unscoped `gh run list --branch main` returns whichever workflow ran
+  most recently, and the weekly `mutants.yml` and `hygiene.yml` runs are
+  report-only — reading their status as "CI is green" is a false pass.
+  Pinning to the sha stops a run from an older commit standing in for
+  the one being tagged.
 - `CHANGELOG.md` has an `## [Unreleased]` section with **content under it**.
   An empty one means there is nothing to release; stop and say so.
 
@@ -57,7 +75,9 @@ That heading format is load-bearing, not style. `release.yml` extracts the
 release notes with:
 
 ```awk
-/^## \[/ { if (found) exit; if (index($0, "## [$VERSION] -") == 1) { found=1; next } }
+# verline is passed in with -v verline="## [<version>] -"; awk never
+# expands a shell variable inside its own program text
+/^## \[/ { if (found) exit; if (index($0, verline) == 1) { found=1; next } }
 ```
 
 It matches from the start of the line and expects the ` - ` separator, so
@@ -84,7 +104,7 @@ Do not hand this to a tag and hope. Run the workflow's own extraction
 against the file:
 
 ```sh
-# substitute the real version into verline — the shell will not do it for you
+VERSION=0.4.0   # the version being released; awk cannot expand it for you
 awk -v verline="## [$VERSION] -" '
   /^## \[/ { if (found) exit; if (index($0, verline) == 1) { found=1; next } }
   found { print }
@@ -106,7 +126,9 @@ cargo pkgid | sed 's/.*[@#]//'   # must equal $VERSION
 
 Run the quality gates from `CLAUDE.md` — `scripts/lint.sh` (both targets)
 and `cargo test` — and **check their exit status**, not just that output
-scrolled past. Then run the `local-review` skill on the diff.
+scrolled past. Then run the `local-review` skill on the diff — before
+*every* push to the PR, not only the first: a fix for a review finding is
+a new diff, and it is the revision nobody has reviewed yet.
 
 Commit, push, open a PR titled `chore: release $VERSION`, and report the
 number. **Do not merge it** — merges are the human's, and so is everything
