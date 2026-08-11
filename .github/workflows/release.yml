@@ -13,7 +13,11 @@ jobs:
     # targets aarch64-apple-darwin — no cross-compilation needed.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      # The release is published with `gh` and the GH_TOKEN env var below,
+      # not git credentials, so the checkout doesn't need to keep any.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
