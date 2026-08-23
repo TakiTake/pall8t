@@ -27,6 +27,10 @@ enum Cmd {
         /// forces them all writable instead
         #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
         readonly: Option<bool>,
+        /// Forward the host's SSH agent into the sandbox for this run,
+        /// overriding `[container] ssh`. `--ssh=false` forces it off
+        #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+        ssh: Option<bool>,
         /// Command to run instead of the configured one (after --)
         #[arg(last = true)]
         command: Vec<String>,
@@ -104,7 +108,11 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Init => cmd_init(),
-        Cmd::Run { readonly, command } => cmd_run(command, readonly),
+        Cmd::Run {
+            readonly,
+            ssh,
+            command,
+        } => cmd_run(command, readonly, ssh),
         Cmd::Build { no_cache } => cmd_build(no_cache),
         Cmd::Ls { json } => cmd_ls(json),
         Cmd::Exec { id, command } => cmd_exec(&id, &command),
@@ -236,7 +244,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
+fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<bool>) -> Result<()> {
     let (cwd, cfg, uid, gid, resolved) = workspace_image(image::BuildMode::IfMissing)?;
     let run_name = container::run_name(&cwd);
 
@@ -272,6 +280,11 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
         .filter(|m| m.readonly)
         .map(|m| m.dest.clone())
         .collect();
+
+    let ssh = config::ssh_enabled(cfg.ssh, cli_ssh);
+    if let Some(msg) = config::ssh_warning(ssh, std::env::var("SSH_AUTH_SOCK").ok().as_deref()) {
+        eprintln!("{msg}");
+    }
 
     let herdr_env = herdr::detect();
     // An explicit `-- <cmd>` override is user intent and bypasses the
@@ -316,6 +329,7 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
         gid,
         tty: stdin_is_tty(),
         env: env_vars,
+        ssh,
         command,
     };
     exec_container(&container::run_argv(&spec), herdr_agent.as_deref())

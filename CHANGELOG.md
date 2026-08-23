@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[container] ssh`: forward the host's SSH agent into the sandbox**
+  (`container run --ssh`), so an agent can push over SSH without a
+  private key ever entering the container home. Off by default —
+  while the run lasts, the sandbox can authenticate as you anywhere your
+  keys are trusted. `pall8t run --ssh` / `--ssh=false` overrides it for
+  one run, and pall8t warns when forwarding is on but the host has no
+  `SSH_AUTH_SOCK` (the runtime would otherwise forward nothing silently).
 - `pall8t build --no-cache`: bypass the builder's layer cache and re-run
   every `RUN` step. `pall8t build` alone already rebuilds unconditionally,
   but a step whose instruction text didn't change — e.g. the claude CLI's

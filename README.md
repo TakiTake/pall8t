@@ -62,6 +62,7 @@ Two layers, merged per field with the project winning: global `~/.pall8t/config.
 [container]
 cpus = 4
 memory = "8g"
+# ssh = true                     # forward the host's SSH agent into the sandbox (default: false)
 # containerfile = "path/to/other/Containerfile"   # relative to the project dir; default: .pall8t/Containerfile
 # watch = ["flake.nix", "flake.lock"]   # extra files whose content also decides whether to rebuild
 
@@ -76,6 +77,14 @@ source = "~/src/other-lib"
 ```
 
 Override for a single run without editing the file: `pall8t run --readonly` (or `--readonly=false` to force them all writable). The flag wins over every entry's own setting.
+
+### SSH agent forwarding
+
+`[container] ssh = true` forwards the host's SSH agent into the sandbox (`container run --ssh`): apple/container mounts the agent socket at `/var/host-services/ssh-auth.sock` inside the guest and points the container's `SSH_AUTH_SOCK` at it. **No key material crosses the boundary** — the sandbox sends signing requests to the agent on the host, which is the point: without it, git-over-SSH inside the sandbox needs a private key sitting in `~/.pall8t/home/.ssh`, where the agent can read it and where it stays after the run.
+
+Off by default, because while the run lasts, code in the sandbox can authenticate as you anywhere your keys are trusted. `pall8t run --ssh` turns it on for one run; `--ssh=false` turns it off for one run.
+
+If forwarding is on and the host has no `SSH_AUTH_SOCK`, pall8t warns: the runtime forwards nothing in that case but *still* sets `SSH_AUTH_SOCK` inside the container, so without the warning the only symptom is `ssh` failing to connect to a socket that was never there.
 
 Note that `~` expands on the **host**, and an identity mount lands at that same absolute path inside the container — `~/src/other-lib` is `/Users/you/src/other-lib` in the sandbox, not `/home/dev/src/other-lib`. Set `target` if you want it somewhere friendlier.
 
