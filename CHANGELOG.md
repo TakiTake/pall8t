@@ -40,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `npm install -g` in the dev image — was still served from the layer
   cache, so "latest" fetches never actually refreshed.
 
+### Fixed
+
+- **`git status`, `git log`, and `git rev-parse` failed inside the sandbox
+  with "detected dubious ownership"** — in the workspace itself, not only
+  in read-only reference mounts. A mount's own directory inode arrives
+  root-owned inside the container while its contents map to the host user
+  correctly, so the earlier measurement (taken on a path *inside* a
+  writable mount) missed it. Every mounted path is now marked
+  `safe.directory`, so git works in the workspace, in a `[[mounts]]`
+  entry, and in a linked worktree. Verified live on apple/container
+  1.2.2, including a worktree created by `herdr worktree create` under
+  `~/.herdr/worktrees/`.
+
 ### Changed
 
 - **The sandbox's Linux `herdr` CLI is now the verified cache itself,

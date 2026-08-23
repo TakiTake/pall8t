@@ -274,14 +274,14 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
         mounts.push(m);
     }
     mounts.push(container::Mount::rw(container::home_mount()?, home_dest));
-    // A read-only mount arrives inside the container owned by root rather
-    // than the host user, so git refuses to read it until each such path is
-    // marked safe (see `mounts::safe_directory_env`).
-    let readonly_paths: Vec<_> = mounts
-        .iter()
-        .filter(|m| m.readonly)
-        .map(|m| m.dest.clone())
-        .collect();
+    // A mount's own directory inode arrives inside the container owned by
+    // root rather than the host user — the workspace included, not just
+    // read-only reference mounts — so git refuses `status`/`log` there
+    // until each mounted path is marked safe (see
+    // `mounts::safe_directory_env`). Computed here, before the herdr
+    // bridge appends its own mounts: those are a binary directory and a
+    // socket, never a repository.
+    let mount_targets: Vec<_> = mounts.iter().map(|m| m.dest.clone()).collect();
 
     // Provenance for `pall8t ls --json` and anything else asking what a
     // running sandbox is: what pall8t knows and the container doesn't say
@@ -322,7 +322,7 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
     // The bridge (ADR-0007) makes the herdr CLI work inside the sandbox:
     // relay + env + Linux binary mount + bootstrap wrap. Best-effort — a
     // bridge failure warns and the run proceeds without it.
-    let mut env_vars = mounts::safe_directory_env(&readonly_paths);
+    let mut env_vars = mounts::safe_directory_env(&mount_targets);
     if let Some(env) = &herdr_env {
         labels.push(("pall8t.herdr.pane".to_string(), env.pane_id.clone()));
         if let Some(w) = &env.workspace_id {
