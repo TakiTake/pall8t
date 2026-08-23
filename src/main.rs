@@ -449,9 +449,13 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
     } else {
         cli_command
     };
+    let provenance = herdr::Provenance {
+        image: resolved.tag.clone(),
+        container: run_name.clone(),
+    };
     let herdr_agent = herdr_env
         .as_ref()
-        .and_then(|env| herdr::announce_pane_identity(env, &command));
+        .and_then(|env| herdr::announce_pane_identity(env, &command, &provenance));
     // Naming the tab and the agent is independent of the bridge below —
     // it is about herdr's view of the pane — so it happens in every
     // `[herdr] sandbox` mode, `off` included.

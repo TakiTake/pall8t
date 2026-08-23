@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The bridge refuses reports claiming one of herdr's own integration
+  sources** (`herdr:claude`, …), in every sandbox mode. herdr recognizes
+  those sources as native integrations, stores the session they report,
+  and resumes such a pane after a server restart by running the agent's
+  resume command **on the host, outside the sandbox**. Reporting under
+  any other source (e.g. `custom:my-agent`) is unaffected, and Claude
+  Code's state detection is unaffected either way — herdr's integration
+  for it carries session identity only.
+- **Sandbox provenance tokens for the herdr sidebar**: `$pall8t_image`
+  and `$pall8t_container` are reported alongside the pane's display name.
+
 - **A run says when the repository's own config mounts a host path from
   outside the project.** `[[mounts]]` in a project's `.pall8t/config.toml`
   can name any path on the host, and that file arrives with the code the
