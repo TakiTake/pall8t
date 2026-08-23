@@ -70,17 +70,13 @@ Two facts about apple/container, verified live on 1.1.0, shape the design:
    (trust-on-first-use); its sha256 is recorded in a sidecar and
    re-verified before each use. Downloads use per-pid temp names so
    concurrent cold-cache runs publish complete files via atomic rename.
-   Because apple/container has no read-only mounts, whatever is mounted is
-   writable by the sandbox (same host uid), so the shared cache is **never
-   mounted**: each run copies the verified binary into a private per-run
-   directory (`~/.pall8t/tools/herdr-run/<container>/`) and mounts *that*
-   at `/opt/pall8t/bin`. A sandbox can therefore corrupt only its own
-   throwaway copy — breaking nothing but its own herdr CLI — and cannot
-   reach the binary a concurrently running sandbox executes, nor the
-   verified source. Per-run copies from exited (`--rm`'d) runs are pruned
-   best-effort on later runs (kept while their container is live or the
-   copy is within a grace window, so a concurrently launching run's copy
-   is never reaped mid-launch).
+   ~~Because apple/container has no read-only mounts, whatever is mounted
+   is writable by the sandbox (same host uid), so the shared cache is
+   **never mounted**: each run copies the verified binary into a private
+   per-run directory (`~/.pall8t/tools/herdr-run/<container>/`) and mounts
+   *that* at `/opt/pall8t/bin`.~~ **Superseded by the amendment**:
+   read-only mounts exist (ADR-0009), so the verified cache is mounted
+   directly, read-only, and the copy is gone.
 4. **Env passthrough**: `HERDR_ENV=1`, `HERDR_{WORKSPACE,TAB,PANE}_ID`,
    `HERDR_SOCKET_PATH` (container path), `HERDR_BIN_PATH` — so herdr's
    published SKILL.md works inside the sandbox *unmodified*, including
@@ -207,6 +203,27 @@ target's parent directory.
 5. Sockets left by an exited run are reaped by the next run: a socket
    nothing is listening on is stale by definition, and a live one belongs
    to a concurrent sandbox and is left alone.
+
+### The per-run binary copy is gone too
+
+The same stale premise shaped how the Linux `herdr` CLI reached the
+sandbox. Because nothing could be mounted read-only, each run copied the
+verified binary into `~/.pall8t/tools/herdr-run/<container>/` and mounted
+that copy read-write, so one sandbox could not overwrite the binary a
+concurrently running sandbox executes.
+
+Read-only mounts have existed since 1.0.0 (ADR-0009), so the verified
+cache is now mounted directly with `,ro`. That is strictly stronger than
+the copy: a sandbox cannot corrupt even its own CLI, the verified source
+is protected by the runtime rather than by never being exposed, and a
+multi-megabyte copy leaves every launch. The copy-and-prune machinery —
+`stage_run_local_herdr`, `prune_stale_run_bins`, `should_reap_run_bin`,
+and their grace window — is deleted.
+
+`~/.pall8t/tools/herdr-run/` is no longer read or written. Leftover
+directories there are inert and can be deleted; pall8t does not remove
+them itself, because an older pall8t still running would be executing out
+of one.
 
 ### Security posture, restated
 
