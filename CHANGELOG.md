@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys are trusted. `pall8t run --ssh` / `--ssh=false` overrides it for
   one run, and pall8t warns when forwarding is on but the host has no
   `SSH_AUTH_SOCK` (the runtime would otherwise forward nothing silently).
+- **A drift report for the relay's herdr method classification**
+  (`scripts/herdr-method-drift.py`, plus a weekly report-only workflow):
+  the `READ` allowlist that decides what a sandboxed agent may call under
+  `[herdr] sandbox = "readonly"` is a hand-made snapshot of herdr's
+  inventory, and this says what a newer herdr serves that it doesn't
+  cover. Report only — classification stays a human decision, and herdr's
+  schema is not a complete inventory (methods that hijack the connection,
+  like `pane.graphics.stream`, are absent from it).
 - **`[container] hardening = "strict"`**: drop every Linux capability,
   mount the container's root filesystem read-only, put `/tmp` on a tmpfs,
   and cap file descriptors — leaving the workspace and the container home

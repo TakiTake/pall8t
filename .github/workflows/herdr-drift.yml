@@ -1,0 +1,52 @@
+# Drift report: herdr's socket-API method inventory vs. the classification
+# pall8t's relay applies to it (src/relay.rs). The relay's READ allowlist —
+# what a sandboxed agent may call under `[herdr] sandbox = "readonly"` — is
+# a hand-made snapshot, so a read method a newer herdr adds is silently
+# classified Mutate and denied.
+#
+# REPORT-ONLY by design (issue #59), like the mutation and hygiene
+# workflows: classification is a human decision, and the schema is not a
+# complete inventory (see the script's caveat), so this can only ever
+# suggest. It never fails the build, and a run without herdr installed is
+# a skip, not a failure.
+name: herdr method drift
+
+on:
+  schedule:
+    # Weekly, Saturday 04:00 JST (Friday 19:00 UTC) — an hour after the
+    # hygiene report, so the two don't land on top of each other.
+    - cron: '0 19 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Fetch the latest herdr release
+        # The release binary, not the install script: nothing here needs a
+        # herdr installation, only its bundled schema, and a pinned asset
+        # download is easier to reason about than piping curl to sh.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo herdrdev/herdr \
+            --pattern 'herdr-linux-x86_64' --output ./herdr --clobber
+          chmod +x ./herdr
+          ./herdr --version
+
+      - name: Report drift
+        run: |
+          {
+            echo '## herdr method drift'
+            echo '```'
+            python3 scripts/herdr-method-drift.py --herdr ./herdr 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/herdr-method-drift.py --herdr ./herdr
