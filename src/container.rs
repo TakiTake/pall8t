@@ -586,13 +586,31 @@ impl Mount {
     /// `dest`, where it is a live socket the guest can connect to — not a
     /// virtiofs view of it (connecting through virtiofs is what fails
     /// with `ENOTSUP`). Emitted as `-v`, see [`Mount::spec`].
-    pub fn socket(host: PathBuf, dest: PathBuf) -> Self {
-        Mount {
+    ///
+    /// Fails when either path contains a `:`. That is what keeps
+    /// [`Mount::spec`]'s "no third field" claim true: `-v` splits on `:`,
+    /// so a single colon in the host path would hand the *container* path
+    /// to apple/container as unvalidated mount options, and a second one
+    /// would fail the whole `container run` rather than just the bridge.
+    /// A `:` is legal in a macOS path, so this is a guard, not a
+    /// formality — the caller is best-effort and degrades to "no bridge"
+    /// with the reason.
+    pub fn socket(host: PathBuf, dest: PathBuf) -> Result<Self> {
+        for path in [&host, &dest] {
+            if path.to_string_lossy().contains(':') {
+                anyhow::bail!(
+                    "a forwarded socket path may not contain `:` ({}) — `-v` \
+                     splits on it, and the third field is parsed as mount options",
+                    path.display()
+                );
+            }
+        }
+        Ok(Mount {
             host,
             dest,
             readonly: false,
             kind: Kind::Socket,
-        }
+        })
     }
 
     /// Identity-path mount, writable: `host` is visible at the same
@@ -1407,7 +1425,8 @@ mod tests {
                 Mount::socket(
                     PathBuf::from("/Users/me/.pall8t/run/pall8t-x-abc12345-99.sock"),
                     PathBuf::from("/tmp/pall8t/herdr.sock"),
-                ),
+                )
+                .unwrap(),
             ],
             cpus: 4,
             memory: "8g".into(),
@@ -1443,6 +1462,41 @@ mod tests {
                 &"type=virtiofs,source=/Users/me/src/x,target=/Users/me/src/x".to_string()
             ),
             "a directory mount is unaffected by a socket mount sharing the run"
+        );
+    }
+
+    /// `-v` splits on `:`, and apple/container hands the third field to
+    /// the filesystem options unchecked (1.2.2 `Parser.volume`). A macOS
+    /// path may contain a colon, so the "no third field to mistype"
+    /// property `Mount::spec` claims has to be enforced at construction —
+    /// otherwise a home directory with a colon in it silently turns the
+    /// container path into mount options.
+    #[test]
+    fn socket_mount_refuses_a_colon_in_either_path() {
+        assert!(
+            Mount::socket(
+                PathBuf::from("/Users/me/.pall8t/run/x.sock"),
+                PathBuf::from("/tmp/pall8t/herdr.sock"),
+            )
+            .is_ok(),
+            "the ordinary case is unaffected"
+        );
+        assert!(
+            Mount::socket(
+                PathBuf::from("/Users/od:d/.pall8t/run/x.sock"),
+                PathBuf::from("/tmp/pall8t/herdr.sock"),
+            )
+            .is_err(),
+            "a colon in the host path would make the container path parse as \
+             mount options — the bridge must decline instead"
+        );
+        assert!(
+            Mount::socket(
+                PathBuf::from("/Users/me/.pall8t/run/x.sock"),
+                PathBuf::from("/tmp/pall8t/her:dr.sock"),
+            )
+            .is_err(),
+            "the container side splits the same way"
         );
     }
 

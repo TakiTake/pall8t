@@ -295,7 +295,7 @@ pub fn prepare_bridge(
     mounts.push(crate::container::Mount::socket(
         listen,
         CONTAINER_SOCKET_PATH.into(),
-    ));
+    )?);
     let mut vars = vec![
         ("HERDR_ENV".to_string(), "1".to_string()),
         ("HERDR_PANE_ID".to_string(), env.pane_id.clone()),
@@ -384,10 +384,18 @@ fn spawn_relay(
         // No line at all: the relay exited before binding (its own error
         // went to its stderr, which is dropped — this is the pall8t-side
         // symptom, and the caller warns and runs without the bridge).
+        // Reap it rather than leaving a zombie under the `container`
+        // client this process is about to become.
+        let _ = child.wait();
         anyhow::bail!("the herdr relay exited before binding {}", listen.display());
     }
     let bound = std::path::PathBuf::from(line.trim());
     if bound != listen {
+        // It bound *something* — a path this process won't mount — so it
+        // would sit there serving a policy-checked socket for the whole
+        // session with no reader. Stop it.
+        let _ = child.kill();
+        let _ = child.wait();
         anyhow::bail!("unexpected relay readiness line {line:?}");
     }
     Ok(bound)

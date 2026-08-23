@@ -90,6 +90,44 @@ local review failed to catch first (source PRs noted).
 - A banner or status line added to a doc must not contradict a claim
   further down the same doc, or the ADR/CHANGELOG describing the change.
 
+**Probes that decide destructive actions** (PR #62)
+- A health/liveness probe whose "no" triggers a delete, kill, or unlink
+  must distinguish *the peer answered no* from *the probe failed to ask*.
+  `connect(…).is_ok()`, `exists()`, `ping == 0`, a nonzero exit — each
+  collapses both into one bit. Enumerate the errnos: `ECONNREFUSED` and
+  "not found" mean gone; `EMFILE`, `EACCES`, a timeout mean the prober is
+  having a bad day, and acting on those destroys live state (a running
+  sandbox's bridge socket, in the case that named this lens). Unknown
+  must fall on the keep side, the way an unreadable mtime already does.
+- The same rule scales down: any `unwrap_or(false)` on an IO probe is a
+  policy decision about the failure case, so state which case it is.
+
+**Interpolating into a delimited wire format** (PR #62)
+- Building `a:b`, `k=v`, `x,y` for another process? The delimiter must be
+  rejected (or escaped) at the **boundary that constructs the value**, not
+  asserted in a comment. Two real ones in one PR: a `:` in `$HOME` turns a
+  two-field `-v host:guest` into a three-field one whose third field is
+  parsed as mount options, and an `=` in a project path makes
+  apple/container's label parser throw and fail the whole run.
+- Read the consumer's parser before deciding what is safe (`split(":")`,
+  `maxSplits`, whether extra fields error or are silently accepted). "This
+  form has no third field to mistype" is a claim about *inputs*, and only
+  becomes true when something enforces it.
+- Values that can't be escaped (paths) get a guard that fails the
+  feature; values that can be sanitized (labels, display strings) get
+  sanitized — never let provenance metadata break a launch.
+
+**Internal and hidden entry points** (PR #62)
+- `#[command(hide = true)]` hides a subcommand from `--help`; it does not
+  stop anyone from typing it. If the command chmods, unlinks, or sweeps a
+  directory, validate that the directory is the one it is supposed to own
+  before doing any of it — `--listen /tmp/x.sock` should not chmod `/tmp`
+  to 0700 on its way to failing.
+- Spawned children on error paths: a `bail!` between `spawn` and `wait`
+  leaks the child. Kill it if it is still doing something (it may be
+  holding a socket nothing will read), and `wait` it either way so it
+  isn't left a zombie under whatever this process execs into.
+
 **Concurrency and shared state** (PR #38)
 - Fixed-name temp files, caches, or locks that two concurrent runs can
   collide on (pall8t runs in parallel panes by design). Per-pid names +

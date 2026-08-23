@@ -178,6 +178,21 @@ struct ReqHead<'a> {
     id: Option<std::borrow::Cow<'a, str>>,
 }
 
+/// The one directory the relay may create, chmod, and sweep: its own run
+/// root. Compared as paths, not prefixes — a nested directory under the
+/// root is still not the root, and there is no reason to accept one.
+fn check_run_socket_dir(dir: &Path, root: &Path) -> Result<()> {
+    if dir != root {
+        anyhow::bail!(
+            "the relay socket must live in {} (got {}); `pall8t herdr relay` is \
+             spawned by `pall8t run`, not run by hand",
+            root.display(),
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// macOS `sun_path` holds 104 bytes including the NUL, and the kernel
 /// rejects a longer address at bind time — which is why the socket name
 /// is derived under a budget rather than taken verbatim.
@@ -250,8 +265,25 @@ fn stale_sockets(
         .collect()
 }
 
+/// Whether a connect attempt says the socket is still served.
+///
+/// Only two errors mean "nothing is listening": the socket answered with
+/// `ECONNREFUSED` (bound file, no listener — an exited run), or it is
+/// gone. Every other error means the probe itself failed — `EMFILE` under
+/// fd pressure, a permission problem, a timeout — and says nothing about
+/// the peer. Treating those as death would unlink a *live* sandbox's
+/// bridge socket, cutting its herdr calls mid-session with nothing logged
+/// on either side. Same rule as the unknown-age case: when the answer
+/// isn't known, keep.
+fn connect_says_dead(err: Option<std::io::ErrorKind>) -> bool {
+    matches!(
+        err,
+        Some(std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
+    )
+}
+
 fn socket_is_live(path: &Path) -> bool {
-    UnixStream::connect(path).is_ok()
+    !connect_says_dead(UnixStream::connect(path).err().map(|e| e.kind()))
 }
 
 /// Best-effort reaping of sockets left behind by exited runs. Failure is
@@ -321,6 +353,12 @@ pub fn run(socket: &Path, listen: &Path, mode: Mode, log_path: &Path) -> Result<
     let dir = listen
         .parent()
         .context("the relay socket path has no parent directory")?;
+    // Everything below this line is destructive — it chmods the directory
+    // to 0700 and unlinks sockets in it — so the directory is checked
+    // before any of it runs. `pall8t run` always passes the run root; a
+    // hand-run `--listen /tmp/x.sock` (the subcommand is hidden, not
+    // blocked) would otherwise chmod /tmp.
+    check_run_socket_dir(dir, &crate::config::pall8t_root()?.join("run"))?;
     std::fs::create_dir_all(dir)
         .with_context(|| format!("cannot create the relay socket directory {}", dir.display()))?;
     {
@@ -610,6 +648,64 @@ mod tests {
         assert!(
             path.to_str().is_some(),
             "truncation must not split a character and produce invalid UTF-8"
+        );
+    }
+
+    /// Reaping unlinks files, so the probe's verdict has to distinguish
+    /// "the peer answered: nothing here" from "the probe itself failed".
+    /// Under fd pressure (`EMFILE`) a healthy sandbox's socket would
+    /// otherwise be judged dead and unlinked, cutting its bridge
+    /// mid-session with nothing logged on either side.
+    #[test]
+    fn only_a_real_answer_counts_as_death() {
+        use std::io::ErrorKind;
+        assert!(
+            connect_says_dead(Some(ErrorKind::ConnectionRefused)),
+            "a bound file with no listener is exactly what an exited run leaves"
+        );
+        assert!(
+            connect_says_dead(Some(ErrorKind::NotFound)),
+            "already gone counts as gone"
+        );
+        assert!(
+            !connect_says_dead(None),
+            "a successful connect is a live peer"
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !connect_says_dead(Some(kind)),
+                "{kind:?} says the probe failed, not that the peer is gone — \
+                 err toward keeping, like an unknown age does"
+            );
+        }
+    }
+
+    #[test]
+    fn the_relay_only_touches_its_own_run_directory() {
+        let root = PathBuf::from("/Users/me/.pall8t/run");
+        assert!(
+            check_run_socket_dir(&root, &root).is_ok(),
+            "the directory `pall8t run` passes is the whole point"
+        );
+        let rejected = check_run_socket_dir(Path::new("/tmp"), &root).unwrap_err();
+        assert!(
+            rejected.to_string().contains("/Users/me/.pall8t/run"),
+            "a hand-run `--listen /tmp/x.sock` must not chmod /tmp to 0700 — \
+             the relay creates, chmods, and sweeps this directory — and the \
+             refusal has to say where the socket belongs: {rejected}"
+        );
+        assert!(
+            check_run_socket_dir(Path::new("/Users/me/.pall8t/run/nested"), &root).is_err(),
+            "a directory under the root is still not the root"
+        );
+        assert!(
+            check_run_socket_dir(Path::new("/Users/me/.pall8t"), &root).is_err(),
+            "nor is its parent, which holds the config and the container home"
         );
     }
 
