@@ -70,6 +70,87 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The layout `herdr worktree create` produces: the checkout lives
+    /// under herdr's own root (`~/.herdr/worktrees/<repo>/<branch-slug>`
+    /// by default), nowhere near the repository it belongs to. Built with
+    /// real git rather than hand-written pointer files, because what this
+    /// resolution can drift against is git's on-disk format, and the
+    /// hand-built fixture above would keep passing if it changed.
+    #[test]
+    fn resolves_a_herdr_style_worktree_created_by_real_git() {
+        let root = tmp("wt-herdr");
+        let repo = root.join("src").join("my-project");
+        fs::create_dir_all(&repo).unwrap();
+        if !git(&repo, &["init", "-q", "-b", "main", "."]) {
+            eprintln!("skipping: no usable git on PATH");
+            return;
+        }
+        fs::write(repo.join("f"), "x").unwrap();
+        assert!(git(&repo, &["add", "f"]));
+        assert!(git(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "seed",
+            ]
+        ));
+
+        // herdr's own command shape: `git -C <repo> worktree add -b
+        // <branch> <path> <base>`, with <path> under its worktrees root.
+        let checkout = root
+            .join(".herdr")
+            .join("worktrees")
+            .join("my-project")
+            .join("feature-x");
+        assert!(git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/x",
+                &checkout.display().to_string(),
+                "main",
+            ]
+        ));
+
+        let got = main_git_dir(&checkout).expect(
+            "a herdr-created worktree must resolve to the main repository's .git, \
+             or git inside the sandbox sees a dangling pointer",
+        );
+        assert_eq!(
+            got,
+            repo.join(".git").canonicalize().unwrap(),
+            "the mount pall8t adds has to be the main repo's common .git — \
+             the worktree's own pointer file names it by absolute path"
+        );
+        assert!(
+            !got.starts_with(&checkout),
+            "the resolved .git is outside the workspace mount, which is the \
+             whole reason pall8t mounts it separately"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Runs git in `dir`, reporting whether it succeeded. Returns false
+    /// when git is missing entirely, so the test can skip rather than
+    /// fail red on a machine without it.
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
     #[test]
     fn none_when_commondir_missing() {
         let root = tmp("wt-broken");
