@@ -231,33 +231,38 @@ pub fn no_mounts_warning(cli_readonly: Option<bool>, mount_count: usize) -> Opti
     )
 }
 
-/// `GIT_CONFIG_*` environment marking every read-only path as a git
+/// `GIT_CONFIG_*` environment marking every mounted path as a git
 /// `safe.directory`, or empty when there are none.
 ///
-/// Necessary because a read-only virtiofs mount does not carry
-/// apple/container's uid/gid remapping: a directory the host shows as
-/// `501:20` appears inside the container as `0:0`, while the writable
-/// workspace mounted beside it appears as `501:20` (measured on 1.2.2).
-/// Contents stay readable — the mode bits are unchanged — but git compares
-/// the repository's owner against its own euid and refuses everything with
-/// "detected dubious ownership". A repository the agent cannot run
-/// `git log` in is not delivering the read access it was mounted for.
+/// Necessary because a mount's own directory inode does not carry
+/// apple/container's uid/gid remapping: a mount point the host shows as
+/// `501:20` appears inside the container as `0:0`, while the files and
+/// directories *inside* it map correctly (measured on 1.2.2 — a
+/// repository's `.git` reads `501:20` while the checkout containing it
+/// reads `0:0`). Git compares the repository's top-level owner against
+/// its own euid, so it refuses `status`, `log`, and `rev-parse` with
+/// "detected dubious ownership" — in the *workspace itself*, not only in
+/// read-only reference mounts.
 ///
-/// Applied to every read-only mount, not only the ones that look like
-/// repositories: a directory that merely *contains* checkouts hits the
-/// same wall, and a `safe.directory` entry naming a path with no repo in
-/// it does nothing. Scoped to the exact paths pall8t mounted, via env
-/// rather than a config file, because `safe.directory = *` in the image
-/// would disable the check for every repository the sandbox ever sees.
-pub fn safe_directory_env(readonly_paths: &[PathBuf]) -> Vec<(String, String)> {
-    if readonly_paths.is_empty() {
+/// That is why this covers every mount rather than the read-only ones it
+/// originally shipped for: the earlier measurement read a path inside a
+/// writable mount (which maps) instead of the mount point (which does
+/// not), so the workspace looked fine while `git status` in it did not
+/// work. Applied to mounts that don't look like repositories too: a
+/// directory that merely *contains* checkouts hits the same wall, and a
+/// `safe.directory` entry naming a path with no repo in it does nothing.
+/// Scoped to the exact paths pall8t mounted, via env rather than a config
+/// file, because `safe.directory = *` in the image would disable the
+/// check for every repository the sandbox ever sees.
+pub fn safe_directory_env(mount_targets: &[PathBuf]) -> Vec<(String, String)> {
+    if mount_targets.is_empty() {
         return Vec::new();
     }
     let mut env = vec![(
         "GIT_CONFIG_COUNT".to_string(),
-        readonly_paths.len().to_string(),
+        mount_targets.len().to_string(),
     )];
-    for (i, path) in readonly_paths.iter().enumerate() {
+    for (i, path) in mount_targets.iter().enumerate() {
         env.push((format!("GIT_CONFIG_KEY_{i}"), "safe.directory".to_string()));
         env.push((
             format!("GIT_CONFIG_VALUE_{i}"),
@@ -750,7 +755,17 @@ mod tests {
     fn safe_directory_env_table() {
         assert!(
             safe_directory_env(&[]).is_empty(),
-            "no read-only mounts, no git config to inject"
+            "nothing mounted, no git config to inject"
+        );
+
+        let workspace = PathBuf::from("/Users/me/src/x");
+        let env = safe_directory_env(std::slice::from_ref(&workspace));
+        assert!(
+            env.iter().any(|(_, v)| *v == workspace.to_string_lossy()),
+            "the workspace is a mount like any other, and its mount point is \
+             root-owned inside the container — without an entry for it, \
+             `git status` in the agent's own working directory fails with \
+             dubious ownership (measured on container 1.2.2)"
         );
 
         let env = safe_directory_env(&[PathBuf::from("/a"), PathBuf::from("/b/c")]);

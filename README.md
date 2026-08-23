@@ -151,6 +151,17 @@ pall8t run
 
 pall8t detects that cwd's `.git` is a worktree pointer and identity-mounts the main repository's `.git` alongside, so `status`/`commit`/`diff` inside the container behave exactly as on the host.
 
+herdr can cut the worktree for you, which is the natural pairing — one pane per task, each with its own checkout and its own sandbox:
+
+```sh
+herdr worktree create --branch task    # checkout under ~/.herdr/worktrees/<repo>/<branch-slug>
+pall8t run                             # in the pane herdr opens there
+```
+
+That layout puts the checkout far from the repository it belongs to (under herdr's own root rather than beside the main checkout), which pall8t handles the same way — the worktree's pointer file names the main `.git` by absolute path, and that path is mounted. Pinned by a test that builds the layout with real git.
+
+Either way, every path pall8t mounts is marked `safe.directory` for git inside the container. It has to be: a mount's own directory arrives owned by root there (the files inside it map to you correctly), and git refuses a repository whose top-level directory it doesn't think you own.
+
 ## herdr integration
 
 Type `pall8t run` into a herdr pane and herdr recognizes the sandboxed agent as-is — no wrapper function or special launch command needed (the agent-state bullet below explains how, and when a name can't be derived). herdr injects `HERDR_ENV`/`HERDR_PANE_ID`/`HERDR_SOCKET_PATH`/`HERDR_BIN_PATH` into `pall8t` itself (the host process), not into the sandboxed `claude`, so pall8t acts on them before it execs into the container:
