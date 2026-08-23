@@ -37,6 +37,9 @@ pub struct Config {
     /// Forward the host's SSH agent socket into the sandbox
     /// (`container run --ssh`). Off by default — see [`ssh_enabled`].
     pub ssh: bool,
+    /// How much the runtime confines the sandbox beyond the VM boundary
+    /// itself (see [`Hardening`]).
+    pub hardening: Hardening,
     pub mounts: Vec<MountEntry>,
     /// `[herdr]` — how much of the host herdr session a sandboxed agent
     /// may reach through the relay bridge (see [`crate::relay`]).
@@ -84,6 +87,38 @@ impl HerdrSandbox {
             HerdrSandbox::Full => "full",
             HerdrSandbox::Readonly => "readonly",
             HerdrSandbox::Off => "off",
+        }
+    }
+}
+
+/// How much the runtime confines the container, on top of the VM
+/// boundary that is always there.
+///
+/// `default` is what pall8t has always run: a writable root filesystem
+/// and the runtime's own capability set. `strict` drops every Linux
+/// capability, mounts the root filesystem read-only, and gives `/tmp` a
+/// tmpfs to write to — so the only writable paths left are the ones
+/// pall8t mounted on purpose (the workspace and the container home).
+///
+/// Opt-in rather than the default because it is the project's toolchain
+/// that decides whether it holds: a build that writes outside the
+/// workspace, or a tool that needs a capability, breaks under `strict`
+/// and works under `default`. Verified on apple/container 1.2.2 —
+/// `--read-only` yields `EROFS` outside the mounts, `--cap-drop ALL`
+/// leaves `CapEff: 0000000000000000`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Hardening {
+    #[default]
+    Default,
+    Strict,
+}
+
+impl Hardening {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Hardening::Default => "default",
+            Hardening::Strict => "strict",
         }
     }
 }
@@ -290,6 +325,7 @@ struct RawContainer {
     containerfile: Option<PathBuf>,
     watch: Option<Vec<PathBuf>>,
     ssh: Option<bool>,
+    hardening: Option<Hardening>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -530,6 +566,11 @@ fn merge(global: Raw, project: Raw) -> Config {
             (_, Some(false)) => false,
             (g, _) => g.unwrap_or(false),
         },
+        hardening: project
+            .container
+            .hardening
+            .or(global.container.hardening)
+            .unwrap_or_default(),
         mounts: project.mounts.or(global.mounts).unwrap_or_default(),
         // `[home]` is parsed and ignored; `load` turns its presence into a
         // deprecation message, which `merge` (path-less) can't produce.
@@ -571,6 +612,16 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # `pall8t run --ssh` / `--ssh=false`. Honored here and from the flag
 # only: a project's .pall8t/config.toml may turn it off, never on.
 # ssh = false
+#
+# How much the runtime confines the sandbox, on top of the VM boundary
+# that is always there:
+#   "default" (default) writable root filesystem, the runtime's own
+#             capability set — what every pall8t release has run
+#   "strict"  every Linux capability dropped, root filesystem read-only,
+#             /tmp on a tmpfs: the only writable paths left are the
+#             workspace and the container home. Opt in per project — a
+#             toolchain that writes outside those breaks under it.
+# hardening = "default"
 
 [run]
 # Command run by `pall8t run`. --dangerously-skip-permissions is NOT in
@@ -644,6 +695,11 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 # `ssh = true` in it is ignored (with a warning). Switching it on is the
 # human's call — ~/.pall8t/config.toml or `pall8t run --ssh`.
 # ssh = false
+#
+# "strict" drops every capability, mounts the root filesystem read-only,
+# and puts /tmp on a tmpfs — see ~/.pall8t/config.toml. Try it per
+# project: whether it holds depends on this project's toolchain.
+# hardening = "default"
 
 [run]
 # command = ["claude"]
@@ -898,6 +954,33 @@ mod tests {
         assert!(
             project_ssh_ignored_warning(&Raw::default(), &Raw::default(), path).is_none(),
             "and a project that said nothing asked for nothing"
+        );
+    }
+
+    #[test]
+    fn hardening_defaults_to_off_and_merges_per_field() {
+        assert_eq!(
+            merge(Raw::default(), Raw::default()).hardening,
+            Hardening::Default,
+            "confinement beyond what pall8t has always run is opt-in: a \
+             toolchain that breaks under it must not break on upgrade"
+        );
+        let global = parse("[container]\nhardening = \"strict\"\n");
+        assert_eq!(
+            merge(global.clone(), Raw::default()).hardening,
+            Hardening::Strict
+        );
+        let project = parse("[container]\nhardening = \"default\"\n");
+        assert_eq!(
+            merge(global, project).hardening,
+            Hardening::Default,
+            "a project can opt back out of a global strict setting — the \
+             project knows its own toolchain"
+        );
+        assert!(
+            toml::from_str::<Raw>("[container]\nhardening = \"paranoid\"\n").is_err(),
+            "an unknown level must fail the parse rather than silently \
+             leaving the sandbox at default confinement"
         );
     }
 
