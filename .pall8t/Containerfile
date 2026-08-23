@@ -51,7 +51,7 @@ RUN printf '%s\n' \
 # GC-rooted out-links to store paths (the Rust toolchain — rustc/cargo/
 # rustfmt/clippy plus rust-analyzer + rust-src for editor tooling and the
 # aarch64-apple-darwin std for scripts/lint.sh's cross-target clippy gate —
-# and the #sandbox-tools env: git, ripgrep, jq, less, vim, tmux, socat, gh,
+# and the #sandbox-tools env: git, ripgrep, jq, less, vim, tmux, gh,
 # node; see flake.nix); the closures are self-contained (RPATH into
 # /nix/store), so they run on Ubuntu as-is. `nix store gc` then drops the
 # build-time-only paths (flake inputs, eval caches) the out-links don't

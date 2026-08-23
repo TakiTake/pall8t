@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The herdr sandbox bridge is now a mounted Unix socket, not a TCP
+  relay.** The host-side relay listens on its own socket under
+  `~/.pall8t/run/` and pall8t mounts that socket into the container at
+  `HERDR_SOCKET_PATH`; apple/container forwards a mount whose source is a
+  Unix socket into the guest as a live socket (verified on 1.2.2 — the
+  ADR-0007 premise that mounts can't do this was an artifact of pall8t
+  only ever emitting `--mount`, whose parser takes directories alone).
+  Consequences: **custom Containerfiles no longer need `socat`** (and the
+  default image no longer installs it), the relay no longer opens a TCP
+  port on the vmnet gateway, and `PALL8T_HERDR_PORT` is gone. Policy
+  classification and the audit log are unchanged — `herdr.sock` itself is
+  still never mounted into the sandbox.
 - **A project Containerfile now builds with the project directory as its
   build context** (ADR-0010), instead of the Containerfile's own directory.
   `COPY` paths resolve relative to the project root, so a

@@ -155,11 +155,7 @@ pub fn resolve(
             None
         };
 
-        mounts.push(Mount {
-            host: source.clone(),
-            dest: target,
-            readonly,
-        });
+        mounts.push(Mount::new(source.clone(), target, readonly));
         if let Some(git_dir) = git_dir {
             // This mount is pall8t's idea, not the user's, so it defers to
             // anything already covering that path rather than stacking a
