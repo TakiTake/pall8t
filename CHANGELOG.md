@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but a step whose instruction text didn't change — e.g. the claude CLI's
   `npm install -g` in the dev image — was still served from the layer
   cache, so "latest" fetches never actually refreshed.
+- **The bridge refuses reports claiming one of herdr's own integration
+  sources** (`herdr:claude`, …), in every sandbox mode. herdr recognizes
+  those sources as native integrations, stores the session they report,
+  and resumes such a pane after a server restart by running the agent's
+  resume command **on the host, outside the sandbox**. Reporting under
+  any other source (e.g. `custom:my-agent`) is unaffected, and Claude
+  Code's state detection is unaffected either way — herdr's integration
+  for it carries session identity only.
+- **Sandbox provenance tokens for the herdr sidebar**: `$pall8t_image`
+  and `$pall8t_container` are reported alongside the pane's display name.
 
 ### Changed
 

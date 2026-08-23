@@ -75,7 +75,11 @@ pub fn agent_hint(env: &HerdrEnv, command: &[String]) -> Option<String> {
 /// here is best-effort chrome — failures warn and the run continues — and
 /// with no derivable name it does nothing at all: better to leave the
 /// pane's herdr-side identity alone than to assert a guess.
-pub fn announce_pane_identity(env: &HerdrEnv, command: &[String]) -> Option<String> {
+pub fn announce_pane_identity(
+    env: &HerdrEnv,
+    command: &[String],
+    provenance: &Provenance,
+) -> Option<String> {
     let agent = agent_hint(env, command)?;
     // The command wins over HERDR_AGENT (see agent_hint); say so when they
     // disagree, or the shadowed env var is undebuggable.
@@ -85,7 +89,7 @@ pub fn announce_pane_identity(env: &HerdrEnv, command: &[String]) -> Option<Stri
              command); HERDR_AGENT={env_agent:?} ignored"
         );
     }
-    if let Err(e) = report_metadata(env, &agent) {
+    if let Err(e) = report_metadata(env, &agent, provenance) {
         eprintln!("pall8t: warning: could not report herdr pane metadata: {e:#}");
     }
     Some(agent)
@@ -184,7 +188,33 @@ pub fn maybe_override_for_herdr(command: Vec<String>, herdr_active: bool) -> Vec
     }
 }
 
-fn report_metadata_argv(pane_id: &str, agent: &str) -> Vec<String> {
+/// What this run is, for the herdr sidebar: the image it booted and the
+/// container it runs as. Both are things a user comparing several
+/// sandboxed panes actually needs — which image tag is this one on, and
+/// which container do I `pall8t exec` into.
+pub struct Provenance {
+    pub image: String,
+    pub container: String,
+}
+
+/// herdr caps a token value at 80 characters and drops the report if a
+/// value carries control characters, so long image tags are trimmed here
+/// rather than silently costing the whole metadata report.
+const TOKEN_VALUE_MAX: usize = 80;
+
+fn token_value(value: &str) -> String {
+    let clean: String = value.chars().filter(|c| !c.is_control()).collect();
+    if clean.chars().count() <= TOKEN_VALUE_MAX {
+        return clean;
+    }
+    // Keep the tail: an image tag's distinguishing part (the content hash)
+    // is at the end, and the shared `pall8t-<project>` head is what every
+    // pane in a project has in common anyway.
+    let skip = clean.chars().count() - (TOKEN_VALUE_MAX - 1);
+    format!("…{}", clean.chars().skip(skip).collect::<String>())
+}
+
+fn report_metadata_argv(pane_id: &str, agent: &str, provenance: &Provenance) -> Vec<String> {
     vec![
         "pane".into(),
         "report-metadata".into(),
@@ -193,6 +223,10 @@ fn report_metadata_argv(pane_id: &str, agent: &str) -> Vec<String> {
         "user:pall8t".into(),
         "--display-agent".into(),
         format!("{agent} (pall8t)"),
+        "--token".into(),
+        format!("pall8t_image={}", token_value(&provenance.image)),
+        "--token".into(),
+        format!("pall8t_container={}", token_value(&provenance.container)),
     ]
 }
 
@@ -206,8 +240,13 @@ fn report_metadata_argv(pane_id: &str, agent: &str) -> Vec<String> {
 /// taken effect, and the report must not depend on that. Confirmed live:
 /// with `--agent claude` set and no argv0 hint, `herdr pane get` never
 /// surfaces `display_agent`; omitting it, the field shows up immediately.
-fn report_metadata(env: &HerdrEnv, agent: &str) -> Result<()> {
-    let argv = report_metadata_argv(&env.pane_id, agent);
+/// The tokens ride along in the same report: herdr has accepted
+/// `--token` since 0.7.5 (the oldest release pall8t's bridge targets), so
+/// a second call would only buy protection against a version nothing
+/// supports. The whole report is best-effort anyway — a failure warns and
+/// the run continues without a sidebar name.
+fn report_metadata(env: &HerdrEnv, agent: &str, provenance: &Provenance) -> Result<()> {
+    let argv = report_metadata_argv(&env.pane_id, agent, provenance);
     crate::util::run_ok(env.herdr_bin(), &argv)?;
     Ok(())
 }
@@ -812,13 +851,21 @@ mod tests {
         );
     }
 
+    fn provenance() -> Provenance {
+        Provenance {
+            image: "pall8t-x:501-20-abc123456789".to_string(),
+            container: "pall8t-x-abc12345-99".to_string(),
+        }
+    }
+
     #[test]
     fn report_metadata_argv_shape() {
         assert!(
-            report_metadata_argv("p1", "codex").contains(&"codex (pall8t)".to_string()),
+            report_metadata_argv("p1", "codex", &provenance())
+                .contains(&"codex (pall8t)".to_string()),
             "the agent name is interpolated, not hardcoded"
         );
-        let argv = report_metadata_argv("p1", "claude");
+        let argv = report_metadata_argv("p1", "claude", &provenance());
         assert_eq!(
             argv,
             vec![
@@ -829,11 +876,42 @@ mod tests {
                 "user:pall8t",
                 "--display-agent",
                 "claude (pall8t)",
+                "--token",
+                "pall8t_image=pall8t-x:501-20-abc123456789",
+                "--token",
+                "pall8t_container=pall8t-x-abc12345-99",
             ],
             "no --agent: herdr's display_agent guard requires it to match \
              effective_agent_label(), which is host-process-name-derived — \
              true only after the argv0 hint kicks in, and this report must \
-             not depend on it (confirmed live)"
+             not depend on it (confirmed live). The tokens render as \
+             $pall8t_image / $pall8t_container in a configured sidebar row"
+        );
+    }
+
+    #[test]
+    fn token_values_survive_herdr_s_limits() {
+        assert_eq!(
+            token_value("pall8t-x:501-20-abc123456789"),
+            "pall8t-x:501-20-abc123456789",
+            "an ordinary tag passes through untouched"
+        );
+        let long = format!("pall8t-{}:501-20-deadbeefcafe", "x".repeat(120));
+        let cut = token_value(&long);
+        assert_eq!(
+            cut.chars().count(),
+            80,
+            "herdr caps a token value at 80 characters; sending more costs the \
+             whole metadata report, sidebar name included"
+        );
+        assert!(
+            cut.ends_with("501-20-deadbeefcafe"),
+            "the tail is what distinguishes two panes of the same project — \
+             trimming must keep the content hash, not the shared prefix"
+        );
+        assert!(
+            !token_value("tag\nwith\tcontrols").contains('\n'),
+            "control characters would make herdr reject the report"
         );
     }
 

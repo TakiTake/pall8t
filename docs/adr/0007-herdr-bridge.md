@@ -112,6 +112,19 @@ Two facts about apple/container, verified live on 1.1.0, shape the design:
   covers where admin methods actually land; the residual risk is a future
   admin method placed outside those namespaces, accepted and revisitable.
 
+Orthogonal to the three classes, and denied in **every** mode: a request
+whose `params.source` starts with `herdr:`. Those sources are herdr's own
+integrations — it recognizes them as official, stores the session
+identity they report, and after a server restart resumes such a pane by
+running the agent's own resume command in it, **on the host, outside the
+sandbox** (herdr 0.8.2: `persist/restore.rs` -> `agent_resume::plan`). A
+sandboxed agent claiming one would arrange for its own unsandboxed
+resurrection, so the bridge refuses it and says why. Reports under any
+other source — herdr documents `custom:<name>` for third parties — pass
+untouched. This costs nothing in state detection: herdr's Claude Code
+integration carries session identity only, and its state authority is the
+screen manifest either way.
+
 Denied requests get a herdr-shaped error
 (`{"id":…,"error":{"code":"sandbox_denied",…}}`) naming the config knob,
 so the in-container CLI fails legibly and the agent knows it's a policy,

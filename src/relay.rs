@@ -153,6 +153,25 @@ fn deny_response(id: &str, method: &str, mode: Mode) -> String {
          \"{}\"; see the pall8t config to change this)",
         mode.as_str()
     );
+    error_response(id, &msg)
+}
+
+/// Denial for a request claiming one of herdr's own integration sources.
+/// Separate from [`deny_response`] because this one is not about
+/// `[herdr] sandbox` at all — no mode permits it, and the message has to
+/// say why rather than point at a config knob the user can turn.
+fn reserved_source_response(id: &str, method: &str, source: &str) -> String {
+    let msg = format!(
+        "pall8t blocked `{method}` from the sandbox: it reports under \
+         `{source}`, a source herdr reserves for its own integrations. herdr \
+         would treat this pane as natively integrated and, after a server \
+         restart, resume it by running the agent on the host — outside the \
+         sandbox. Report under your own source instead (e.g. `custom:my-agent`)."
+    );
+    error_response(id, &msg)
+}
+
+fn error_response(id: &str, msg: &str) -> String {
     serde_json::json!({
         "id": id,
         "error": { "code": "sandbox_denied", "message": msg }
@@ -176,6 +195,37 @@ struct ReqHead<'a> {
     method: Option<std::borrow::Cow<'a, str>>,
     #[serde(default, borrow)]
     id: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    params: Option<ReqParams<'a>>,
+}
+
+/// The one field of `params` policy reads: the reporting source a request
+/// claims for itself (see [`claims_reserved_source`]). Every other param
+/// stays unparsed.
+#[derive(serde::Deserialize)]
+struct ReqParams<'a> {
+    #[serde(default, borrow)]
+    source: Option<std::borrow::Cow<'a, str>>,
+}
+
+/// Prefix herdr reserves for its own shipped integrations
+/// (`herdr:claude`, `herdr:codex`, …). Its custom-integration guide tells
+/// third parties to use something else (`custom:my-agent`).
+const RESERVED_SOURCE_PREFIX: &str = "herdr:";
+
+/// Whether a request claims to be one of herdr's own integrations.
+///
+/// A sandboxed agent reporting under `herdr:<agent>` is not a cosmetic
+/// lie: herdr recognizes exactly those sources as *official*
+/// (`is_official_agent_source`), stores the session reference they report,
+/// and on a server restart resumes the pane by running the agent's own
+/// resume command — `claude --resume <id>` — **in the pane on the host,
+/// outside the sandbox** (herdr 0.8.2, `persist/restore.rs` →
+/// `agent_resume::plan`). A pane the user sandboxed would come back
+/// unsandboxed. Reports under any other source are none of pall8t's
+/// business and pass untouched.
+pub fn claims_reserved_source(source: Option<&str>) -> bool {
+    source.is_some_and(|s| s.starts_with(RESERVED_SOURCE_PREFIX))
 }
 
 /// The one directory the relay may create, chmod, and sweep: its own run
@@ -452,6 +502,34 @@ fn handle(mut conn: UnixStream, socket: &Path, mode: Mode, log_path: &Path) -> R
         .and_then(|h| h.method.as_deref())
         .unwrap_or("");
     let id = head.as_ref().and_then(|h| h.id.as_deref()).unwrap_or("");
+    let source = head
+        .as_ref()
+        .and_then(|h| h.params.as_ref())
+        .and_then(|p| p.source.as_deref());
+
+    // Denied in every mode, ahead of the method policy: this is not about
+    // how much of herdr the sandbox may touch, but about the sandbox
+    // claiming to *be* a herdr integration (see [`claims_reserved_source`]).
+    //
+    // A request whose head doesn't parse reaches this with `source: None`
+    // and is forwarded under `full` (below) — that is not a way around
+    // the rule: every request herdr itself accepts parses here too. Its
+    // `Request.id` is a required String and `params` is a typed object
+    // per method (herdr 0.8.2 `api/schema.rs`), so anything `ReqHead`
+    // rejects, herdr rejects as well.
+    if claims_reserved_source(source) {
+        let source = source.unwrap_or("");
+        audit(
+            log_path,
+            &serde_json::json!({
+                "ts": epoch_secs(), "event": "deny_source",
+                "method": method, "source": source,
+            }),
+        );
+        conn.write_all(reserved_source_response(id, method, source).as_bytes())?;
+        conn.write_all(b"\n")?;
+        return Ok(());
+    }
 
     // An unparseable line has no method to check: in full mode it is
     // forwarded (herdr answers `invalid_request` itself — staying out of
@@ -558,6 +636,81 @@ mod tests {
         assert!(allowed(Mode::Readonly, "pane.read"));
         assert!(!allowed(Mode::Readonly, "pane.split"));
         assert!(!allowed(Mode::Readonly, "server.stop"));
+    }
+
+    #[test]
+    fn claims_reserved_source_table() {
+        assert!(
+            claims_reserved_source(Some("herdr:claude")),
+            "herdr's own Claude integration source: reporting under it makes \
+             herdr resume this pane on the host after a restart"
+        );
+        assert!(
+            claims_reserved_source(Some("herdr:anything-new")),
+            "the whole prefix is reserved, so an integration source a newer \
+             herdr adds is covered before pall8t has heard of it"
+        );
+        assert!(
+            !claims_reserved_source(Some("custom:my-agent")),
+            "the source herdr's own custom-integration guide tells third \
+             parties to use must keep working from inside the sandbox"
+        );
+        assert!(
+            !claims_reserved_source(Some("user:pall8t")),
+            "pall8t's own host-side reports use this source; the rule is about \
+             what the sandbox claims, not about the string being pall8t's"
+        );
+        assert!(
+            !claims_reserved_source(Some("herdr")),
+            "only the `herdr:` namespace is reserved — a source that merely \
+             starts with the letters is not claiming an integration"
+        );
+        assert!(
+            !claims_reserved_source(None),
+            "most methods carry no source at all and must pass untouched"
+        );
+    }
+
+    /// The reserved-source check must not depend on the rest of the head
+    /// being well formed: a report with no `id` still reports, and herdr
+    /// accepts it. (A head that fails to parse *entirely* is a different
+    /// case — see the note in `handle`: herdr rejects those too.)
+    #[test]
+    fn reserved_source_is_denied_even_without_a_request_id() {
+        let dir = test_dir("noid");
+        let (listen, _) = start_relay(Mode::Full, &dir);
+        let resp = roundtrip(
+            &listen,
+            r#"{"method":"pane.report_agent_session","params":{"source":"herdr:claude","agent":"claude"}}"#,
+        );
+        assert_eq!(
+            resp["error"]["code"], "sandbox_denied",
+            "the source is what is refused; a missing id must not smuggle it past"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reserved_source_response_explains_the_hazard() {
+        let resp: serde_json::Value = serde_json::from_str(&reserved_source_response(
+            "req_3",
+            "pane.report_agent_session",
+            "herdr:claude",
+        ))
+        .unwrap();
+        assert_eq!(resp["id"], "req_3");
+        assert_eq!(resp["error"]["code"], "sandbox_denied");
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("herdr:claude") && msg.contains("outside the sandbox"),
+            "the agent must learn what it did and why it is refused, not just \
+             that something was blocked: {msg}"
+        );
+        assert!(
+            !msg.contains("[herdr] sandbox"),
+            "no mode permits this, so the message must not point at a config \
+             knob as if turning it would help"
+        );
     }
 
     #[test]
@@ -922,6 +1075,44 @@ mod tests {
         assert!(
             received.contains("\"id\":\"r1\"") && received.contains("\"id\":\"r2\""),
             "both pipelined requests must reach the upstream socket, got: {received}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hazard this rule exists for, end to end: herdr's own Claude
+    /// integration, installed in the container home, reports the sandboxed
+    /// session under `herdr:claude`. herdr would then store it as a native
+    /// session and resume the pane by running `claude --resume <id>` on the
+    /// host after a server restart — unsandboxed. `full` mode is otherwise
+    /// transparent, so this is the one thing it stops.
+    #[test]
+    fn relay_denies_a_sandbox_report_claiming_herdrs_own_source() {
+        let dir = test_dir("source");
+        let (listen, log) = start_relay(Mode::Full, &dir);
+
+        let resp = roundtrip(
+            &listen,
+            r#"{"id":"r1","method":"pane.report_agent_session","params":{"pane_id":"%1","source":"herdr:claude","agent":"claude","agent_session_id":"abc"}}"#,
+        );
+        assert_eq!(
+            resp["error"]["code"], "sandbox_denied",
+            "an official-source report must not reach herdr, even in full mode"
+        );
+
+        let resp = roundtrip(
+            &listen,
+            r#"{"id":"r2","method":"pane.report_agent","params":{"pane_id":"%1","source":"custom:mine","agent":"claude","state":"working"}}"#,
+        );
+        assert_eq!(
+            resp["result"]["echo"]["method"], "pane.report_agent",
+            "reporting under its own source is exactly what a sandboxed agent \
+             should be able to do, and still works"
+        );
+
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains("deny_source") && logged.contains("herdr:claude"),
+            "the audit log names the source, since that is what was refused"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

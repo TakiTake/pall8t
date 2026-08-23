@@ -282,9 +282,13 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
     } else {
         cli_command
     };
+    let provenance = herdr::Provenance {
+        image: resolved.tag.clone(),
+        container: run_name.clone(),
+    };
     let herdr_agent = herdr_env
         .as_ref()
-        .and_then(|env| herdr::announce_pane_identity(env, &command));
+        .and_then(|env| herdr::announce_pane_identity(env, &command, &provenance));
     // The bridge (ADR-0007) makes the herdr CLI work inside the sandbox:
     // relay + env + Linux binary mount + bootstrap wrap. Best-effort — a
     // bridge failure warns and the run proceeds without it.
