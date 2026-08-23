@@ -698,6 +698,13 @@ pub struct RunSpec {
     /// producer today is the herdr bridge (`HERDR_*` identity — see
     /// [`crate::herdr`]).
     pub env: Vec<(String, String)>,
+    /// Forward the host's SSH agent socket (`--ssh`). apple/container
+    /// takes `SSH_AUTH_SOCK` from *this* process's environment and
+    /// forwards that socket into the guest at
+    /// `/var/host-services/ssh-auth.sock`, setting the guest's own
+    /// `SSH_AUTH_SOCK` to it — so no key material crosses the boundary,
+    /// only signing requests. Opt-in per [`crate::config::ssh_enabled`].
+    pub ssh: bool,
     pub command: Vec<String>,
 }
 
@@ -710,6 +717,9 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
         argv.push("-t".into());
     }
     argv.extend(["--rm".into(), "--name".into(), spec.name.clone()]);
+    if spec.ssh {
+        argv.push("--ssh".into());
+    }
     for m in &spec.mounts {
         let (flag, value) = m.spec();
         argv.push(flag.into());
@@ -1426,6 +1436,7 @@ mod tests {
             gid: 20,
             tty: false,
             env: vec![],
+            ssh: false,
             command: vec!["claude".into()],
         };
         let argv = run_argv(&spec);
@@ -1493,6 +1504,36 @@ mod tests {
     }
 
     #[test]
+    fn ssh_forwarding_emits_the_flag() {
+        let spec = RunSpec {
+            name: "pall8t-x-abc12345-99".into(),
+            image: "img".into(),
+            workdir: PathBuf::from("/Users/me/src/x"),
+            mounts: vec![],
+            cpus: 4,
+            memory: "8g".into(),
+            uid: 501,
+            gid: 20,
+            tty: false,
+            env: vec![],
+            ssh: true,
+            command: vec!["claude".into()],
+        };
+        let argv = run_argv(&spec);
+        assert!(
+            argv.contains(&"--ssh".to_string()),
+            "`ssh = true` must reach the runtime as --ssh; the flag is the whole \
+             feature, and nothing else in the argv hints at it"
+        );
+        let image_pos = argv.iter().position(|a| a == "img").unwrap();
+        assert!(
+            argv.iter().position(|a| a == "--ssh").unwrap() < image_pos,
+            "flags precede the image positional, or the runtime reads --ssh as \
+             an argument to the container command"
+        );
+    }
+
+    #[test]
     fn run_argv_shape() {
         let spec = RunSpec {
             name: "pall8t-x-abc12345-99".into(),
@@ -1515,9 +1556,15 @@ mod tests {
             gid: 20,
             tty: true,
             env: vec![("HERDR_ENV".into(), "1".into())],
+            ssh: false,
             command: vec!["claude".into()],
         };
         let argv = run_argv(&spec);
+        assert!(
+            !argv.contains(&"--ssh".to_string()),
+            "agent forwarding is opt-in: a run that didn't ask for it must not \
+             hand the sandbox the host's SSH agent"
+        );
         let e = argv.iter().position(|a| a == "-e").unwrap();
         assert_eq!(
             argv[e + 1],

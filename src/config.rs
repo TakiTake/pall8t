@@ -34,6 +34,9 @@ pub struct Config {
     /// path validation and [`crate::image::combined_hash`] for the hash.
     pub watch: Vec<PathBuf>,
     pub command: Vec<String>,
+    /// Forward the host's SSH agent socket into the sandbox
+    /// (`container run --ssh`). Off by default — see [`ssh_enabled`].
+    pub ssh: bool,
     pub mounts: Vec<MountEntry>,
     /// `[herdr]` — how much of the host herdr session a sandboxed agent
     /// may reach through the relay bridge (see [`crate::relay`]).
@@ -119,6 +122,41 @@ pub fn mount_readonly(entry: &MountEntry, cli_override: Option<bool>) -> bool {
     cli_override.or(entry.readonly).unwrap_or(false)
 }
 
+/// Whether this run forwards the host SSH agent, given the merged config
+/// and the `--ssh` override from the command line.
+///
+/// Same precedence as [`mount_readonly`] — flag beats config beats
+/// default — and the default is **off**. Forwarding the agent lets the
+/// sandboxed agent authenticate as the user anywhere the user's keys are
+/// trusted, for the lifetime of the run; that is a capability the sandbox
+/// otherwise lacks, so it is opt-in even though it is *safer* than the
+/// alternative it replaces (a private key copied into the container
+/// home, which the sandbox can read and keeps after the run).
+pub fn ssh_enabled(config: bool, cli_override: Option<bool>) -> bool {
+    cli_override.unwrap_or(config)
+}
+
+/// Warning for a run that asked for SSH forwarding on a host with no
+/// agent. Verified on container 1.2.2: the runtime logs "ssh forwarding
+/// requested but no `SSH_AUTH_SOCK` found" to its *own* log, forwards
+/// nothing — and still sets `SSH_AUTH_SOCK` inside the container, so the
+/// sandbox sees a path with no socket behind it. Without this warning the
+/// user gets only a connect failure from `ssh` and no cause. `None` when
+/// there is nothing to say.
+pub fn ssh_warning(enabled: bool, host_auth_sock: Option<&str>) -> Option<String> {
+    let missing = host_auth_sock.is_none_or(str::is_empty);
+    (enabled && missing).then(|| {
+        concat!(
+            "pall8t: warning: [container] ssh is on, but SSH_AUTH_SOCK is unset ",
+            "on the host — there is no agent to forward. SSH_AUTH_SOCK is still set ",
+            "inside the sandbox, pointing at a socket that isn't there, so ",
+            "git-over-SSH will fail on connect. Start an agent (ssh-add) or set ",
+            "ssh = false."
+        )
+        .to_string()
+    })
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Raw {
     #[serde(default)]
@@ -162,6 +200,7 @@ struct RawContainer {
     memory: Option<String>,
     containerfile: Option<PathBuf>,
     watch: Option<Vec<PathBuf>>,
+    ssh: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -371,6 +410,11 @@ fn merge(global: Raw, project: Raw) -> Config {
             .command
             .or(global.run.command)
             .unwrap_or_else(|| vec!["claude".to_string()]),
+        ssh: project
+            .container
+            .ssh
+            .or(global.container.ssh)
+            .unwrap_or(false),
         mounts: project.mounts.or(global.mounts).unwrap_or_default(),
         // `[home]` is parsed and ignored; `load` turns its presence into a
         // deprecation message, which `merge` (path-less) can't produce.
@@ -403,6 +447,13 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # cpus = 4
 # memory = "8g"
 # containerfile = "/absolute/path/to/Containerfile"
+#
+# Forward the host's SSH agent into the sandbox, so the agent can push
+# over SSH without a private key ever entering the container home. Off by
+# default: while it is running, code in the sandbox can authenticate as
+# you anywhere your keys are trusted. Override for one run with
+# `pall8t run --ssh` / `--ssh=false`.
+# ssh = false
 
 [run]
 # Command run by `pall8t run`. --dangerously-skip-permissions is NOT in
@@ -466,6 +517,10 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 # Containerfile (containerfile above or .pall8t/Containerfile); paths are
 # relative to the project dir and must exist.
 # watch = ["flake.nix", "flake.lock"]
+#
+# Forward the host's SSH agent into this project's sandbox — see
+# ~/.pall8t/config.toml for what that grants. Off by default.
+# ssh = false
 
 [run]
 # command = ["claude"]
@@ -601,6 +656,63 @@ mod tests {
             toml::from_str::<Raw>("[herdr]\nauto_renam = true\n").is_err(),
             "a misspelled key fails the parse rather than silently renaming \
              nothing (deny_unknown_fields)"
+        );
+    }
+
+    #[test]
+    fn ssh_is_off_until_asked_for_and_merges_per_field() {
+        assert!(
+            !merge(Raw::default(), Raw::default()).ssh,
+            "forwarding the host agent is a capability the sandbox otherwise \
+             lacks — it must never arrive by default"
+        );
+        let global = parse("[container]\nssh = true\n");
+        assert!(
+            merge(global.clone(), Raw::default()).ssh,
+            "the global file opts in"
+        );
+        let project_off = parse("[container]\nssh = false\n");
+        assert!(
+            !merge(global, project_off).ssh,
+            "a project can turn off what the global file switched on — merging \
+             is per field, and the project is the more specific intent"
+        );
+    }
+
+    #[test]
+    fn ssh_enabled_precedence_table() {
+        assert!(!ssh_enabled(false, None), "config off, no flag: off");
+        assert!(ssh_enabled(true, None), "config on, no flag: on");
+        assert!(
+            ssh_enabled(false, Some(true)),
+            "`pall8t run --ssh` turns it on for one run without editing config"
+        );
+        assert!(
+            !ssh_enabled(true, Some(false)),
+            "`--ssh=false` beats a config that switched it on — the way to run \
+             one sandbox without handing it the agent"
+        );
+    }
+
+    #[test]
+    fn ssh_warning_only_when_it_would_forward_nothing() {
+        assert!(
+            ssh_warning(true, None).is_some(),
+            "asking for forwarding with no agent on the host gets a warning: \
+             the runtime logs it to its own log and silently forwards nothing"
+        );
+        assert!(
+            ssh_warning(true, Some("")).is_some(),
+            "an empty SSH_AUTH_SOCK is as agent-less as an unset one"
+        );
+        assert!(
+            ssh_warning(true, Some("/private/tmp/agent.sock")).is_none(),
+            "an agent is present: nothing to say"
+        );
+        assert!(
+            ssh_warning(false, None).is_none(),
+            "a run that never asked for forwarding must not be nagged about an \
+             agent it doesn't want"
         );
     }
 
