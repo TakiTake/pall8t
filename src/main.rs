@@ -363,6 +363,7 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
         env: env_vars,
         ssh,
         labels,
+        hardening: cfg.hardening,
         command,
     };
     exec_container(&container::run_argv(&spec), herdr_agent.as_deref())

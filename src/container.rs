@@ -580,6 +580,33 @@ pub fn build_argv(
     argv
 }
 
+/// Runtime flags for one [`crate::config::Hardening`] level.
+///
+/// Verified live on apple/container 1.2.2, all four together: a write
+/// outside the mounts fails with `EROFS`, `/tmp` stays writable,
+/// `CapEff` reads `0000000000000000`, and `ulimit -n` reports the soft
+/// limit set here. The `nofile` ceiling is deliberately generous — a
+/// build with a wide dependency graph opens a lot of files, and a
+/// hardening profile that breaks builds gets switched off rather than
+/// tightened.
+fn hardening_argv(level: crate::config::Hardening) -> Vec<String> {
+    match level {
+        crate::config::Hardening::Default => Vec::new(),
+        crate::config::Hardening::Strict => vec![
+            "--cap-drop".into(),
+            "ALL".into(),
+            "--read-only".into(),
+            // A read-only root filesystem without this leaves the agent
+            // no scratch space at all, and `/tmp` is where every tool
+            // expects to find some.
+            "--tmpfs".into(),
+            "/tmp".into(),
+            "--ulimit".into(),
+            "nofile=8192:16384".into(),
+        ],
+    }
+}
+
 /// A label value apple/container will accept.
 ///
 /// Its parser splits on `=` with `maxSplits: 2` and **throws** on three
@@ -756,6 +783,9 @@ pub struct RunSpec {
     /// knows about the run that the container itself doesn't say (see
     /// [`crate::main`]'s `cmd_run`). Read back by `pall8t ls --json`.
     pub labels: Vec<(String, String)>,
+    /// Runtime confinement beyond the VM boundary (see
+    /// [`crate::config::Hardening`]), rendered by [`hardening_argv`].
+    pub hardening: crate::config::Hardening,
     /// Forward the host's SSH agent socket (`--ssh`). apple/container
     /// takes `SSH_AUTH_SOCK` from *this* process's environment and
     /// forwards that socket into the guest at
@@ -778,6 +808,15 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
     if spec.ssh {
         argv.push("--ssh".into());
     }
+    // An init process inside the container: forwards signals to the agent
+    // and reaps orphans it leaves behind — worth having wherever the
+    // agent spawns children of its own (tmux, agent teams, background
+    // shells). Unconditional because it changes nothing else: verified on
+    // 1.2.2 that the agent's own exit code still comes back (`exit 42` →
+    // 42, with and without), and that pid 1 becomes the init rather than
+    // the agent.
+    argv.push("--init".into());
+    argv.extend(hardening_argv(spec.hardening));
     for (k, v) in &spec.labels {
         argv.push("--label".into());
         argv.push(format!("{k}={}", label_value(v)));
@@ -1261,6 +1300,79 @@ mod tests {
     }
 
     #[test]
+    fn hardening_argv_table() {
+        assert!(
+            hardening_argv(crate::config::Hardening::Default).is_empty(),
+            "the default level must add no flags at all — it is what every \
+             release so far has run, and a silent change of confinement is \
+             exactly what an opt-in profile exists to avoid"
+        );
+        let strict = hardening_argv(crate::config::Hardening::Strict);
+        for (flag, value) in [
+            ("--cap-drop", "ALL"),
+            ("--read-only", "--tmpfs"),
+            ("--tmpfs", "/tmp"),
+        ] {
+            let at = strict
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("strict must pass {flag}: {strict:?}"));
+            assert_eq!(
+                strict.get(at + 1).map(String::as_str),
+                Some(value),
+                "{flag} must be followed by {value}"
+            );
+        }
+        assert!(
+            strict.contains(&"/tmp".to_string()),
+            "a read-only root filesystem with no tmpfs leaves the agent no \
+             scratch space, which breaks tools rather than confining them"
+        );
+        let nofile = strict
+            .iter()
+            .position(|a| a == "--ulimit")
+            .map(|i| strict[i + 1].clone())
+            .expect("strict sets a file-descriptor ceiling");
+        assert!(
+            nofile.starts_with("nofile="),
+            "the ulimit is the fd ceiling, in apple/container's \
+             <type>=<soft>[:<hard>] form: {nofile}"
+        );
+    }
+
+    #[test]
+    fn every_run_gets_an_init_process() {
+        let spec = RunSpec {
+            name: "pall8t-x-abc12345-99".into(),
+            image: "img".into(),
+            workdir: PathBuf::from("/Users/me/src/x"),
+            mounts: vec![],
+            cpus: 4,
+            memory: "8g".into(),
+            uid: 501,
+            gid: 20,
+            tty: false,
+            env: vec![],
+            ssh: false,
+            labels: vec![],
+            hardening: crate::config::Hardening::Default,
+            command: vec!["claude".into()],
+        };
+        let argv = run_argv(&spec);
+        let init = argv
+            .iter()
+            .position(|a| a == "--init")
+            .expect("--init forwards signals to the agent and reaps its orphans");
+        let image_pos = argv.iter().position(|a| a == "img").unwrap();
+        assert!(init < image_pos, "flags precede the image positional");
+        assert!(
+            !argv.contains(&"--read-only".to_string()),
+            "the default hardening level must not confine anything beyond \
+             what pall8t has always done"
+        );
+    }
+
+    #[test]
     fn labels_emit_one_flag_each() {
         let spec = RunSpec {
             name: "pall8t-x-abc12345-99".into(),
@@ -1278,6 +1390,7 @@ mod tests {
                 ("pall8t.version".into(), "0.4.0".into()),
                 ("pall8t.project".into(), "/Users/me/we=ird".into()),
             ],
+            hardening: crate::config::Hardening::Default,
             command: vec!["claude".into()],
         };
         let argv = run_argv(&spec);
@@ -1610,6 +1723,7 @@ mod tests {
             env: vec![],
             ssh: false,
             labels: vec![],
+            hardening: crate::config::Hardening::Default,
             command: vec!["claude".into()],
         };
         let argv = run_argv(&spec);
@@ -1691,6 +1805,7 @@ mod tests {
             env: vec![],
             ssh: true,
             labels: vec![],
+            hardening: crate::config::Hardening::Default,
             command: vec!["claude".into()],
         };
         let argv = run_argv(&spec);
@@ -1732,6 +1847,7 @@ mod tests {
             env: vec![("HERDR_ENV".into(), "1".into())],
             ssh: false,
             labels: vec![],
+            hardening: crate::config::Hardening::Default,
             command: vec!["claude".into()],
         };
         let argv = run_argv(&spec);
