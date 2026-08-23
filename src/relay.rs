@@ -87,11 +87,18 @@ pub enum Class {
 /// check running first.
 const ADMIN_NAMESPACES: &[&str] = &["server.", "integration.", "plugin.", "session."];
 
-/// Pure-inspection methods (allowed even in `readonly`), from herdr 0.7.5's
-/// method inventory. A read method a newer herdr adds is missing here until
-/// this list is refreshed — it is then treated as [`Class::Mutate`], which
-/// only ever errs toward denying, never toward leaking a mutation into
-/// `readonly`.
+/// Pure-inspection methods (allowed even in `readonly`). A read method a
+/// newer herdr adds is missing here until this list is refreshed — it is
+/// then treated as [`Class::Mutate`], which only ever errs toward denying,
+/// never toward leaking a mutation into `readonly`.
+///
+/// Last reconciled against herdr 0.8 (protocol 19). `scripts/herdr-method-drift.py`
+/// reports what a newer herdr serves that this list doesn't classify as a
+/// read — run it by hand, or read the weekly job's summary. Note that
+/// `pane.graphics.stream` stays here deliberately: herdr serves and
+/// documents it, but it hijacks the connection instead of answering in
+/// the request/response shape, so it is absent from herdr's own schema
+/// and the drift report flags it every time.
 const READ: &[&str] = &[
     "ping",
     "agent.explain",

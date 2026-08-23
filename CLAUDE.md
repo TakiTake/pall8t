@@ -78,8 +78,10 @@ stop there.
 - Testing conventions (read before writing tests): [docs/testing.md](docs/testing.md)
 - Sandbox environment details: `.claude/skills/pall8t`
 - Review automation: report-only workflows for mutation testing
-  (`mutants.yml`) and duplication/unused-deps (`hygiene.yml`), each
-  weekly plus on-demand via `gh workflow run <name>` — reports, never
-  gates; Codex PR review (`codex-review.yml`) stays dormant until an
+  (`mutants.yml`), duplication/unused-deps (`hygiene.yml`), and herdr
+  API-method drift (`herdr-drift.yml`, which runs
+  `scripts/herdr-method-drift.py` against the latest herdr release),
+  each weekly plus on-demand via `gh workflow run <name>` — reports,
+  never gates; Codex PR review (`codex-review.yml`) stays dormant until an
   `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
   `.coderabbit.yaml` (free for this public repo once the app is installed).
