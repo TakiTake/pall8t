@@ -552,6 +552,7 @@ mod tests {
             watch: vec![],
             command: vec!["claude".to_string()],
             ssh: false,
+            hardening: crate::config::Hardening::default(),
             mounts: vec![],
             deprecations: vec![],
             herdr: crate::config::HerdrConfig::default(),

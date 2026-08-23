@@ -78,6 +78,22 @@ source = "~/src/other-lib"
 
 Override for a single run without editing the file: `pall8t run --readonly` (or `--readonly=false` to force them all writable). The flag wins over every entry's own setting.
 
+### Hardening the sandbox
+
+Everything pall8t runs is already in its own VM. `[container] hardening` decides how much the runtime confines the container *inside* that VM:
+
+```toml
+[container]
+hardening = "strict"   # default: "default"
+```
+
+- **`"default"`** — what every pall8t release has run: a writable root filesystem and the runtime's normal capability set.
+- **`"strict"`** — `--cap-drop ALL` (the capability *bounding* set is emptied, so nothing inside can regain one), a read-only root filesystem, `/tmp` on a tmpfs, and an 8192 file-descriptor ceiling. The only writable paths left are the ones pall8t mounted on purpose: your workspace and the container home.
+
+Opt-in per project, because whether it holds depends on the project's toolchain — a build that writes outside the workspace, or a tool that needs a capability, works under `default` and fails under `strict`. Verified on apple/container 1.2.2: under `strict`, a write to `/var/tmp` fails with `EROFS` and `CapBnd` reads `0000000000000000`; under `default`, the same write succeeds and `CapBnd` carries the runtime's usual set.
+
+Independently of the profile, every run gets `--init`: an init process inside the container that forwards signals to the agent and reaps the orphans it leaves behind (a `tmux` session, a background shell, teammate agents). The agent's own exit code still comes back unchanged — `exit 42` gives 42, a signal-killed command gives 143.
+
 ### SSH agent forwarding
 
 `[container] ssh = true` forwards the host's SSH agent into the sandbox (`container run --ssh`): apple/container mounts the agent socket at `/var/host-services/ssh-auth.sock` inside the guest and points the container's `SSH_AUTH_SOCK` at it. **No key material crosses the boundary** — the sandbox sends signing requests to the agent on the host, which is the point: without it, git-over-SSH inside the sandbox needs a private key sitting in `~/.pall8t/home/.ssh`, where the agent can read it and where it stays after the run.

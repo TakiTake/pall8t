@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys are trusted. `pall8t run --ssh` / `--ssh=false` overrides it for
   one run, and pall8t warns when forwarding is on but the host has no
   `SSH_AUTH_SOCK` (the runtime would otherwise forward nothing silently).
+- **`[container] hardening = "strict"`**: drop every Linux capability,
+  mount the container's root filesystem read-only, put `/tmp` on a tmpfs,
+  and cap file descriptors — leaving the workspace and the container home
+  as the only writable paths. Opt-in per project: whether it holds
+  depends on the project's toolchain. The default level is unchanged.
+- **Every run now gets an init process** (`container run --init`), which
+  forwards signals to the agent and reaps the orphans it leaves behind
+  (tmux, background shells, teammate agents). Exit-code propagation is
+  unchanged — verified on 1.2.2 for both a plain exit and a signal.
 - **Every `pall8t run` container carries provenance labels**
   (`pall8t.version`, `pall8t.project`, `pall8t.image`, the herdr pane /
   workspace / tab and sandbox mode when running under herdr, and a
