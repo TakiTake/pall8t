@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys are trusted. `pall8t run --ssh` / `--ssh=false` overrides it for
   one run, and pall8t warns when forwarding is on but the host has no
   `SSH_AUTH_SOCK` (the runtime would otherwise forward nothing silently).
+- **Every `pall8t run` container carries provenance labels**
+  (`pall8t.version`, `pall8t.project`, `pall8t.image`, the herdr pane /
+  workspace / tab and sandbox mode when running under herdr, and a
+  worktree's main git dir), and `pall8t ls --json` reports them alongside
+  the image. `pall8t ls` now recognizes its containers by the
+  `pall8t.version` label rather than by the `pall8t-` name prefix — the
+  prefix stays as a fallback for containers started by an older pall8t,
+  and a container someone else happened to name `pall8t-…` no longer
+  counts as one of ours.
 - `pall8t build --no-cache`: bypass the builder's layer cache and re-run
   every `RUN` step. `pall8t build` alone already rebuilds unconditionally,
   but a step whose instruction text didn't change — e.g. the claude CLI's

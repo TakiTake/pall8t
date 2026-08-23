@@ -218,6 +218,11 @@ pub struct ContainerInfo {
     /// Image reference the container was created from, when the listing
     /// carries it.
     pub image: Option<String>,
+    /// `configuration.labels` from the listing — pall8t's own provenance
+    /// for containers it started (see [`RunSpec::labels`]), empty for
+    /// anything else (or for a listing that doesn't carry them: the
+    /// schema is pre-1.0, ADR-0001).
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// All containers: `container list --all --format json`.
@@ -258,6 +263,15 @@ fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
                 .pointer("/configuration/image/reference")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let labels = item
+                .pointer("/configuration/labels")
+                .and_then(Value::as_object)
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
             if let Some(name) = name {
                 let state = if status.eq_ignore_ascii_case("running") {
                     State::Running
@@ -268,6 +282,7 @@ fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
                     name: name.to_string(),
                     state,
                     image,
+                    labels,
                 });
             }
         }
@@ -275,12 +290,28 @@ fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
     Ok(items)
 }
 
+/// Label key every `pall8t run` container carries. Its presence is what
+/// makes a container pall8t's, so the marker and the version are the same
+/// key: a container without it isn't ours, whatever it is named.
+pub const LABEL_VERSION: &str = "pall8t.version";
+
+/// Whether a listing entry is a container pall8t started.
+///
+/// The label is the answer; the `pall8t-` name prefix is a fallback for
+/// containers started by a pall8t older than labels — drop it once those
+/// can no longer be running (they are `--rm` foreground sessions, so one
+/// release is plenty). The prefix alone was never sound: any container a
+/// user names `pall8t-…` matched it.
+pub fn is_pall8t_container(c: &ContainerInfo) -> bool {
+    c.labels.contains_key(LABEL_VERSION) || c.name.starts_with("pall8t-")
+}
+
 /// Containers started by pall8t (names carry the `pall8t-` prefix, see
 /// [`run_name`]).
 pub fn list_pall8t() -> Result<Vec<ContainerInfo>> {
     Ok(list_all()?
         .into_iter()
-        .filter(|c| c.name.starts_with("pall8t-"))
+        .filter(is_pall8t_container)
         .collect())
 }
 
@@ -549,6 +580,21 @@ pub fn build_argv(
     argv
 }
 
+/// A label value apple/container will accept.
+///
+/// Its parser splits on `=` with `maxSplits: 2` and **throws** on three
+/// parts (`invalid label format`), so a value containing `=` fails the
+/// whole `container run` — verified in 1.2.2's `Parser.labels`. A project
+/// directory is free to contain one. Control characters get the same
+/// treatment for the same reason: a label is provenance, and no label is
+/// worth failing a launch over.
+fn label_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c == '=' || c.is_control() { '_' } else { c })
+        .collect()
+}
+
 /// One mount of a [`RunSpec`], rendered by [`run_argv`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
@@ -706,6 +752,10 @@ pub struct RunSpec {
     /// producer today is the herdr bridge (`HERDR_*` identity — see
     /// [`crate::herdr`]).
     pub env: Vec<(String, String)>,
+    /// `--label key=value` provenance for this container: what pall8t
+    /// knows about the run that the container itself doesn't say (see
+    /// [`crate::main`]'s `cmd_run`). Read back by `pall8t ls --json`.
+    pub labels: Vec<(String, String)>,
     /// Forward the host's SSH agent socket (`--ssh`). apple/container
     /// takes `SSH_AUTH_SOCK` from *this* process's environment and
     /// forwards that socket into the guest at
@@ -727,6 +777,10 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
     argv.extend(["--rm".into(), "--name".into(), spec.name.clone()]);
     if spec.ssh {
         argv.push("--ssh".into());
+    }
+    for (k, v) in &spec.labels {
+        argv.push("--label".into());
+        argv.push(format!("{k}={}", label_value(v)));
     }
     for m in &spec.mounts {
         let (flag, value) = m.spec();
@@ -1135,6 +1189,116 @@ mod tests {
     /// 1.0.0): `status` is a nested object, not a bare string. Regression
     /// test for the bug where every container was misreported `stopped`
     /// because the parser looked for a top-level string that never existed.
+    /// Captured from `container ls --format json` on 1.2.2, for a
+    /// container started with two `--label` flags: the labels come back
+    /// under `configuration.labels` as a flat string map.
+    #[test]
+    fn parse_list_all_reads_labels_and_identifies_pall8t_containers() {
+        let json = r#"[
+            {
+                "id": "pall8t-x-1",
+                "configuration": {
+                    "id": "pall8t-x-1",
+                    "labels": { "pall8t.version": "0.4.0", "pall8t.project": "/Users/me/src/x" },
+                    "image": { "reference": "pall8t-x:501-20-abc123" }
+                },
+                "status": { "state": "running", "networks": [] }
+            },
+            {
+                "id": "pall8t-lookalike",
+                "configuration": { "id": "pall8t-lookalike" },
+                "status": { "state": "running", "networks": [] }
+            },
+            {
+                "id": "someone-elses",
+                "configuration": { "id": "someone-elses", "labels": { "app": "db" } },
+                "status": { "state": "running", "networks": [] }
+            }
+        ]"#;
+        let items = parse_list_all(json).unwrap();
+        assert_eq!(
+            items[0].labels.get("pall8t.project").map(String::as_str),
+            Some("/Users/me/src/x"),
+            "labels are read from configuration.labels, where 1.2.2 puts them"
+        );
+        assert!(items[1].labels.is_empty() && items[2].labels.len() == 1);
+
+        assert!(
+            is_pall8t_container(&items[0]),
+            "the version label is what marks a container as ours"
+        );
+        assert!(
+            is_pall8t_container(&items[1]),
+            "a container from a pall8t older than labels has only its name — \
+             keep recognizing it, or `pall8t ls` loses running sessions on upgrade"
+        );
+        assert!(
+            !is_pall8t_container(&items[2]),
+            "someone else's container, whatever labels it carries, is not ours"
+        );
+    }
+
+    #[test]
+    fn label_values_cannot_break_the_run() {
+        assert_eq!(
+            label_value("/Users/me/src/x"),
+            "/Users/me/src/x",
+            "an ordinary value passes through untouched"
+        );
+        assert_eq!(
+            label_value("/Users/me/weird=dir"),
+            "/Users/me/weird_dir",
+            "1.2.2's Parser.labels throws `invalid label format` on a value \
+             containing `=`, which would fail the whole run — and a project \
+             directory is free to contain one"
+        );
+        assert_eq!(
+            label_value("tag\nnewline"),
+            "tag_newline",
+            "control characters get the same treatment: no label is worth \
+             failing a launch over"
+        );
+    }
+
+    #[test]
+    fn labels_emit_one_flag_each() {
+        let spec = RunSpec {
+            name: "pall8t-x-abc12345-99".into(),
+            image: "img".into(),
+            workdir: PathBuf::from("/Users/me/src/x"),
+            mounts: vec![],
+            cpus: 4,
+            memory: "8g".into(),
+            uid: 501,
+            gid: 20,
+            tty: false,
+            env: vec![],
+            ssh: false,
+            labels: vec![
+                ("pall8t.version".into(), "0.4.0".into()),
+                ("pall8t.project".into(), "/Users/me/we=ird".into()),
+            ],
+            command: vec!["claude".into()],
+        };
+        let argv = run_argv(&spec);
+        let first = argv.iter().position(|a| a == "--label").unwrap();
+        assert_eq!(argv[first + 1], "pall8t.version=0.4.0");
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--label").count(),
+            2,
+            "one --label flag per entry"
+        );
+        assert!(
+            argv.contains(&"pall8t.project=/Users/me/we_ird".to_string()),
+            "the value is sanitised on the way out, not left to fail the run"
+        );
+        let image_pos = argv.iter().position(|a| a == "img").unwrap();
+        assert!(
+            first < image_pos,
+            "labels are flags and must precede the image positional"
+        );
+    }
+
     #[test]
     fn parse_list_all_reads_nested_status_state() {
         let json = r#"[
@@ -1445,6 +1609,7 @@ mod tests {
             tty: false,
             env: vec![],
             ssh: false,
+            labels: vec![],
             command: vec!["claude".into()],
         };
         let argv = run_argv(&spec);
@@ -1525,6 +1690,7 @@ mod tests {
             tty: false,
             env: vec![],
             ssh: true,
+            labels: vec![],
             command: vec!["claude".into()],
         };
         let argv = run_argv(&spec);
@@ -1565,6 +1731,7 @@ mod tests {
             tty: true,
             env: vec![("HERDR_ENV".into(), "1".into())],
             ssh: false,
+            labels: vec![],
             command: vec!["claude".into()],
         };
         let argv = run_argv(&spec);
