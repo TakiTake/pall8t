@@ -42,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The sandbox's Linux `herdr` CLI is now the verified cache itself,
+  mounted read-only**, instead of a per-run copy mounted read-write. The
+  copy existed only because ADR-0007 believed read-only mounts were
+  unavailable; a read-only mount is strictly stronger (the sandbox cannot
+  corrupt even its own CLI) and drops a multi-megabyte copy from every
+  bridged launch. `~/.pall8t/tools/herdr-run/` is no longer used —
+  leftover directories there are inert and can be deleted by hand.
 - **The herdr sandbox bridge is now a mounted Unix socket, not a TCP
   relay.** The host-side relay listens on its own socket under
   `~/.pall8t/run/` and pall8t mounts that socket into the container at
