@@ -101,6 +101,28 @@ The image tag embeds the Containerfile's content hash, so any edit — no commit
 
 A build streams `container build`'s own output live to stderr — no `-v` flag, this is always on, since a silent multi-minute build looks hung. Deliberately kept off pall8t's own stdout, which `pall8t build`'s final `built <tag>` line and `pall8t ls --json` need to stay machine-readable.
 
+### What a running sandbox says about itself
+
+Every container `pall8t run` starts is labelled, and `pall8t ls --json` hands the labels back:
+
+```console
+$ pall8t ls --json | jq '.[0]'
+{
+  "name": "pall8t-my-project-9f2c1a04-4711",
+  "status": "running",
+  "image": "pall8t-my-project:501-20-3b8f01c2d4e6",
+  "labels": {
+    "pall8t.version": "0.4.0",
+    "pall8t.project": "/Users/me/src/my-project",
+    "pall8t.image": "pall8t-my-project:501-20-3b8f01c2d4e6",
+    "pall8t.herdr.pane": "%3",
+    "pall8t.herdr.sandbox": "full"
+  }
+}
+```
+
+That is enough to map a herdr pane to the sandbox serving it, or a sandbox back to the project and image it booted, without parsing the container name. `name` and `status` are unchanged, so anything already reading them keeps working; the `pall8t.herdr.*` labels appear only for a run started from a herdr pane, and a container started by an older pall8t has no labels at all.
+
 ## Working with git worktrees
 
 Cutting worktrees is the caller's business — you or herdr — but pall8t makes them work inside the sandbox:
