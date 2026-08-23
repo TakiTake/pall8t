@@ -85,3 +85,7 @@ stop there.
   never gates; Codex PR review (`codex-review.yml`) stays dormant until an
   `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
   `.coderabbit.yaml` (free for this public repo once the app is installed).
+- herdr plugin (contrib): `contrib/herdr-plugin/` — sandbox status/shell/
+  rebuild/stop from a herdr pane. A thin shell over the pall8t CLI whose
+  only contract is `pall8t ls --json`; when that output shape changes, it
+  changes in the same commit.
