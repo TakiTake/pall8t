@@ -556,17 +556,22 @@ pub struct Mount {
     pub dest: PathBuf,
     /// Mount it read-only. Enforced by the guest kernel — a write inside
     /// the container fails with `EROFS` — verified on apple/container
-    /// 1.2.2 and pinned by ADR-0009. Meaningless for [`Kind::Socket`],
+    /// 1.2.2 and pinned by ADR-0009. Meaningless for a socket mount,
     /// which forwards connections rather than mounting a filesystem.
     pub readonly: bool,
-    pub kind: Kind,
+    /// Private on purpose: it is what decides between `--mount` and the
+    /// unvalidated-options `-v` form, and only [`Mount::socket`] — which
+    /// rejects the `:` that form splits on — may select the latter. A
+    /// `pub` field would let a struct literal pick `Kind::Socket` past
+    /// that guard (see [`Mount::spec`]).
+    kind: Kind,
 }
 
 /// What the runtime does with a mount source. Directories become
 /// filesystems; a Unix socket becomes a forwarded socket the guest can
 /// connect to — the herdr bridge's transport (ADR-0007 amendment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
+pub(crate) enum Kind {
     Directory,
     Socket,
 }
@@ -618,33 +623,18 @@ impl Mount {
     /// references stay valid on both sides (ADR-0004's insight, retained
     /// by ADR-0006).
     pub fn identity(path: PathBuf) -> Self {
-        Mount {
-            host: path.clone(),
-            dest: path,
-            readonly: false,
-            kind: Kind::Directory,
-        }
+        Mount::new(path.clone(), path, false)
     }
 
     /// Writable mount of `host` at `dest`.
     pub fn rw(host: PathBuf, dest: PathBuf) -> Self {
-        Mount {
-            host,
-            dest,
-            readonly: false,
-            kind: Kind::Directory,
-        }
+        Mount::new(host, dest, false)
     }
 
     /// Read-only mount of `host` at `dest` — the sandbox can read it and
     /// cannot change it (ADR-0009).
     pub fn ro(host: PathBuf, dest: PathBuf) -> Self {
-        Mount {
-            host,
-            dest,
-            readonly: true,
-            kind: Kind::Directory,
-        }
+        Mount::new(host, dest, true)
     }
 
     /// The flag and value this mount goes out as.
@@ -664,7 +654,9 @@ impl Mount {
     /// guest. `-v` is the one form that reaches it. The ADR-0009 hazard
     /// doesn't ride along, because this form has no third field to
     /// mistype — `readonly` is meaningless for a forwarded socket, and
-    /// [`Mount::socket`] is the only constructor that produces one.
+    /// [`Mount::socket`], which rejects a `:` in either path, is the only
+    /// way to produce a [`Kind::Socket`] at all (the field is private, so
+    /// no struct literal can route around it).
     /// (Tracked upstream in TakiTake/pall8t#52; if apple/container lifts
     /// the parser restriction, this collapses back to `--mount`.)
     fn spec(&self) -> (&'static str, String) {

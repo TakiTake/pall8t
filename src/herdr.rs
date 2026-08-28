@@ -332,13 +332,6 @@ pub fn wrap_command_for_bridge(command: Vec<String>) -> Vec<String> {
     argv
 }
 
-/// Runtime directory for the per-run relay sockets (`~/.pall8t/run`).
-/// Deliberately not under `tools/`: those are cached artifacts, these are
-/// live endpoints whose lifetime is one `pall8t run`.
-fn run_socket_root() -> Result<std::path::PathBuf> {
-    Ok(crate::config::pall8t_root()?.join("run"))
-}
-
 /// Spawns `pall8t herdr relay …` (the hidden serving loop) and returns
 /// the socket it listens on, once bound: the relay prints the path as its
 /// readiness line, and `container run` needs the socket to exist before
@@ -354,7 +347,7 @@ fn spawn_relay(
     let log_dir = crate::config::pall8t_root()?.join("logs");
     std::fs::create_dir_all(&log_dir)?;
     let log = log_dir.join(format!("herdr-relay-{container_name}.log"));
-    let root = run_socket_root()?;
+    let root = crate::relay::run_socket_root()?;
     let listen = crate::relay::socket_path(&root, container_name)
         .with_context(|| format!("no relay socket path fits under {}", root.display()))?;
     let mut child = std::process::Command::new(exe)
@@ -389,8 +382,7 @@ fn spawn_relay(
         let _ = child.wait();
         anyhow::bail!("the herdr relay exited before binding {}", listen.display());
     }
-    let bound = std::path::PathBuf::from(line.trim());
-    if bound != listen {
+    if std::path::Path::new(line.trim()) != listen {
         // It bound *something* — a path this process won't mount — so it
         // would sit there serving a policy-checked socket for the whole
         // session with no reader. Stop it.
@@ -398,7 +390,7 @@ fn spawn_relay(
         let _ = child.wait();
         anyhow::bail!("unexpected relay readiness line {line:?}");
     }
-    Ok(bound)
+    Ok(listen)
 }
 
 /// `herdr --version` → `"0.7.5"`. The version pin matters: herdr's CLI
@@ -582,11 +574,7 @@ fn prune_stale_run_bins(root: &std::path::Path, current: &str) {
         .unwrap_or_default();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let age = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok());
+        let age = crate::util::entry_age(&entry);
         if should_reap_run_bin(&name, current, &live, age, RUN_BIN_REAP_GRACE) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
