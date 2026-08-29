@@ -15,8 +15,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `npm install -g` in the dev image — was still served from the layer
   cache, so "latest" fetches never actually refreshed.
 
+### Fixed
+
+- **The herdr relay no longer leaks a process when the run that spawned it
+  exits immediately.** It watches for reparenting to decide when its run is
+  over, but sampled its parent *after* binding and announcing its socket —
+  by which point a `pall8t run` that failed right after reading that
+  announcement was already gone, leaving the relay comparing the reparent
+  target against itself, a condition that can never become true. Such a
+  relay served until the machine was rebooted. The parent is now sampled
+  before any of that, and a relay that finds itself already orphaned exits
+  instead of serving.
+
 ### Changed
 
+- **The herdr sandbox bridge is now a mounted Unix socket, not a TCP
+  relay.** The host-side relay listens on its own socket under
+  `~/.pall8t/run/` and pall8t mounts that socket into the container at
+  `HERDR_SOCKET_PATH`; apple/container forwards a mount whose source is a
+  Unix socket into the guest as a live socket (verified on 1.2.2 — the
+  ADR-0007 premise that mounts can't do this was an artifact of pall8t
+  only ever emitting `--mount`, whose parser takes directories alone).
+  Consequences: **custom Containerfiles no longer need `socat`** (and the
+  default image no longer installs it), the relay no longer opens a TCP
+  port on the vmnet gateway, and `PALL8T_HERDR_PORT` is gone. Policy
+  classification and the audit log are unchanged — `herdr.sock` itself is
+  still never mounted into the sandbox.
 - **A project Containerfile now builds with the project directory as its
   build context** (ADR-0010), instead of the Containerfile's own directory.
   `COPY` paths resolve relative to the project root, so a

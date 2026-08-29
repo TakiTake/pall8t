@@ -549,16 +549,31 @@ pub fn build_argv(
     argv
 }
 
-/// One bind mount of a [`RunSpec`], rendered as `--mount` by
-/// [`run_argv`].
+/// One mount of a [`RunSpec`], rendered by [`run_argv`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
     pub host: PathBuf,
     pub dest: PathBuf,
     /// Mount it read-only. Enforced by the guest kernel — a write inside
     /// the container fails with `EROFS` — verified on apple/container
-    /// 1.2.2 and pinned by ADR-0009.
+    /// 1.2.2 and pinned by ADR-0009. Meaningless for a socket mount,
+    /// which forwards connections rather than mounting a filesystem.
     pub readonly: bool,
+    /// Private on purpose: it is what decides between `--mount` and the
+    /// unvalidated-options `-v` form, and only [`Mount::socket`] — which
+    /// rejects the `:` that form splits on — may select the latter. A
+    /// `pub` field would let a struct literal pick `Kind::Socket` past
+    /// that guard (see [`Mount::spec`]).
+    kind: Kind,
+}
+
+/// What the runtime does with a mount source. Directories become
+/// filesystems; a Unix socket becomes a forwarded socket the guest can
+/// connect to — the herdr bridge's transport (ADR-0007 amendment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Directory,
+    Socket,
 }
 
 impl Mount {
@@ -568,7 +583,39 @@ impl Mount {
             host,
             dest,
             readonly,
+            kind: Kind::Directory,
         }
+    }
+
+    /// Forwards the host Unix socket at `host` into the container at
+    /// `dest`, where it is a live socket the guest can connect to — not a
+    /// virtiofs view of it (connecting through virtiofs is what fails
+    /// with `ENOTSUP`). Emitted as `-v`, see [`Mount::spec`].
+    ///
+    /// Fails when either path contains a `:`. That is what keeps
+    /// [`Mount::spec`]'s "no third field" claim true: `-v` splits on `:`,
+    /// so a single colon in the host path would hand the *container* path
+    /// to apple/container as unvalidated mount options, and a second one
+    /// would fail the whole `container run` rather than just the bridge.
+    /// A `:` is legal in a macOS path, so this is a guard, not a
+    /// formality — the caller is best-effort and degrades to "no bridge"
+    /// with the reason.
+    pub fn socket(host: PathBuf, dest: PathBuf) -> Result<Self> {
+        for path in [&host, &dest] {
+            if path.to_string_lossy().contains(':') {
+                anyhow::bail!(
+                    "a forwarded socket path may not contain `:` ({}) — `-v` \
+                     splits on it, and the third field is parsed as mount options",
+                    path.display()
+                );
+            }
+        }
+        Ok(Mount {
+            host,
+            dest,
+            readonly: false,
+            kind: Kind::Socket,
+        })
     }
 
     /// Identity-path mount, writable: `host` is visible at the same
@@ -576,51 +623,60 @@ impl Mount {
     /// references stay valid on both sides (ADR-0004's insight, retained
     /// by ADR-0006).
     pub fn identity(path: PathBuf) -> Self {
-        Mount {
-            host: path.clone(),
-            dest: path,
-            readonly: false,
-        }
+        Mount::new(path.clone(), path, false)
     }
 
     /// Writable mount of `host` at `dest`.
     pub fn rw(host: PathBuf, dest: PathBuf) -> Self {
-        Mount {
-            host,
-            dest,
-            readonly: false,
-        }
+        Mount::new(host, dest, false)
     }
 
     /// Read-only mount of `host` at `dest` — the sandbox can read it and
     /// cannot change it (ADR-0009).
     pub fn ro(host: PathBuf, dest: PathBuf) -> Self {
-        Mount {
-            host,
-            dest,
-            readonly: true,
-        }
+        Mount::new(host, dest, true)
     }
 
-    /// The `--mount` value for this mount.
+    /// The flag and value this mount goes out as.
     ///
-    /// `--mount`, not `-v host:dest[:opts]`, and that is a safety choice
-    /// rather than a style one: apple/container validates `--mount`
-    /// directives and rejects an unknown one outright, while `-v` passes
-    /// its third field through to the filesystem options unchecked. On
-    /// 1.2.2, `-v src:dst:readonlyy` mounts **read-write in silence**,
-    /// where `--mount …,readonlyy` fails the run before it starts. A typo
-    /// in a protection flag must not be the quiet outcome (ADR-0009).
-    fn spec(&self) -> String {
-        let mut s = format!(
-            "type=virtiofs,source={},target={}",
-            self.host.display(),
-            self.dest.display()
-        );
-        if self.readonly {
-            s.push_str(",ro");
+    /// A directory is `--mount`, not `-v host:dest[:opts]`, and that is a
+    /// safety choice rather than a style one: apple/container validates
+    /// `--mount` directives and rejects an unknown one outright, while
+    /// `-v` passes its third field through to the filesystem options
+    /// unchecked. On 1.2.2, `-v src:dst:readonlyy` mounts **read-write in
+    /// silence**, where `--mount …,readonlyy` fails the run before it
+    /// starts. A typo in a protection flag must not be the quiet outcome
+    /// (ADR-0009).
+    ///
+    /// A socket has to be `-v` anyway: 1.2.2's `--mount` parser accepts
+    /// only a directory source (`path '…' is not a directory`), while the
+    /// runtime behind both spellings forwards a socket source into the
+    /// guest. `-v` is the one form that reaches it. The ADR-0009 hazard
+    /// doesn't ride along, because this form has no third field to
+    /// mistype — `readonly` is meaningless for a forwarded socket, and
+    /// [`Mount::socket`], which rejects a `:` in either path, is the only
+    /// way to produce a [`Kind::Socket`] at all (the field is private, so
+    /// no struct literal can route around it).
+    /// (Tracked upstream in TakiTake/pall8t#52; if apple/container lifts
+    /// the parser restriction, this collapses back to `--mount`.)
+    fn spec(&self) -> (&'static str, String) {
+        match self.kind {
+            Kind::Socket => (
+                "-v",
+                format!("{}:{}", self.host.display(), self.dest.display()),
+            ),
+            Kind::Directory => {
+                let mut s = format!(
+                    "type=virtiofs,source={},target={}",
+                    self.host.display(),
+                    self.dest.display()
+                );
+                if self.readonly {
+                    s.push_str(",ro");
+                }
+                ("--mount", s)
+            }
         }
-        s
     }
 }
 
@@ -639,8 +695,8 @@ pub struct RunSpec {
     pub tty: bool,
     /// `-e KEY=VALUE` environment for the container process. pall8t
     /// forwards nothing from the host environment by default; the only
-    /// producer today is the herdr bridge (`HERDR_*` identity plus the
-    /// relay port — see [`crate::herdr`]).
+    /// producer today is the herdr bridge (`HERDR_*` identity — see
+    /// [`crate::herdr`]).
     pub env: Vec<(String, String)>,
     pub command: Vec<String>,
 }
@@ -655,8 +711,9 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
     }
     argv.extend(["--rm".into(), "--name".into(), spec.name.clone()]);
     for m in &spec.mounts {
-        argv.push("--mount".into());
-        argv.push(m.spec());
+        let (flag, value) = m.spec();
+        argv.push(flag.into());
+        argv.push(value);
     }
     for (k, v) in &spec.env {
         argv.push("-e".into());
@@ -717,27 +774,6 @@ fn inspect_str(name: &str, pointer: &str) -> Option<String> {
 /// inspect`) — for `pall8t run` containers, the workspace it mounted.
 pub fn workdir(name: &str) -> Option<String> {
     inspect_str(name, "/0/configuration/initProcess/workingDirectory")
-}
-
-/// A running container's vmnet IPv4 address (via `container inspect`),
-/// without the CIDR suffix — e.g. `"192.168.64.5/24"` → `"192.168.64.5"`.
-/// The herdr relay pins accepted peers to this (see [`crate::relay`]).
-pub fn ip_address(name: &str) -> Option<String> {
-    let cidr = inspect_str(name, "/0/status/networks/0/ipv4Address")?;
-    Some(cidr.split('/').next().unwrap_or(&cidr).to_string())
-}
-
-/// The default network's host-side gateway address (`container network
-/// inspect default` → `status.ipv4Gateway`) — the one host address
-/// containers can reach, so the relay binds to it rather than `0.0.0.0`
-/// (see [`crate::relay`]). Available as soon as the container system is
-/// up, before any container exists.
-pub fn default_gateway() -> Option<String> {
-    let out = run_ok(["network", "inspect", "default"]).ok()?;
-    let v: Value = serde_json::from_str(out.trim()).ok()?;
-    v.pointer("/0/status/ipv4Gateway")
-        .and_then(Value::as_str)
-        .map(str::to_string)
 }
 
 /// What to exec for the `container` CLI when argv[0] matters, plus env
@@ -1364,6 +1400,98 @@ mod tests {
         );
     }
 
+    /// The herdr bridge's socket is the one mount that must go out as
+    /// `-v`: 1.2.2's `--mount` parser accepts only a directory source,
+    /// while the runtime behind `-v` forwards a socket source into the
+    /// guest as a live socket (verified on 1.2.2). Two colon-separated
+    /// fields and no third — the unvalidated-options hazard ADR-0009
+    /// names has nothing to ride on here.
+    #[test]
+    fn socket_mount_goes_out_as_two_field_v() {
+        let spec = RunSpec {
+            name: "pall8t-x-abc12345-99".into(),
+            image: "img".into(),
+            workdir: PathBuf::from("/Users/me/src/x"),
+            mounts: vec![
+                Mount::identity(PathBuf::from("/Users/me/src/x")),
+                Mount::socket(
+                    PathBuf::from("/Users/me/.pall8t/run/pall8t-x-abc12345-99.sock"),
+                    PathBuf::from("/tmp/pall8t/herdr.sock"),
+                )
+                .unwrap(),
+            ],
+            cpus: 4,
+            memory: "8g".into(),
+            uid: 501,
+            gid: 20,
+            tty: false,
+            env: vec![],
+            command: vec!["claude".into()],
+        };
+        let argv = run_argv(&spec);
+        let v = argv
+            .iter()
+            .position(|a| a == "-v")
+            .expect("the socket mount emits -v");
+        assert_eq!(
+            argv[v + 1],
+            "/Users/me/.pall8t/run/pall8t-x-abc12345-99.sock:/tmp/pall8t/herdr.sock",
+            "host:container, and nothing else — a third field would be passed to \
+             the filesystem options unchecked (ADR-0009)"
+        );
+        assert_eq!(
+            argv[v + 1].matches(':').count(),
+            1,
+            "exactly one separator: no options field can exist to be mistyped"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "-v").count(),
+            1,
+            "only the socket mount uses -v; the directory mount stays on --mount"
+        );
+        assert!(
+            argv.contains(
+                &"type=virtiofs,source=/Users/me/src/x,target=/Users/me/src/x".to_string()
+            ),
+            "a directory mount is unaffected by a socket mount sharing the run"
+        );
+    }
+
+    /// `-v` splits on `:`, and apple/container hands the third field to
+    /// the filesystem options unchecked (1.2.2 `Parser.volume`). A macOS
+    /// path may contain a colon, so the "no third field to mistype"
+    /// property `Mount::spec` claims has to be enforced at construction —
+    /// otherwise a home directory with a colon in it silently turns the
+    /// container path into mount options.
+    #[test]
+    fn socket_mount_refuses_a_colon_in_either_path() {
+        assert!(
+            Mount::socket(
+                PathBuf::from("/Users/me/.pall8t/run/x.sock"),
+                PathBuf::from("/tmp/pall8t/herdr.sock"),
+            )
+            .is_ok(),
+            "the ordinary case is unaffected"
+        );
+        assert!(
+            Mount::socket(
+                PathBuf::from("/Users/od:d/.pall8t/run/x.sock"),
+                PathBuf::from("/tmp/pall8t/herdr.sock"),
+            )
+            .is_err(),
+            "a colon in the host path would make the container path parse as \
+             mount options — the bridge must decline instead"
+        );
+        assert!(
+            Mount::socket(
+                PathBuf::from("/Users/me/.pall8t/run/x.sock"),
+                PathBuf::from("/tmp/pall8t/her:dr.sock"),
+            )
+            .is_err(),
+            "the container side splits the same way"
+        );
+    }
+
     #[test]
     fn run_argv_shape() {
         let spec = RunSpec {
@@ -1418,12 +1546,12 @@ mod tests {
         );
         assert!(
             !argv.contains(&"-v".to_string()),
-            "no mount may go out as `-v`: its options are unvalidated"
+            "a directory mount may never go out as `-v`: its options are unvalidated"
         );
         assert_eq!(
             argv.iter().filter(|a| *a == "--mount").count(),
             3,
-            "every mount emits exactly one --mount flag"
+            "every directory mount emits exactly one --mount flag"
         );
         assert_eq!(
             argv.last(),

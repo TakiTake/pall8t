@@ -79,9 +79,9 @@ enum HerdrCmd {
         /// Host herdr API socket to forward to
         #[arg(long)]
         socket: std::path::PathBuf,
-        /// Sandbox container whose IP is the only accepted peer
+        /// Unix socket to listen on (mounted into the sandbox)
         #[arg(long)]
-        container: String,
+        listen: std::path::PathBuf,
         /// Policy mode: full | readonly
         #[arg(long)]
         mode: String,
@@ -384,10 +384,10 @@ fn cmd_herdr(cmd: &HerdrCmd) -> Result<()> {
     match cmd {
         HerdrCmd::Relay {
             socket,
-            container,
+            listen,
             mode,
             log,
-        } => pall8t::relay::run(socket, container, pall8t::relay::Mode::parse(mode)?, log),
+        } => pall8t::relay::run(socket, listen, pall8t::relay::Mode::parse(mode)?, log),
         HerdrCmd::Doctor { json } => {
             let snap = herdr::DoctorSnapshot::from_process_env();
             let socket_reachable = snap

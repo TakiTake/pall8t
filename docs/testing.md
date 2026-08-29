@@ -44,6 +44,47 @@ The test strategy starts in the production code, not the test file:
   name + pid, cleaned at the end; `/tmp`-short paths when `sun_path`
   limits apply.
 
+## Two layers: in-crate tests and `tests/cli.rs`
+
+Most of the suite lives next to the code it covers, in `#[cfg(test)] mod
+tests`. One integration target, `tests/cli.rs`, drives the built `pall8t`
+binary instead. It exists for the things a unit test structurally cannot
+see: `main`'s exit codes, clap's shape, which stream each message goes to,
+and the command lines pall8t hands `container` and `herdr`.
+
+It is still bound by the rule above — no live runtime, no live herdr:
+
+- **An isolated `$HOME` per test.** `dirs::home_dir()` reads `$HOME` first
+  and only falls back to `getpwuid` when it is unset or empty (verified in
+  dirs-sys 0.4.1), so every child gets an explicit `HOME` under `/tmp` and
+  `~/.pall8t` becomes a throwaway tree. Never `env_clear()` without setting
+  it — that sends `~/.pall8t` back to the developer's real home.
+- **An empty `PATH`**, so "the `container` CLI is missing" is a fact of the
+  test rather than a property of the developer's machine.
+- **A stand-in `container` on that `PATH` when a test needs one.** It
+  replays literal captured output for the three read-only queries pall8t
+  parses and records every argv it is handed. It does not emulate
+  apple/container; it is there so the *command lines* — the real contract
+  — can be asserted without a VM.
+- **`execve` ends coverage.** `pall8t run` and `pall8t exec` replace the
+  process, and no atexit handler runs, so a profile written at exit is
+  lost. The launch tests therefore make the stand-in runtime remove itself
+  at the last call before the exec, which turns the process replacement
+  into an ordinary error return. That is also a real behaviour worth
+  pinning: a runtime that disappears mid-launch must fail loudly.
+- **Nothing may hang.** `herdr relay` serves until its parent exits, so the
+  test for its refusal-to-run guard waits with a deadline
+  (`Sandbox::run_bounded`) — if the guard ever stopped firing, the suite
+  must fail, not block.
+
+## Coverage
+
+`cargo llvm-cov --summary-only` (install once with `cargo install
+cargo-llvm-cov` and `rustup component add llvm-tools-preview`). It is a
+guide, not a gate: the number is high because the seams above make the
+decisions reachable, and a line covered by a test that asserts nothing
+counts for nothing. Read it as "what has no test pointing at it at all".
+
 ## Would the test go red?
 
 A test only counts if it fails when the code it names is broken. The

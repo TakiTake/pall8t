@@ -225,30 +225,15 @@ pub const CONTAINER_SOCKET_PATH: &str = "/tmp/pall8t/herdr.sock";
 /// bootstrap prepends it to `PATH`.
 pub const CONTAINER_BIN_DIR: &str = "/opt/pall8t/bin";
 
-/// In-container bootstrap, run as the command's `sh -c` prologue. Bridges
-/// `HERDR_SOCKET_PATH` (a Unix socket the stock herdr CLI expects) to the
-/// host relay's TCP port via socat, then execs the real command. The vmnet
-/// gateway — the host — is read from /proc/net/route; the hex→decimal
-/// conversion is done in portable awk because dash's printf isn't
-/// guaranteed to accept 0x literals. Everything is best-effort: a missing
-/// socat or route degrades to "no herdr CLI in this sandbox" with a
-/// warning, never a failed run.
+/// In-container bootstrap, run as the command's `sh -c` prologue: puts
+/// the mounted Linux herdr CLI on `PATH`, then execs the real command.
+///
+/// The socket the CLI talks to needs nothing from this script — the relay
+/// socket is mounted straight in at `HERDR_SOCKET_PATH` (see
+/// [`crate::relay`]). Before that, this prologue also ran a `socat
+/// UNIX-LISTEN:… TCP:<gateway>:<port>` bridge, which is why custom
+/// Containerfiles used to need `socat`; they no longer do.
 const BOOTSTRAP: &str = r#"
-if [ -n "${PALL8T_HERDR_PORT:-}" ] && [ -n "${HERDR_SOCKET_PATH:-}" ]; then
-  if command -v socat >/dev/null 2>&1; then
-    gw=$(awk 'function hex(s,  n,i){n=0;for(i=1;i<=length(s);i++)n=n*16+index("0123456789abcdef",tolower(substr(s,i,1)))-1;return n}
-      $2=="00000000"{h=$3;print hex(substr(h,7,2)) "." hex(substr(h,5,2)) "." hex(substr(h,3,2)) "." hex(substr(h,1,2));exit}' /proc/net/route)
-    if [ -n "$gw" ]; then
-      mkdir -p "$(dirname "$HERDR_SOCKET_PATH")"
-      rm -f "$HERDR_SOCKET_PATH"
-      socat "UNIX-LISTEN:$HERDR_SOCKET_PATH,fork" "TCP:$gw:$PALL8T_HERDR_PORT" >/dev/null 2>&1 &
-    else
-      echo 'pall8t: herdr bridge: no default route in /proc/net/route' >&2
-    fi
-  else
-    echo 'pall8t: herdr bridge: socat not in the image (add it to your Containerfile) - the herdr CLI will not work here' >&2
-  fi
-fi
 if [ -d /opt/pall8t/bin ]; then
   PATH="/opt/pall8t/bin:$PATH"
   export PATH
@@ -304,7 +289,13 @@ pub fn prepare_bridge(
         ),
     }
 
-    let port = spawn_relay(socket, container_name, relay_mode)?;
+    let listen = spawn_relay(socket, container_name, relay_mode)?;
+    // The relay's own socket, forwarded into the sandbox as a socket
+    // (Mount::socket) — this is the bridge's whole transport.
+    mounts.push(crate::container::Mount::socket(
+        listen,
+        CONTAINER_SOCKET_PATH.into(),
+    )?);
     let mut vars = vec![
         ("HERDR_ENV".to_string(), "1".to_string()),
         ("HERDR_PANE_ID".to_string(), env.pane_id.clone()),
@@ -316,7 +307,6 @@ pub fn prepare_bridge(
             "HERDR_BIN_PATH".to_string(),
             format!("{CONTAINER_BIN_DIR}/herdr"),
         ),
-        ("PALL8T_HERDR_PORT".to_string(), port.to_string()),
     ];
     if let Some(w) = &env.workspace_id {
         vars.push(("HERDR_WORKSPACE_ID".to_string(), w.clone()));
@@ -342,23 +332,32 @@ pub fn wrap_command_for_bridge(command: Vec<String>) -> Vec<String> {
     argv
 }
 
-/// Spawns `pall8t herdr relay …` (the hidden serving loop) and reads the
-/// ephemeral port it prints. The child outlives the coming exec and
-/// watches its parent to exit with the session.
-fn spawn_relay(socket: &str, container_name: &str, mode: crate::relay::Mode) -> Result<u16> {
+/// Spawns `pall8t herdr relay …` (the hidden serving loop) and returns
+/// the socket it listens on, once bound: the relay prints the path as its
+/// readiness line, and `container run` needs the socket to exist before
+/// it can take it as a mount source. The child outlives the coming exec
+/// and watches its parent to exit with the session.
+fn spawn_relay(
+    socket: &str,
+    container_name: &str,
+    mode: crate::relay::Mode,
+) -> Result<std::path::PathBuf> {
     use std::io::BufRead;
     let exe = std::env::current_exe().context("cannot locate the pall8t binary")?;
     let log_dir = crate::config::pall8t_root()?.join("logs");
     std::fs::create_dir_all(&log_dir)?;
     let log = log_dir.join(format!("herdr-relay-{container_name}.log"));
+    let root = crate::relay::run_socket_root()?;
+    let listen = crate::relay::socket_path(&root, container_name)
+        .with_context(|| format!("no relay socket path fits under {}", root.display()))?;
     let mut child = std::process::Command::new(exe)
         .args([
             "herdr",
             "relay",
             "--socket",
             socket,
-            "--container",
-            container_name,
+            "--listen",
+            &listen.to_string_lossy(),
             "--mode",
             mode.as_str(),
             "--log",
@@ -373,12 +372,25 @@ fn spawn_relay(socket: &str, container_name: &str, mode: crate::relay::Mode) -> 
     let mut line = String::new();
     std::io::BufReader::new(stdout)
         .read_line(&mut line)
-        .context("cannot read the relay port")?;
-    let port: u16 = line
-        .trim()
-        .parse()
-        .with_context(|| format!("unexpected relay port line {line:?}"))?;
-    Ok(port)
+        .context("cannot read the relay readiness line")?;
+    if line.trim().is_empty() {
+        // No line at all: the relay exited before binding (its own error
+        // went to its stderr, which is dropped — this is the pall8t-side
+        // symptom, and the caller warns and runs without the bridge).
+        // Reap it rather than leaving a zombie under the `container`
+        // client this process is about to become.
+        let _ = child.wait();
+        anyhow::bail!("the herdr relay exited before binding {}", listen.display());
+    }
+    if std::path::Path::new(line.trim()) != listen {
+        // It bound *something* — a path this process won't mount — so it
+        // would sit there serving a policy-checked socket for the whole
+        // session with no reader. Stop it.
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!("unexpected relay readiness line {line:?}");
+    }
+    Ok(listen)
 }
 
 /// `herdr --version` → `"0.7.5"`. The version pin matters: herdr's CLI
@@ -562,11 +574,7 @@ fn prune_stale_run_bins(root: &std::path::Path, current: &str) {
         .unwrap_or_default();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let age = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok());
+        let age = crate::util::entry_age(&entry);
         if should_reap_run_bin(&name, current, &live, age, RUN_BIN_REAP_GRACE) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
@@ -735,6 +743,27 @@ pub fn doctor_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prologue used to start a `socat UNIX-LISTEN:… TCP:<gateway>:…`
+    /// bridge, which is why custom Containerfiles needed `socat` and why a
+    /// missing one degraded the sandbox to "no herdr CLI here". The relay
+    /// socket is mounted straight in now; if this ever reappears, the
+    /// README's Containerfile contract silently changed with it.
+    #[test]
+    fn bootstrap_has_no_socat_bridge() {
+        assert!(
+            !BOOTSTRAP.contains("socat"),
+            "the bridge no longer runs socat in the guest"
+        );
+        assert!(
+            !BOOTSTRAP.contains("PALL8T_HERDR_PORT") && !BOOTSTRAP.contains("/proc/net/route"),
+            "no TCP port and no gateway lookup: the transport is the mounted socket"
+        );
+        assert!(
+            BOOTSTRAP.contains("/opt/pall8t/bin") && BOOTSTRAP.trim().ends_with("exec \"$@\""),
+            "what remains is the PATH prepend and the exec into the real command"
+        );
+    }
 
     #[test]
     fn maybe_override_for_herdr_table() {

@@ -32,20 +32,30 @@ Two facts about apple/container, verified live on 1.1.0, shape the design:
   vmnet gateway address (`/proc/net/route`), and the host sees the
   container's own address as the peer.
 
+> **Superseded — see the [amendment](#amendment-2026-08-23-the-socket-premise-was-wrong)
+> below.** The first fact was an artifact of *how* pall8t asked for the
+> mount, not of apple/container. The transport is now a mounted socket;
+> the TCP relay and the in-container `socat` are gone. Everything else in
+> this ADR — policy classes, version lockstep, env passthrough, the
+> security posture — still stands.
+
 ## Decision
 
 `pall8t run`, when it detects a herdr pane and `[herdr] sandbox` is not
 `"off"`, assembles a **bridge**:
 
 1. **Host relay** (`pall8t herdr relay`, hidden subcommand, spawned just
-   before the exec): listens on an ephemeral TCP port, forwards NDJSON
+   before the exec): listens on an ephemeral TCP port *(superseded: a
+   private Unix socket — see the amendment)*, forwards NDJSON
    requests to the real `herdr.sock`. It applies a per-request policy
    (below), writes an audit log (`~/.pall8t/logs/herdr-relay-<run>.log`),
    and only accepts connections whose peer address is the sandbox
    container's own IP (`container inspect`). It watches its parent — the
    pall8t pid that becomes the `container` client via exec — and exits on
    reparent, so its lifetime equals the session's.
-2. **In-container bridge**: the run command is wrapped in a `sh` bootstrap
+2. **In-container bridge** *(superseded by the amendment: the relay's
+   socket is mounted straight in, and the bootstrap no longer bridges
+   anything)*: the run command is wrapped in a `sh` bootstrap
    that reads the gateway from `/proc/net/route` and runs `socat
    UNIX-LISTEN:/tmp/pall8t/herdr.sock,fork TCP:<gateway>:<port>`, so the
    stock herdr CLI finds a real Unix socket at `HERDR_SOCKET_PATH`. The
@@ -132,21 +142,85 @@ couldn't), it does not make the opening a non-event.
 - A developer using herdr + pall8t gets herdr's documented agent workflow
   inside the sandbox with zero setup; herdr's upstream SKILL.md needs no
   pall8t-specific edits.
-- The default image grows `socat`; custom Containerfiles need it. Without
-  `socat` the bootstrap only warns — `HERDR_SOCKET_PATH` then points at a
-  socket that never exists, so the stock herdr CLI and Unix-socket
-  clients cannot connect; only a client that reads `PALL8T_HERDR_PORT`
-  and speaks TCP to the gateway directly can still reach the relay.
+- ~~The default image grows `socat`; custom Containerfiles need it.
+  Without `socat` the bootstrap only warns — `HERDR_SOCKET_PATH` then
+  points at a socket that never exists, so the stock herdr CLI and
+  Unix-socket clients cannot connect; only a client that reads
+  `PALL8T_HERDR_PORT` and speaks TCP to the gateway directly can still
+  reach the relay.~~ **Superseded by the amendment**: no image needs
+  `socat`, and the socket exists whenever the mount did.
 - First bridged run needs network access to download the Linux herdr CLI;
   it's cached per version afterwards.
 - herdr's screen-scrape agent detection still comes from the host-side
   argv0 hint (unchanged); in-container integrations that report state over
   the socket (herdr's `integration install` hooks in the container home)
-  also work — but only once the in-container `socat` bridge has created
-  the Unix socket at `HERDR_SOCKET_PATH`. `HERDR_ENV=1` is set whenever
-  the bridge is *configured*; it is not proof the socket is *up*. Without
-  `socat` in the image (previous bullet) the socket never appears, so
-  those integrations and the stock CLI stay unusable even though
-  `HERDR_ENV=1`.
+  also work. `HERDR_ENV=1` is set whenever the bridge is *configured*; it
+  is still not proof the socket is *up* — bridge setup is best-effort, and
+  a run whose relay failed to start warns on the host and proceeds with
+  the env set but no socket mounted. A client should check rather than
+  assume. (Before the amendment there was a second way to get
+  `HERDR_ENV=1` with no socket: an image without `socat`. That one is
+  gone.)
 - `pane.move` responses, closed-pane ID rules, etc. pass through untouched
   — pall8t interprets nothing but the method name.
+
+## Amendment (2026-08-23): the socket premise was wrong
+
+`ENOTSUP` was real, but it was the answer to the wrong question. pall8t
+emits every mount as `--mount type=virtiofs,…` (ADR-0009 explains why:
+`-v`'s third field is unvalidated). On container 1.2.2:
+
+- The **CLI parser** rejects any `--mount` whose source is not a directory
+  (`path '…' is not a directory`), so a socket never gets that far.
+- The **runtime** has always treated a mount whose source is a Unix socket
+  as a socket to forward into the guest, not a filesystem to mount
+  (`UnixSocketConfiguration(direction: .into)` — the same mechanism
+  `--ssh` uses for the agent socket).
+- `-v host.sock:/guest.sock` skips the parser's directory guard and
+  reaches that runtime path.
+
+Verified live on 1.2.2 against a host `AF_UNIX` echo server: the guest
+sees a real socket, connects, and the host process receives the payload
+and replies. Also verified: the guest node carries the **host's** file
+mode (so a 0600 host socket is unreachable from a non-root guest process,
+and 0666 is reachable by `dev`), and the runtime creates the mount
+target's parent directory.
+
+### What changes
+
+1. The relay listens on a **Unix socket of its own** at
+   `~/.pall8t/run/<container>.sock` (name truncated with a hash suffix
+   when `sun_path`'s 104-byte budget demands it), mode `0666` inside a
+   `0700` directory. It prints that path as its readiness line, because
+   `container run` needs the socket to exist before it can take it as a
+   mount source.
+2. That socket is mounted into the sandbox at `HERDR_SOCKET_PATH`
+   (`Mount::socket`, emitted as the two-field `-v` — the one form the
+   runtime accepts for a socket; tracked upstream as pall8t#52).
+3. The in-container bootstrap loses the `socat` bridge and the
+   `/proc/net/route` gateway lookup; it now only prepends
+   `/opt/pall8t/bin` to `PATH` and execs. **Custom Containerfiles no
+   longer need `socat`**, and the shipped default image no longer
+   installs it.
+4. `PALL8T_HERDR_PORT` is gone, as are the peer-IP pinning and
+   `container::ip_address`/`default_gateway` that served it.
+5. Sockets left by an exited run are reaped by the next run: a socket
+   nothing is listening on is stale by definition, and a live one belongs
+   to a concurrent sandbox and is left alone.
+
+### Security posture, restated
+
+This is a narrowing. The TCP listener was reachable by every process on
+the machine and every container on the vmnet, which is what the peer-IP
+gate existed to compensate for. The listening socket is reachable only
+through a `0700` directory owned by this user — a user who can already
+connect to `herdr.sock` itself — and each run's socket is mounted into
+exactly one container. The `0666` mode on the socket file governs access
+*inside* the VM, where the only principal is the sandboxed agent, which
+is precisely who should reach it.
+
+The policy classes and the audit log are untouched, and deliberately so:
+the relay is still the only thing the sandbox can talk to, and every
+request still passes `classify` before it reaches `herdr.sock`. Mounting
+`herdr.sock` itself would have been simpler and is exactly what this
+design refuses — it would hand the sandbox the unfiltered API.

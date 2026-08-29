@@ -160,6 +160,20 @@ fn capped_slug(name: &str) -> String {
         .to_string()
 }
 
+/// How long ago `entry` was last modified, or `None` when that can't be
+/// read — an absent or unreadable mtime, or one in the future (a clock
+/// step, a filesystem with coarse timestamps). Both reapers in this crate
+/// (`herdr::prune_stale_run_bins`, `relay::reap_stale_sockets`) delete
+/// things based on this, and both must read `None` as *don't reap*, so
+/// the "unknown age" case is decided here once rather than in each walk.
+pub(crate) fn entry_age(entry: &std::fs::DirEntry) -> Option<std::time::Duration> {
+    entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
