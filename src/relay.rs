@@ -780,6 +780,37 @@ mod tests {
         );
     }
 
+    /// The liveness probe itself, against real sockets — the two answers
+    /// that depend on nobody else: a socket something is listening on
+    /// answers, and a path with nothing at it does not.
+    ///
+    /// The third case — a socket file whose listener is gone — is
+    /// deliberately absent. It is the one a subprocess spawned by another
+    /// test can falsify by inheriting the listener (see
+    /// [`reap_stale_sockets`]), and it is already decided, errno by errno,
+    /// in [`connect_says_dead`]. Testing it here bought a flake, not
+    /// coverage.
+    #[test]
+    fn a_socket_is_live_only_while_something_is_listening() {
+        let dir = test_dir("islive");
+        let served = dir.join("served.sock");
+        // Held for the length of the test: an unaccepted connect still
+        // succeeds, which is exactly what the probe asks.
+        let listener = UnixListener::bind(&served).unwrap();
+        assert!(
+            socket_is_live(&served),
+            "a served socket is live — reaping it would cut a running \
+             sandbox's bridge mid-session"
+        );
+        assert!(
+            !socket_is_live(&dir.join("never-existed.sock")),
+            "and a path with nothing at it is not: `NotFound` is one of the \
+             two errors that mean gone"
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The reaping walk itself, on a real directory: it deletes files, so
     /// "which ones" is worth proving against the filesystem rather than
     /// only through the pure decision. No container and no herdr involved
