@@ -16,8 +16,21 @@ The test strategy starts in the production code, not the test file:
 - **Dependencies are arguments.** Probes with real IO (a socket connect, a
   `--version` spawn) are computed by the caller and passed in, so the
   logic under test stays pure and parallel-test-safe
-  (`herdr::doctor_checks(&snap, socket_reachable, bin_resolvable)`).
+  (`herdr::doctor_checks(&snap, socket_reachable, bin_resolvable)`,
+  `stale_sockets(candidates, grace, is_live)`,
+  `reap_stale_sockets(dir, grace, is_live)`).
   Never mutate `std::env` in a test — the suite runs in parallel.
+- **A socket this process closed is not necessarily dead, and a half-close
+  it performed is not necessarily seen.** macOS has no atomic
+  close-on-exec for socket creation, so a subprocess another test spawns
+  in that instant inherits the socket and holds it open for its own
+  lifetime. Two tests here assumed otherwise and failed roughly once in
+  every 300-900 full-suite runs — a bound-then-dropped socket that kept
+  answering `connect`, and an upstream half-close that never reached its
+  peer. Assert what the code under test decides, and inject the probe;
+  the connect itself belongs in the one place that interprets it
+  (`connect_says_dead`). The same goes for any resource the suite assumes
+  is private while `Command::spawn` runs in parallel.
 - **External CLI output is parsed by a pure `parse_*` function**, tested
   against *literal captured output* of the real tool, including a comment
   saying which version it was captured from (`parse_list_all`,
