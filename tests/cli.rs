@@ -1294,7 +1294,8 @@ fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
 
     let err = stderr(&out);
     assert!(
-        err.contains(r#"naming this tab and its agent "demo-2""#),
+        err.contains(r#"naming this tab "demo-2""#)
+            && err.contains("its agent takes the same name"),
         "the run says what it named, with [herdr] agent_name overriding the \
          directory basename and the tab's number as the suffix: {err}"
     );
@@ -1385,9 +1386,11 @@ fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
         "a label the human chose must survive the run untouched: {calls}"
     );
     assert!(
-        err.contains("leaving the tab's label as it is"),
-        "and the run must say so rather than claiming a tab it did not \
-         name: {err}"
+        err.contains(r#"this tab keeps its label "release work""#)
+            && err.contains(r#"address the agent as "demo-2""#),
+        "and the run must say so rather than claiming a tab it did not name — \
+         naming both strings is what shows the human that the label they will \
+         read off the tab is not the name that reaches this agent: {err}"
     );
     let log = wait_for_line(
         &sb.pall8t_root().join("logs").join("herdr-naming.log"),
