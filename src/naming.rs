@@ -642,17 +642,23 @@ mod tests {
     /// inference turns on (issue #71): `w13:t2` was created second but
     /// sits first, so its auto label reads `"1"`, not `"2"`.
     ///
-    /// Shape derived from herdr 0.8.2's own types rather than captured
-    /// from a live server (this suite never runs one, per
-    /// docs/testing.md): `ResponseResult::TabList { tabs: Vec<TabInfo> }`,
-    /// internally tagged `type`, re-serialized by the CLI through
-    /// `serde_json::Value` — which sorts keys alphabetically, as the
-    /// captured `tab rename` output in issue #71 shows.
+    /// Field for field the envelope a live herdr 0.8.2 session answers
+    /// `herdr tab list` with — `ResponseResult::TabList { tabs:
+    /// Vec<TabInfo> }`, internally tagged `type`, re-serialized by the CLI
+    /// through `serde_json::Value`, which is what sorts the keys
+    /// alphabetically. The *arrangement* is constructed rather than
+    /// captured, because one session rarely holds every case at once: two
+    /// workspaces, so per-workspace position counting is actually
+    /// exercised. The disagreement itself is not hypothetical — a live
+    /// session produced tab `w17:t4` with `number = 4` sitting at position
+    /// 3, auto-labeled `"3"`.
     const TAB_LIST: &str = r#"{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"unknown","focused":false,"label":"1","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"},{"agent_status":"idle","focused":true,"label":"api","number":3,"pane_count":2,"tab_id":"w13:t3","workspace_id":"w13"},{"agent_status":"unknown","focused":false,"label":"1","number":9,"pane_count":1,"tab_id":"w14:t9","workspace_id":"w14"}],"type":"tab_list"}}"#;
 
     /// `herdr agent list`, same provenance: `AgentInfo::name` is optional
     /// and omitted when the agent has none (`skip_serializing_if`), which
-    /// is the common case this parse must not trip over.
+    /// is the common case this parse must not trip over — confirmed on a
+    /// live session, where an unnamed agent's object carries no `name` key
+    /// at all rather than a null.
     const AGENT_LIST: &str = r#"{"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"idle","focused":false,"name":"foo-2","pane_id":"w13:p3","tab_id":"w13:t3","terminal_id":"t1","workspace_id":"w13"},{"agent":"codex","agent_status":"working","focused":false,"pane_id":"w13:p5","tab_id":"w13:t2","terminal_id":"t2","workspace_id":"w13"}],"type":"agent_list"}}"#;
 
     #[test]
