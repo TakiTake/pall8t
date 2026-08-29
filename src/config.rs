@@ -136,25 +136,53 @@ pub fn ssh_enabled(config: bool, cli_override: Option<bool>) -> bool {
     cli_override.unwrap_or(config)
 }
 
-/// Warning for a run that asked for SSH forwarding on a host with no
-/// agent. Verified on container 1.2.2: the runtime logs "ssh forwarding
+/// Warning for a run that asked for SSH forwarding the host cannot
+/// deliver. Verified on container 1.2.2: the runtime logs "ssh forwarding
 /// requested but no `SSH_AUTH_SOCK` found" to its *own* log, forwards
 /// nothing — and still sets `SSH_AUTH_SOCK` inside the container, so the
 /// sandbox sees a path with no socket behind it. Without this warning the
 /// user gets only a connect failure from `ssh` and no cause. `None` when
 /// there is nothing to say.
-pub fn ssh_warning(enabled: bool, host_auth_sock: Option<&str>) -> Option<String> {
-    let missing = host_auth_sock.is_none_or(str::is_empty);
-    (enabled && missing).then(|| {
-        concat!(
-            "pall8t: warning: [container] ssh is on, but SSH_AUTH_SOCK is unset ",
-            "on the host — there is no agent to forward. SSH_AUTH_SOCK is still set ",
-            "inside the sandbox, pointing at a socket that isn't there, so ",
-            "git-over-SSH will fail on connect. Start an agent (ssh-add) or set ",
-            "ssh = false."
-        )
-        .to_string()
-    })
+///
+/// Two ways to have no agent, not one. Unset is the obvious one; the
+/// commonly hit one is a **stale** `SSH_AUTH_SOCK` — a tmux session or a
+/// shell resumed after a reboot still exports the path of a socket that
+/// died with the agent that made it. Testing only for unset lets exactly
+/// the confusing case through silently, so existence is asked as well,
+/// via `sock_exists` rather than by touching the filesystem here (the
+/// caller passes `Path::exists`; the tests pass an answer). A probe that
+/// cannot tell — an unreadable parent directory — reads as absent and
+/// warns: the cost of a wrong warning is one line of text, the cost of a
+/// wrong silence is the unexplained connect failure this exists to
+/// prevent.
+pub fn ssh_warning(
+    enabled: bool,
+    host_auth_sock: Option<&str>,
+    sock_exists: impl FnOnce(&str) -> bool,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let cause = match host_auth_sock {
+        Some(path) if !path.is_empty() => {
+            if sock_exists(path) {
+                return None;
+            }
+            format!("SSH_AUTH_SOCK on the host points at {path}, which isn't there")
+        }
+        _ => "SSH_AUTH_SOCK is unset on the host".to_string(),
+    };
+    // `ssh-add` alone is not the remedy: with no agent to talk to it just
+    // fails with "Could not open a connection to your authentication
+    // agent", which is a second dead end for anyone following the advice
+    // literally. Starting one is what the situation calls for.
+    Some(format!(
+        "pall8t: warning: [container] ssh is on, but {cause} — there is no \
+         agent to forward. SSH_AUTH_SOCK is still set inside the sandbox, \
+         pointing at a socket that isn't there, so git-over-SSH will fail on \
+         connect. Start an agent (eval \"$(ssh-agent -s)\" && ssh-add) or set \
+         ssh = false."
+    ))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -696,23 +724,46 @@ mod tests {
 
     #[test]
     fn ssh_warning_only_when_it_would_forward_nothing() {
+        let live = |_: &str| true;
+        let gone = |_: &str| false;
         assert!(
-            ssh_warning(true, None).is_some(),
-            "asking for forwarding with no agent on the host gets a warning: \
-             the runtime logs it to its own log and silently forwards nothing"
+            ssh_warning(true, None, live).is_some(),
+            "forwarding asked for with no SSH_AUTH_SOCK at all: the runtime \
+             forwards nothing and says so only in its own log"
         );
         assert!(
-            ssh_warning(true, Some("")).is_some(),
-            "an empty SSH_AUTH_SOCK is as agent-less as an unset one"
+            ssh_warning(true, Some(""), live).is_some(),
+            "an empty SSH_AUTH_SOCK is unset with extra steps"
         );
         assert!(
-            ssh_warning(true, Some("/private/tmp/agent.sock")).is_none(),
-            "an agent is present: nothing to say"
+            ssh_warning(true, Some("/private/tmp/agent.sock"), live).is_none(),
+            "a live agent is the whole point; saying nothing is correct"
         );
         assert!(
-            ssh_warning(false, None).is_none(),
-            "a run that never asked for forwarding must not be nagged about an \
-             agent it doesn't want"
+            ssh_warning(false, None, live).is_none(),
+            "nothing to warn about when the run never asked to forward"
+        );
+
+        // The case a presence-only check misses: a tmux session or a shell
+        // resumed after a reboot still exports the path of a socket that
+        // died with its agent. `container` forwards nothing, sets
+        // SSH_AUTH_SOCK in the guest anyway, and the user sees only a
+        // connect failure — the exact silence this function exists to break.
+        let stale = ssh_warning(true, Some("/private/tmp/dead-agent.sock"), gone)
+            .expect("a stale SSH_AUTH_SOCK has no agent behind it either");
+        assert!(
+            stale.contains("/private/tmp/dead-agent.sock"),
+            "and it must name the dead path, since that is the one clue the \
+             user cannot get anywhere else: {stale}"
+        );
+
+        // The remedy has to be one that works. `ssh-add` on its own fails
+        // with "Could not open a connection to your authentication agent"
+        // in precisely the situation this warning is printed in.
+        let unset = ssh_warning(true, None, gone).unwrap();
+        assert!(
+            unset.contains("ssh-agent -s"),
+            "the fix for 'no agent' is starting one, not ssh-add: {unset}"
         );
     }
 

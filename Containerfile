@@ -3,9 +3,15 @@ FROM ubuntu:24.04
 ARG UID=501
 ARG GID=501
 
-# node + claude CLI + gh + common tools; dev user with host UID/GID
+# node + claude CLI + gh + common tools; dev user with host UID/GID.
+# GitHub's SSH host keys are baked into /etc/ssh/ssh_known_hosts from the
+# authenticated api.github.com/meta rather than left to ssh-keyscan/TOFU:
+# the sandbox runs non-interactively, so an unknown host key is not a
+# prompt anyone can answer, it is `git push` dying on "Host key
+# verification failed" — with [container] ssh = true forwarding a perfectly
+# good agent that never gets consulted.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git sudo ripgrep less vim openssh-client tmux && \
+      ca-certificates curl git sudo ripgrep less vim openssh-client jq tmux && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -13,6 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
       > /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && apt-get install -y --no-install-recommends gh && \
+    curl -fsSL https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com \(.)"' \
+      >> /etc/ssh/ssh_known_hosts && \
     (getent group ${GID} || groupadd -g ${GID} dev) && \
     useradd -m -u ${UID} -g ${GID} -s /bin/bash dev && \
     echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev

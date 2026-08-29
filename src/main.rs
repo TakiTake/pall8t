@@ -302,7 +302,11 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
         .collect();
 
     let ssh = config::ssh_enabled(cfg.ssh, cli_ssh);
-    if let Some(msg) = config::ssh_warning(ssh, std::env::var("SSH_AUTH_SOCK").ok().as_deref()) {
+    if let Some(msg) =
+        config::ssh_warning(ssh, std::env::var("SSH_AUTH_SOCK").ok().as_deref(), |p| {
+            std::path::Path::new(p).exists()
+        })
+    {
         eprintln!("{msg}");
     }
 

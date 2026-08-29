@@ -15,7 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the run lasts, the sandbox can authenticate as you anywhere your
   keys are trusted. `pall8t run --ssh` / `--ssh=false` overrides it for
   one run, and pall8t warns when forwarding is on but the host has no
-  `SSH_AUTH_SOCK` (the runtime would otherwise forward nothing silently).
+  agent to forward — both an unset `SSH_AUTH_SOCK` and one pointing at a
+  socket that is no longer there, which is what a shell resumed after a
+  reboot exports. The runtime would otherwise forward nothing silently
+  while still setting `SSH_AUTH_SOCK` in the guest.
+
+### Changed
+
+- **The default image bakes GitHub's SSH host keys into
+  `/etc/ssh/ssh_known_hosts`** (from the authenticated `api.github.com/meta`,
+  as the repo's own dev image already did). Without them a forwarded agent
+  is unusable for its main purpose: the sandbox is non-interactive, so an
+  unknown host key is not a prompt anyone can answer — `git push` just dies
+  on "Host key verification failed" without ever consulting the agent. A
+  custom Containerfile needs the same line. `jq` joins the default image's
+  tool list to do it.
 
 ## [0.5.0] - 2026-08-29
 

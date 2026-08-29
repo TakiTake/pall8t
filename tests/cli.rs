@@ -1141,6 +1141,98 @@ fn run_hands_the_runtime_the_workspace_mount_and_the_configured_command() {
     );
 }
 
+/// `[container] ssh` has to survive the whole trip — config file, the
+/// `--ssh` override, `ssh_enabled`, `RunSpec`, `run_argv` — and the only
+/// place its effect is observable is the argv pall8t hands the runtime.
+/// The unit tests cover each link; this one pins that they are actually
+/// joined, so a wiring slip (`let ssh = false;` in `cmd_run`) has
+/// somewhere to go red. The runtime is left in place rather than vanished:
+/// the fake logs the `run` line and exits, which is the launch this needs
+/// to read.
+#[test]
+fn ssh_forwarding_travels_from_config_to_the_runtimes_argv() {
+    let sb = Sandbox::new("run-ssh");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    let run_line = |fake: &FakeRuntime| {
+        fake.argv_log()
+            .lines()
+            .find(|l| l.starts_with("run "))
+            .expect("pall8t must reach `container run`")
+            .to_string()
+    };
+
+    // Off by default: nothing in an ordinary config hands the sandbox the
+    // user's agent.
+    sb.run(&["run"]);
+    assert!(
+        !run_line(&fake).contains("--ssh"),
+        "forwarding is opt-in; a run that never asked must not get it: {}",
+        run_line(&fake)
+    );
+
+    // `--ssh` alone, with no config saying anything.
+    fake.clear_log();
+    sb.run(&["run", "--ssh"]);
+    assert!(
+        run_line(&fake).contains("--ssh"),
+        "`pall8t run --ssh` must reach the runtime as --ssh: {}",
+        run_line(&fake)
+    );
+
+    // And from the config file, which is the form the README documents.
+    sb.write_project_config("[container]\nssh = true\n");
+    fake.clear_log();
+    sb.run(&["run"]);
+    assert!(
+        run_line(&fake).contains("--ssh"),
+        "[container] ssh = true must reach the runtime too: {}",
+        run_line(&fake)
+    );
+
+    // The escape hatch: one run without forwarding, config untouched.
+    fake.clear_log();
+    let out = sb.command().args(["run", "--ssh=false"]).output().unwrap();
+    assert!(
+        !run_line(&fake).contains("--ssh"),
+        "`--ssh=false` beats a config that switched it on: {}",
+        run_line(&fake)
+    );
+
+    // The warning rides the same wiring: the harness clears the
+    // environment, so this run genuinely has no SSH_AUTH_SOCK.
+    fake.clear_log();
+    let out_on = sb.command().args(["run", "--ssh"]).output().unwrap();
+    assert!(
+        stderr(&out_on).contains("SSH_AUTH_SOCK is unset on the host"),
+        "forwarding with no agent must say so on stderr: {}",
+        stderr(&out_on)
+    );
+    assert!(
+        !stderr(&out).contains("SSH_AUTH_SOCK"),
+        "and a run that turned forwarding off has nothing to warn about: {}",
+        stderr(&out)
+    );
+
+    // A stale SSH_AUTH_SOCK is the case a presence-only check misses.
+    fake.clear_log();
+    let dead = sb.root.join("dead-agent.sock");
+    let out_stale = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &dead)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&out_stale).contains(&format!("points at {}", dead.display())),
+        "a socket path with nothing behind it must be named, not treated as \
+         a working agent: {}",
+        stderr(&out_stale)
+    );
+}
+
 /// The whole bridge, assembled: a herdr pane's environment, a host herdr
 /// CLI, a verified cached Linux build, and a real socket to forward to.
 /// `pall8t run` must announce the pane's agent to herdr, spawn the relay,

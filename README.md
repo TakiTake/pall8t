@@ -84,7 +84,9 @@ Override for a single run without editing the file: `pall8t run --readonly` (or 
 
 Off by default, because while the run lasts, code in the sandbox can authenticate as you anywhere your keys are trusted. `pall8t run --ssh` turns it on for one run; `--ssh=false` turns it off for one run.
 
-If forwarding is on and the host has no `SSH_AUTH_SOCK`, pall8t warns: the runtime forwards nothing in that case but *still* sets `SSH_AUTH_SOCK` inside the container, so without the warning the only symptom is `ssh` failing to connect to a socket that was never there.
+If forwarding is on and the host has no agent, pall8t warns — both when `SSH_AUTH_SOCK` is unset and when it points at a socket that is no longer there (a shell resumed after a reboot, a long-lived tmux session). The runtime forwards nothing in that case but *still* sets `SSH_AUTH_SOCK` inside the container, so without the warning the only symptom is `ssh` failing to connect to a socket that was never there.
+
+A forwarded agent is only half of what git-over-SSH needs: the sandbox runs non-interactively, so an unknown host key is not a prompt anyone can answer. The default image therefore bakes GitHub's SSH host keys into `/etc/ssh/ssh_known_hosts` at build time, from the authenticated `api.github.com/meta` rather than `ssh-keyscan`. **A custom Containerfile needs to do the same** (or `ssh` inside the sandbox fails with "Host key verification failed" while the agent it was handed goes unconsulted) — see the line in the built-in [`Containerfile`](Containerfile).
 
 Note that `~` expands on the **host**, and an identity mount lands at that same absolute path inside the container — `~/src/other-lib` is `/Users/you/src/other-lib` in the sandbox, not `/home/dev/src/other-lib`. Set `target` if you want it somewhere friendlier.
 
