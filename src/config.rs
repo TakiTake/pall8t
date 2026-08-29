@@ -150,27 +150,29 @@ pub fn ssh_enabled(config: bool, cli_override: Option<bool>) -> bool {
 /// died with the agent that made it. Testing only for unset lets exactly
 /// the confusing case through silently, so existence is asked as well,
 /// via `sock_exists` rather than by touching the filesystem here (the
-/// caller passes `Path::exists`; the tests pass an answer). A probe that
+/// caller hands over `Path::exists` itself; the tests hand over an
+/// answer). A probe that
 /// cannot tell — an unreadable parent directory — reads as absent and
 /// warns: the cost of a wrong warning is one line of text, the cost of a
 /// wrong silence is the unexplained connect failure this exists to
 /// prevent.
 pub fn ssh_warning(
     enabled: bool,
-    host_auth_sock: Option<&str>,
-    sock_exists: impl FnOnce(&str) -> bool,
+    host_auth_sock: Option<&Path>,
+    sock_exists: impl Fn(&Path) -> bool,
 ) -> Option<String> {
     if !enabled {
         return None;
     }
-    let cause = match host_auth_sock {
-        Some(path) if !path.is_empty() => {
-            if sock_exists(path) {
-                return None;
-            }
-            format!("SSH_AUTH_SOCK on the host points at {path}, which isn't there")
-        }
-        _ => "SSH_AUTH_SOCK is unset on the host".to_string(),
+    // `filter` folds an empty SSH_AUTH_SOCK in with an unset one: both mean
+    // "no agent", and only one of them has a path worth printing.
+    let cause = match host_auth_sock.filter(|s| !s.as_os_str().is_empty()) {
+        None => "SSH_AUTH_SOCK is unset on the host".to_string(),
+        Some(sock) if sock_exists(sock) => return None,
+        Some(sock) => format!(
+            "SSH_AUTH_SOCK on the host points at {}, which isn't there",
+            sock.display()
+        ),
     };
     // `ssh-add` alone is not the remedy: with no agent to talk to it just
     // fails with "Could not open a connection to your authentication
@@ -724,19 +726,19 @@ mod tests {
 
     #[test]
     fn ssh_warning_only_when_it_would_forward_nothing() {
-        let live = |_: &str| true;
-        let gone = |_: &str| false;
+        let live = |_: &Path| true;
+        let gone = |_: &Path| false;
         assert!(
             ssh_warning(true, None, live).is_some(),
             "forwarding asked for with no SSH_AUTH_SOCK at all: the runtime \
              forwards nothing and says so only in its own log"
         );
         assert!(
-            ssh_warning(true, Some(""), live).is_some(),
+            ssh_warning(true, Some(Path::new("")), live).is_some(),
             "an empty SSH_AUTH_SOCK is unset with extra steps"
         );
         assert!(
-            ssh_warning(true, Some("/private/tmp/agent.sock"), live).is_none(),
+            ssh_warning(true, Some(Path::new("/private/tmp/agent.sock")), live).is_none(),
             "a live agent is the whole point; saying nothing is correct"
         );
         assert!(
@@ -749,12 +751,20 @@ mod tests {
         // died with its agent. `container` forwards nothing, sets
         // SSH_AUTH_SOCK in the guest anyway, and the user sees only a
         // connect failure — the exact silence this function exists to break.
-        let stale = ssh_warning(true, Some("/private/tmp/dead-agent.sock"), gone)
+        let stale = ssh_warning(true, Some(Path::new("/private/tmp/dead-agent.sock")), gone)
             .expect("a stale SSH_AUTH_SOCK has no agent behind it either");
         assert!(
             stale.contains("/private/tmp/dead-agent.sock"),
             "and it must name the dead path, since that is the one clue the \
              user cannot get anywhere else: {stale}"
+        );
+        // An empty path is "unset", not a path to complain about.
+        assert!(
+            ssh_warning(true, Some(Path::new("")), gone)
+                .unwrap()
+                .contains("is unset on the host"),
+            "an empty SSH_AUTH_SOCK must read as unset, not as a nameless \
+             missing socket"
         );
 
         // The remedy has to be one that works. `ssh-add` on its own fails

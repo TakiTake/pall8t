@@ -302,11 +302,10 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
         .collect();
 
     let ssh = config::ssh_enabled(cfg.ssh, cli_ssh);
-    if let Some(msg) =
-        config::ssh_warning(ssh, std::env::var("SSH_AUTH_SOCK").ok().as_deref(), |p| {
-            std::path::Path::new(p).exists()
-        })
-    {
+    // `var_os`, not `var`: SSH_AUTH_SOCK is a path, and a path is not
+    // required to be UTF-8. `Path::exists` goes in as the probe itself.
+    let host_auth_sock = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
+    if let Some(msg) = config::ssh_warning(ssh, host_auth_sock.as_deref(), Path::exists) {
         eprintln!("{msg}");
     }
 

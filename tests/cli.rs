@@ -1141,6 +1141,15 @@ fn run_hands_the_runtime_the_workspace_mount_and_the_configured_command() {
     );
 }
 
+/// The `run` command line pall8t handed the fake runtime.
+fn run_line(fake: &FakeRuntime) -> String {
+    fake.argv_log()
+        .lines()
+        .find(|l| l.starts_with("run "))
+        .expect("pall8t must reach `container run`")
+        .to_string()
+}
+
 /// `[container] ssh` has to survive the whole trip — config file, the
 /// `--ssh` override, `ssh_enabled`, `RunSpec`, `run_argv` — and the only
 /// place its effect is observable is the argv pall8t hands the runtime.
@@ -1151,85 +1160,93 @@ fn run_hands_the_runtime_the_workspace_mount_and_the_configured_command() {
 /// to read.
 #[test]
 fn ssh_forwarding_travels_from_config_to_the_runtimes_argv() {
-    let sb = Sandbox::new("run-ssh");
+    let sb = Sandbox::new("run-ssh-argv");
     let fake = FakeRuntime::current(&sb);
     let tag = build_once(&sb, &fake);
     fake.set_images(std::slice::from_ref(&tag));
 
-    let run_line = |fake: &FakeRuntime| {
-        fake.argv_log()
-            .lines()
-            .find(|l| l.starts_with("run "))
-            .expect("pall8t must reach `container run`")
-            .to_string()
-    };
+    let cases: [(&str, &[&str], bool, &str); 4] = [
+        (
+            "",
+            &["run"],
+            false,
+            "forwarding is opt-in: a run that never asked for it must not be \
+             handed the user's agent",
+        ),
+        (
+            "",
+            &["run", "--ssh"],
+            true,
+            "`pall8t run --ssh` is the one-run way in, with nothing in the \
+             config file saying anything",
+        ),
+        (
+            "[container]\nssh = true\n",
+            &["run"],
+            true,
+            "and `[container] ssh = true` is the standing way in — the form \
+             the README documents",
+        ),
+        (
+            "[container]\nssh = true\n",
+            &["run", "--ssh=false"],
+            false,
+            "`--ssh=false` beats a config that switched it on: one run \
+             without handing over the agent, config left alone",
+        ),
+    ];
 
-    // Off by default: nothing in an ordinary config hands the sandbox the
-    // user's agent.
-    sb.run(&["run"]);
+    for (config, args, expected, why) in cases {
+        sb.write_project_config(config);
+        fake.clear_log();
+        sb.run(args);
+        let line = run_line(&fake);
+        assert_eq!(line.contains("--ssh"), expected, "{why}. argv was: {line}");
+    }
+}
+
+/// The other half of the same wiring: when forwarding is on but the host
+/// has no agent behind `SSH_AUTH_SOCK`, the run has to say so. The runtime
+/// forwards nothing in that case and still sets `SSH_AUTH_SOCK` inside the
+/// guest, so this warning is the only thing standing between the user and
+/// an unexplained `ssh` connect failure.
+#[test]
+fn the_ssh_warning_says_which_way_the_hosts_agent_is_missing() {
+    let sb = Sandbox::new("run-ssh-warn");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    // The harness clears the environment, so this run genuinely has no
+    // SSH_AUTH_SOCK — no need to unset one.
+    let unset = sb.run(&["run", "--ssh"]);
     assert!(
-        !run_line(&fake).contains("--ssh"),
-        "forwarding is opt-in; a run that never asked must not get it: {}",
-        run_line(&fake)
+        stderr(&unset).contains("SSH_AUTH_SOCK is unset on the host"),
+        "forwarding with no agent at all must say so on stderr: {}",
+        stderr(&unset)
     );
 
-    // `--ssh` alone, with no config saying anything.
-    fake.clear_log();
-    sb.run(&["run", "--ssh"]);
+    let off = sb.run(&["run"]);
     assert!(
-        run_line(&fake).contains("--ssh"),
-        "`pall8t run --ssh` must reach the runtime as --ssh: {}",
-        run_line(&fake)
+        !stderr(&off).contains("SSH_AUTH_SOCK"),
+        "and a run that never asked to forward has nothing to warn about: {}",
+        stderr(&off)
     );
 
-    // And from the config file, which is the form the README documents.
-    sb.write_project_config("[container]\nssh = true\n");
-    fake.clear_log();
-    sb.run(&["run"]);
-    assert!(
-        run_line(&fake).contains("--ssh"),
-        "[container] ssh = true must reach the runtime too: {}",
-        run_line(&fake)
-    );
-
-    // The escape hatch: one run without forwarding, config untouched.
-    fake.clear_log();
-    let out = sb.command().args(["run", "--ssh=false"]).output().unwrap();
-    assert!(
-        !run_line(&fake).contains("--ssh"),
-        "`--ssh=false` beats a config that switched it on: {}",
-        run_line(&fake)
-    );
-
-    // The warning rides the same wiring: the harness clears the
-    // environment, so this run genuinely has no SSH_AUTH_SOCK.
-    fake.clear_log();
-    let out_on = sb.command().args(["run", "--ssh"]).output().unwrap();
-    assert!(
-        stderr(&out_on).contains("SSH_AUTH_SOCK is unset on the host"),
-        "forwarding with no agent must say so on stderr: {}",
-        stderr(&out_on)
-    );
-    assert!(
-        !stderr(&out).contains("SSH_AUTH_SOCK"),
-        "and a run that turned forwarding off has nothing to warn about: {}",
-        stderr(&out)
-    );
-
-    // A stale SSH_AUTH_SOCK is the case a presence-only check misses.
-    fake.clear_log();
+    // The case a presence-only check misses: a path still exported for a
+    // socket that died with its agent.
     let dead = sb.root.join("dead-agent.sock");
-    let out_stale = sb
+    let stale = sb
         .command()
         .args(["run", "--ssh"])
         .env("SSH_AUTH_SOCK", &dead)
         .output()
         .unwrap();
     assert!(
-        stderr(&out_stale).contains(&format!("points at {}", dead.display())),
+        stderr(&stale).contains(&format!("points at {}", dead.display())),
         "a socket path with nothing behind it must be named, not treated as \
          a working agent: {}",
-        stderr(&out_stale)
+        stderr(&stale)
     );
 }
 

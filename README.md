@@ -82,7 +82,7 @@ Override for a single run without editing the file: `pall8t run --readonly` (or 
 
 `[container] ssh = true` forwards the host's SSH agent into the sandbox (`container run --ssh`): apple/container mounts the agent socket at `/var/host-services/ssh-auth.sock` inside the guest and points the container's `SSH_AUTH_SOCK` at it. **No key material crosses the boundary** — the sandbox sends signing requests to the agent on the host, which is the point: without it, git-over-SSH inside the sandbox needs a private key sitting in `~/.pall8t/home/.ssh`, where the agent can read it and where it stays after the run.
 
-Off by default, because while the run lasts, code in the sandbox can authenticate as you anywhere your keys are trusted. `pall8t run --ssh` turns it on for one run; `--ssh=false` turns it off for one run.
+Off by default ([ADR-0011](docs/adr/0011-ssh-agent-forwarding.md)), because while the run lasts, code in the sandbox can authenticate as you anywhere your keys are trusted. `pall8t run --ssh` turns it on for one run; `--ssh=false` turns it off for one run.
 
 If forwarding is on and the host has no agent, pall8t warns — both when `SSH_AUTH_SOCK` is unset and when it points at a socket that is no longer there (a shell resumed after a reboot, a long-lived tmux session). The runtime forwards nothing in that case but *still* sets `SSH_AUTH_SOCK` inside the container, so without the warning the only symptom is `ssh` failing to connect to a socket that was never there.
 

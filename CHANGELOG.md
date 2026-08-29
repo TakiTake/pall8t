@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`[container] ssh`: forward the host's SSH agent into the sandbox**
-  (`container run --ssh`), so an agent can push over SSH without a
+  (`container run --ssh`, ADR-0011), so an agent can push over SSH without a
   private key ever entering the container home. Off by default —
   while the run lasts, the sandbox can authenticate as you anywhere your
   keys are trusted. `pall8t run --ssh` / `--ssh=false` overrides it for
