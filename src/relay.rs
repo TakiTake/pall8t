@@ -26,6 +26,7 @@
 //! Method policy on top keeps the sandbox from administering the host
 //! herdr installation itself; see [`classify`] for the split.
 
+use crate::util::epoch_secs;
 use anyhow::{anyhow, Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -334,15 +335,6 @@ fn audit(log_path: &Path, entry: &serde_json::Value) {
         .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
-fn epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// The pid orphaned children are reparented to.
-const INIT_PID: libc::pid_t = 1;
-
 /// Exits the process the moment the parent changes — i.e. the exec'd
 /// `container` client (which kept pall8t's pid) has exited and the relay
 /// was reparented. Polling getppid is the portable way to observe this
@@ -360,15 +352,12 @@ const INIT_PID: libc::pid_t = 1;
 /// into the host herdr session. Pinned by
 /// `the_relay_exits_once_the_run_that_spawned_it_is_gone`.
 fn watch_parent(original: libc::pid_t) {
-    if original == INIT_PID {
+    if !crate::util::spawning_run_alive(original) {
         std::process::exit(0);
     }
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        // SAFETY: getppid cannot fail and has no preconditions.
-        if unsafe { libc::getppid() } != original {
-            std::process::exit(0);
-        }
+    std::thread::spawn(move || {
+        crate::util::wait_out_spawning_run(original);
+        std::process::exit(0);
     });
 }
 

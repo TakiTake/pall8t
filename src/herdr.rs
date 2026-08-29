@@ -71,24 +71,48 @@ pub fn agent_hint(env: &HerdrEnv, command: &[String]) -> Option<String> {
 
 /// The one herdr-pane identity entry point for `pall8t run`: derives the
 /// agent hint, explains a shadowed `HERDR_AGENT`, reports the sidebar
-/// display name, and returns the hint for the exec's argv0. Everything
-/// here is best-effort chrome — failures warn and the run continues — and
-/// with no derivable name it does nothing at all: better to leave the
-/// pane's herdr-side identity alone than to assert a guess.
-pub fn announce_pane_identity(env: &HerdrEnv, command: &[String]) -> Option<String> {
-    let agent = agent_hint(env, command)?;
-    // The command wins over HERDR_AGENT (see agent_hint); say so when they
-    // disagree, or the shadowed env var is undebuggable.
-    if let Some(env_agent) = env.agent.as_deref().filter(|a| *a != agent) {
-        eprintln!(
-            "pall8t: note: herdr pane agent is {agent:?} (from the run \
-             command); HERDR_AGENT={env_agent:?} ignored"
-        );
+/// display name, names the tab and agent when the user opted into that
+/// (see [`crate::naming`]), and returns the hint for the exec's argv0.
+/// Everything here is best-effort chrome — failures warn and the run
+/// continues.
+///
+/// The *identity* half does nothing at all with no derivable name: better
+/// to leave the pane's herdr-side identity alone than to assert a guess.
+/// The *naming* half still runs, because a tab whose pane hosts no
+/// recognized agent is still a tab a human has to find.
+///
+/// Called ahead of [`prepare_bridge`], and independent of it: naming is
+/// about herdr's view of the pane, not about the bridge, so it happens in
+/// every `[herdr] sandbox` mode including `off`.
+pub fn announce_pane_identity(
+    env: &HerdrEnv,
+    command: &[String],
+    cfg: &crate::config::HerdrConfig,
+    workspace_dir: &std::path::Path,
+) -> Option<String> {
+    let agent = agent_hint(env, command);
+    if let Some(agent) = agent.as_deref() {
+        // The command wins over HERDR_AGENT (see agent_hint); say so when
+        // they disagree, or the shadowed env var is undebuggable.
+        if let Some(env_agent) = env.agent.as_deref().filter(|a| *a != agent) {
+            eprintln!(
+                "pall8t: note: herdr pane agent is {agent:?} (from the run \
+                 command); HERDR_AGENT={env_agent:?} ignored"
+            );
+        }
+        if let Err(e) = report_metadata(env, agent) {
+            eprintln!("pall8t: warning: could not report herdr pane metadata: {e:#}");
+        }
     }
-    if let Err(e) = report_metadata(env, &agent) {
-        eprintln!("pall8t: warning: could not report herdr pane metadata: {e:#}");
-    }
-    Some(agent)
+    crate::naming::name_pane(&crate::naming::Request {
+        herdr_bin: env.herdr_bin(),
+        pane_id: &env.pane_id,
+        tab_id: env.tab_id.as_deref(),
+        workspace_dir,
+        cfg,
+        expect_agent: agent.is_some(),
+    });
+    agent
 }
 
 /// The process names herdr's own `identify_agent` (its `detect` module)

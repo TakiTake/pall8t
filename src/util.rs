@@ -160,6 +160,47 @@ fn capped_slug(name: &str) -> String {
         .to_string()
 }
 
+/// The pid an orphaned child is reparented to.
+const INIT_PID: libc::pid_t = 1;
+
+/// Gap between checks of whether the spawning run is still there — long,
+/// because nothing depends on noticing promptly.
+const PARENT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether the `pall8t run` that spawned this process is still around:
+/// our parent is still `original`, and `original` isn't init itself.
+///
+/// Both halves matter. `pall8t run` keeps its pid when it execs into the
+/// `container` client, so an unchanged parent means the session is live;
+/// but a child spawned by a run that then failed immediately looks up and
+/// sees pid 1, and a value compared against itself never changes — reading
+/// that as "alive" is what leaked a relay per failed run (pinned by
+/// `the_relay_exits_once_the_run_that_spawned_it_is_gone`). `original` is
+/// therefore sampled as early as the spawned process can manage: whatever
+/// runs before the sample is time the parent can exit in.
+pub(crate) fn spawning_run_alive(original: libc::pid_t) -> bool {
+    // SAFETY: getppid cannot fail and has no preconditions.
+    original != INIT_PID && unsafe { libc::getppid() } == original
+}
+
+/// Blocks until [`spawning_run_alive`] stops holding. Polling getppid is
+/// the portable way to observe reparenting without a supervision protocol.
+pub(crate) fn wait_out_spawning_run(original: libc::pid_t) {
+    while spawning_run_alive(original) {
+        std::thread::sleep(PARENT_POLL);
+    }
+}
+
+/// Seconds since the Unix epoch, `0` when the clock is before it — the
+/// timestamp both append-only logs in this crate (the relay's audit log,
+/// the agent namer's) put on every line, so their lines can be read
+/// together.
+pub(crate) fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// How long ago `entry` was last modified, or `None` when that can't be
 /// read — an absent or unreadable mtime, or one in the future (a clock
 /// step, a filesystem with coarse timestamps). Both reapers in this crate

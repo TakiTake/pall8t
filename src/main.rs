@@ -72,6 +72,26 @@ enum HerdrCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Names this run's herdr agent once herdr detects it, then exits
+    /// (spawned by `pall8t run`, never by hand — see `naming`, issue #71)
+    #[command(hide = true)]
+    NameAgent {
+        /// Pane whose agent to name
+        #[arg(long)]
+        pane: String,
+        /// Name to give it
+        #[arg(long)]
+        name: String,
+        /// Tab to keep in step with the name, when pall8t labeled it
+        #[arg(long)]
+        tab: Option<String>,
+        /// herdr CLI to call
+        #[arg(long, default_value = "herdr")]
+        herdr_bin: String,
+        /// Log file for what it did
+        #[arg(long)]
+        log: std::path::PathBuf,
+    },
     /// Host-side relay serving the sandbox herdr bridge (spawned by
     /// `pall8t run`, never by hand — see ADR-0007)
     #[command(hide = true)]
@@ -182,7 +202,7 @@ fn workspace_image(
         .canonicalize()
         .context("cannot resolve the current directory")?;
     let cfg = config::load(&cwd)?;
-    warn_deprecations(&cfg);
+    warn_config_warnings(&cfg);
     ensure_container_system()?;
     let (uid, gid) = container::host_ids();
     let resolved = image::ensure_built(&cwd, &cfg, uid, gid, mode)?;
@@ -194,8 +214,8 @@ fn workspace_image(
 /// machine-readable. Every command that loads a config calls this: a
 /// diagnostic command that stayed quiet about an ignored setting would be
 /// the one place a confused user is most likely to look.
-fn warn_deprecations(cfg: &config::Config) {
-    for d in &cfg.deprecations {
+fn warn_config_warnings(cfg: &config::Config) {
+    for d in &cfg.warnings {
         eprintln!("pall8t: warning: {d}");
     }
 }
@@ -284,7 +304,7 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
     };
     let herdr_agent = herdr_env
         .as_ref()
-        .and_then(|env| herdr::announce_pane_identity(env, &command));
+        .and_then(|env| herdr::announce_pane_identity(env, &command, &cfg.herdr, &cwd));
     // The bridge (ADR-0007) makes the herdr CLI work inside the sandbox:
     // relay + env + Linux binary mount + bootstrap wrap. Best-effort — a
     // bridge failure warns and the run proceeds without it.
@@ -388,6 +408,13 @@ fn cmd_herdr(cmd: &HerdrCmd) -> Result<()> {
             mode,
             log,
         } => pall8t::relay::run(socket, listen, pall8t::relay::Mode::parse(mode)?, log),
+        HerdrCmd::NameAgent {
+            pane,
+            name,
+            tab,
+            herdr_bin,
+            log,
+        } => pall8t::naming::run_agent_namer(herdr_bin, pane, name, tab.as_deref(), log),
         HerdrCmd::Doctor { json } => {
             let snap = herdr::DoctorSnapshot::from_process_env();
             let socket_reachable = snap
@@ -400,7 +427,7 @@ fn cmd_herdr(cmd: &HerdrCmd) -> Result<()> {
                 .ok()
                 .and_then(|cwd| config::load(&cwd).ok());
             if let Some(cfg) = &cfg {
-                warn_deprecations(cfg);
+                warn_config_warnings(cfg);
             }
             let mode = cfg.map_or(config::HerdrSandbox::default(), |c| c.herdr.sandbox);
             let cached = herdr::cached_linux_herdr(snap.herdr_bin());

@@ -279,7 +279,7 @@ fn help_lists_every_subcommand() {
 }
 
 #[test]
-fn the_relay_subcommand_stays_hidden_from_help() {
+fn the_internal_subcommands_stay_hidden_from_help() {
     let sb = Sandbox::new("hidden");
     let out = sb.run(&["herdr", "--help"]);
     assert!(out.status.success());
@@ -288,6 +288,13 @@ fn the_relay_subcommand_stays_hidden_from_help() {
         "`herdr relay` is spawned by `pall8t run`, never typed — listing it \
          invites hand-running the one subcommand that chmods and sweeps a \
          directory: {}",
+        stdout(&out)
+    );
+    assert!(
+        !stdout(&out).contains("name-agent"),
+        "and `herdr name-agent` is likewise pall8t's own machinery: it \
+         outlives the run that spawned it and reports to a log, neither of \
+         which makes sense typed by hand: {}",
         stdout(&out)
     );
 }
@@ -1023,7 +1030,8 @@ fn build_skips_pruning_when_an_image_in_use_cannot_be_determined() {
 
 /// Installs a stand-in host `herdr` CLI and returns its path. It answers
 /// `--version` (which is how pall8t decides *which* Linux build the
-/// sandbox needs) and accepts everything else, recording argv.
+/// sandbox needs), replays whatever JSON the test left for the two list
+/// queries pall8t parses, and accepts everything else, recording argv.
 fn fake_host_herdr(sb: &Sandbox, version: &str) -> PathBuf {
     let path = sb.root.join("herdr");
     let root = sb.root.display();
@@ -1035,6 +1043,8 @@ PATH=/bin:/usr/bin
 printf '%s\n' "$*" >> "{root}/herdr-argv.log"
 case "$1" in
   --version) echo "herdr {version}" ;;
+  tab) [ "$2" = list ] && cat "{root}/herdr-tab-list.json" ;;
+  agent) [ "$2" = list ] && cat "{root}/herdr-agent-list.json" ;;
 esac
 exit 0
 "#
@@ -1043,6 +1053,22 @@ exit 0
     .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     path
+}
+
+/// Waits for `needle` to show up in `path`, and returns the file's
+/// contents either way. The agent half of herdr naming runs in a detached
+/// child that outlives `pall8t run`, so its effects land *after* the
+/// command returns; a deadline turns "the child was never spawned" into a
+/// failed assertion instead of a hung suite.
+fn wait_for_line(path: &Path, needle: &str, limit: std::time::Duration) -> String {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let body = std::fs::read_to_string(path).unwrap_or_default();
+        if body.contains(needle) || std::time::Instant::now() >= deadline {
+            return body;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Seeds `~/.pall8t/tools/herdr/<version>/herdr` and the sha256 sidecar
@@ -1189,11 +1215,92 @@ fn a_run_inside_a_herdr_pane_builds_the_socket_bridge() {
          no agent at all: {herdr_calls}"
     );
     assert!(
+        !herdr_calls.contains("rename") && !herdr_calls.contains("tab list"),
+        "and with [herdr] auto_rename unset nothing is named — naming is \
+         opt-in, so a config that never asked for it must not even look at \
+         the tab list (issue #71): {herdr_calls}"
+    );
+    assert!(
         err.contains("failed to exec `container`"),
         "everything above happens on the way to the launch, which then \
          reports the missing runtime: {err}"
     );
     drop(host_herdr);
+}
+
+/// Naming, opted into (issue #71). `sandbox = "off"` on purpose: naming is
+/// about herdr's view of the pane, not about the bridge, so it has to
+/// happen with the bridge switched off entirely — the mode that spawns no
+/// relay, and the reason the agent half is its own child rather than the
+/// relay's job.
+#[test]
+fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
+    let sb = Sandbox::new("run-naming");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
+    // This pane's tab is `w13:t2`: created second (number 2) but sitting
+    // first, so herdr's own auto label for it is "1". A tab still on that
+    // label is pall8t's to rename — and the suffix comes from the number,
+    // not the position, so the name is "demo-2".
+    std::fs::write(
+        sb.root.join("herdr-tab-list.json"),
+        r#"{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"unknown","focused":true,"label":"1","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}],"type":"tab_list"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        sb.root.join("herdr-agent-list.json"),
+        r#"{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}"#,
+    )
+    .unwrap();
+    sb.write_project_config(
+        "[herdr]\nsandbox = \"off\"\nauto_rename = true\nagent_name = \"demo\"\n",
+    );
+    fake.vanish_after_image_list();
+
+    let out = sb
+        .command()
+        .args(["run", "--", "claude"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "w13:p3")
+        .env("HERDR_TAB_ID", "w13:t2")
+        .env("HERDR_WORKSPACE_ID", "w13")
+        .env("HERDR_BIN_PATH", &herdr_bin)
+        .output()
+        .unwrap();
+
+    let err = stderr(&out);
+    assert!(
+        err.contains(r#"naming this tab and its agent "demo-2""#),
+        "the run says what it named, with [herdr] agent_name overriding the \
+         directory basename and the tab's number as the suffix: {err}"
+    );
+    let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    assert!(
+        calls.contains("tab rename w13:t2 demo-2"),
+        "the tab is renamed before the exec — it needs no detected agent, so \
+         the human sees the right label from the moment the run starts: {calls}"
+    );
+
+    // The agent half cannot run here: at this point the pane's agent is
+    // still pall8t itself. It belongs to the detached child, which reports
+    // to its own log because the pane's terminal now belongs to the agent.
+    let log = wait_for_line(
+        &sb.pall8t_root().join("logs").join("herdr-naming.log"),
+        "named the agent",
+        std::time::Duration::from_secs(10),
+    );
+    assert!(
+        log.contains(r#"named the agent "demo-2""#),
+        "the agent gets the same name as the tab, from a process that \
+         outlives the exec: {log}"
+    );
+    assert!(
+        calls.contains("agent list"),
+        "and the name was checked against the live agents first, so two runs \
+         that would collide get distinct names: {calls}"
+    );
 }
 
 #[test]

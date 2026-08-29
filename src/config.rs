@@ -38,16 +38,26 @@ pub struct Config {
     /// `[herdr]` — how much of the host herdr session a sandboxed agent
     /// may reach through the relay bridge (see [`crate::relay`]).
     pub herdr: HerdrConfig,
-    /// One message per config file that still carries a setting pall8t no
-    /// longer honors, for the caller to print once per invocation (see
-    /// [`load`]). Empty in the common case.
-    pub deprecations: Vec<String>,
+    /// One message per setting the loaded config declares but pall8t does
+    /// not act on — a section it no longer honors ([`deprecations_in`]) or
+    /// one that is inert without the flag that enables it
+    /// ([`inert_agent_name_warning`]) — for the caller to print once per
+    /// invocation (see [`load`]). Empty in the common case.
+    pub warnings: Vec<String>,
 }
 
 /// Merged `[herdr]` configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HerdrConfig {
     pub sandbox: HerdrSandbox,
+    /// Opt-in: name the herdr tab and agent this run launches in, so the
+    /// name a human reads off the tab is the name they can address
+    /// (issue #71, see [`crate::naming`]). Undefined means pall8t renames
+    /// nothing, exactly as before the feature existed.
+    pub auto_rename: bool,
+    /// Name to use instead of the workspace directory's basename. Inert
+    /// on its own — see [`inert_agent_name_warning`].
+    pub agent_name: Option<String>,
 }
 
 /// What the sandboxed agent may do to the host herdr session over the
@@ -142,6 +152,8 @@ struct Raw {
 #[serde(deny_unknown_fields)]
 struct RawHerdr {
     sandbox: Option<HerdrSandbox>,
+    auto_rename: Option<bool>,
+    agent_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -287,13 +299,35 @@ pub fn load(project_dir: &Path) -> Result<Config> {
     ]) {
         return Err(anyhow!(msg));
     }
-    let deprecations = deprecations_in(&global, &global_path)
+    let per_file: Vec<String> = deprecations_in(&global, &global_path)
         .into_iter()
         .chain(deprecations_in(&project, &project_path))
         .collect();
-    Ok(Config {
-        deprecations,
-        ..merge(global, project)
+    let merged = merge(global, project);
+    // The inert-setting check reads the *merged* config, not each file:
+    // a global `auto_rename = true` enables a project's `agent_name`, and
+    // warning per file would call that combination inert.
+    let warnings = per_file
+        .into_iter()
+        .chain(inert_agent_name_warning(&merged.herdr))
+        .collect();
+    Ok(Config { warnings, ..merged })
+}
+
+/// The warning for a config that names the herdr agent but never turns
+/// naming on. `agent_name` alone is a setting that silently does nothing,
+/// which is exactly what the `[home]` warning above exists to prevent.
+///
+/// The alternative — letting `agent_name` imply `auto_rename = true` —
+/// was rejected in issue #71: it would make "undefined means off" untrue
+/// for half the feature, so a user who set a name to have it *ready*
+/// would find pall8t renaming their tabs.
+fn inert_agent_name_warning(herdr: &HerdrConfig) -> Option<String> {
+    (!herdr.auto_rename && herdr.agent_name.is_some()).then(|| {
+        "[herdr] agent_name is set but auto_rename is not — pall8t renames \
+         neither the tab nor the agent. Add `auto_rename = true` under \
+         [herdr] to turn naming on, or delete agent_name."
+            .to_string()
     })
 }
 
@@ -330,13 +364,23 @@ fn merge(global: Raw, project: Raw) -> Config {
         mounts: project.mounts.or(global.mounts).unwrap_or_default(),
         // `[home]` is parsed and ignored; `load` turns its presence into a
         // deprecation message, which `merge` (path-less) can't produce.
-        deprecations: Vec::new(),
+        warnings: Vec::new(),
         herdr: HerdrConfig {
             sandbox: project
                 .herdr
                 .sandbox
                 .or(global.herdr.sandbox)
                 .unwrap_or_default(),
+            // Per-field, like everything else here: a global
+            // `auto_rename = true` stays on for a project that only sets
+            // `agent_name`, and the pair is judged after merging (see
+            // [`inert_agent_name_warning`]) rather than file by file.
+            auto_rename: project
+                .herdr
+                .auto_rename
+                .or(global.herdr.auto_rename)
+                .unwrap_or(false),
+            agent_name: project.herdr.agent_name.or(global.herdr.agent_name),
         },
     }
 }
@@ -377,6 +421,16 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 #              or input from inside the sandbox
 #   "off"      the sandbox can't see herdr at all
 # sandbox = "full"
+#
+# Name the herdr tab and the agent this run launches in, with the same
+# string, so what you read off the tab is what `herdr agent prompt <name>`
+# takes. Off unless set: pall8t renames nothing by default. The name is
+# the workspace directory's basename plus the tab's number (~/src/foo in
+# tab 2 -> "foo-2"); a tab you renamed yourself keeps your label.
+# auto_rename = true
+# Name to use instead of the directory basename. Inert on its own —
+# without auto_rename above, pall8t warns and renames nothing.
+# agent_name = "api"
 "#;
 
 /// Skeleton written by `pall8t init` as `.pall8t/config.toml`.
@@ -417,6 +471,8 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 
 [herdr]
 # sandbox = "full"   # or "readonly" / "off" — see ~/.pall8t/config.toml
+# auto_rename = true # name this run's herdr tab and agent "<dir>-<tab number>"
+# agent_name = "api" # ... using this instead of the directory basename
 "#;
 
 #[cfg(test)]
@@ -487,11 +543,54 @@ mod tests {
         assert!(cfg.watch.is_empty());
         assert_eq!(cfg.command, vec!["claude".to_string()]);
         assert!(cfg.mounts.is_empty());
-        assert!(cfg.deprecations.is_empty());
+        assert!(cfg.warnings.is_empty());
         assert_eq!(
             cfg.herdr.sandbox,
             HerdrSandbox::Full,
             "full herdr passthrough is the default"
+        );
+        assert!(
+            !cfg.herdr.auto_rename && cfg.herdr.agent_name.is_none(),
+            "naming is opt-in: undefined means pall8t renames neither the \
+             tab nor the agent (issue #71)"
+        );
+    }
+
+    #[test]
+    fn herdr_naming_merges_per_field_and_only_agent_name_is_inert() {
+        let global = parse("[herdr]\nauto_rename = true\nagent_name = \"api\"\n");
+        let cfg = merge(global.clone(), Raw::default());
+        assert!(cfg.herdr.auto_rename);
+        assert_eq!(cfg.herdr.agent_name.as_deref(), Some("api"));
+        assert!(
+            inert_agent_name_warning(&cfg.herdr).is_none(),
+            "a name with naming switched on is doing its job"
+        );
+
+        let cfg = merge(global, parse("[herdr]\nagent_name = \"web\"\n"));
+        assert_eq!(cfg.herdr.agent_name.as_deref(), Some("web"), "project wins");
+        assert!(
+            cfg.herdr.auto_rename && inert_agent_name_warning(&cfg.herdr).is_none(),
+            "and the global auto_rename still enables it — the pair is judged \
+             after merging, so a project that only names itself isn't called inert"
+        );
+
+        let cfg = merge(Raw::default(), parse("[herdr]\nagent_name = \"api\"\n"));
+        assert!(
+            !cfg.herdr.auto_rename,
+            "a name must not imply auto_rename: that would make \"undefined \
+             means off\" untrue for half the feature (issue #71)"
+        );
+        let warning = inert_agent_name_warning(&cfg.herdr).expect("a setting that does nothing");
+        assert!(
+            warning.contains("auto_rename"),
+            "and the warning has to name the flag that would turn it on: {warning}"
+        );
+
+        assert!(
+            toml::from_str::<Raw>("[herdr]\nauto_renam = true\n").is_err(),
+            "a misspelled key fails the parse rather than silently renaming \
+             nothing (deny_unknown_fields)"
         );
     }
 
@@ -537,7 +636,7 @@ mod tests {
         let cfg = merge(stale.clone(), Raw::default());
         assert_eq!(cfg.cpus, 2, "the rest of the file is honored as usual");
         assert!(
-            cfg.deprecations.is_empty(),
+            cfg.warnings.is_empty(),
             "`merge` knows no paths; `load` is what attaches the warning"
         );
 
