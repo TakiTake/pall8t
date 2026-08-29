@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-29
+
 ### Added
 
 - **`pall8t run` can name the herdr tab and agent it launches in** (issue
@@ -85,8 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`flake.nix` + `flake.lock`) instead of `mise.toml`: `nix develop` on the
   host and the dev-container image (`.pall8t/Containerfile`) both provision
   Rust from the same lock file.
-- The dev image's userland tools (git, ripgrep, jq, less, vim, tmux, socat,
-  gh, node) also come from the flake now (`#sandbox-tools`), pinned by
+- The dev image's userland tools (git, ripgrep, jq, less, vim, tmux, gh,
+  node) also come from the flake now (`#sandbox-tools`), pinned by
   `flake.lock` instead of floating apt/NodeSource/GitHub-CLI repository
   state; the NodeSource and GitHub-CLI apt repositories are gone from the
   image. apt keeps only what nix can't cover: the bootstrap pair
@@ -332,7 +334,8 @@ container home.
   management (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in
   favor of the shared-home mode.
 
-[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.5.0
 [0.4.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.4.0
 [0.3.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.3.0
 [0.2.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.2.0
