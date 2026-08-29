@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`pall8t run` can name the herdr tab and agent it launches in** (issue
+  #71), opt-in via `auto_rename = true` under `[herdr]`. A herdr agent's
+  name is what makes `herdr agent prompt <target> …` usable across
+  sandboxes; without one the only working target is the pane id, which
+  changes every run. pall8t now names both the tab and the agent with the
+  same string — the workspace directory's basename plus the tab's number
+  (`~/src/foo` in tab 2 → `foo-2`), or `[herdr] agent_name` in place of
+  the basename — so the name on the tab is the name you type. A name a
+  live agent already holds gets a further counter (`foo-2-2`). A tab you
+  labeled yourself is left alone; one still on herdr's own label — or
+  carrying a label pall8t wrote there on an earlier run — is taken over,
+  so a second run in the same tab can't leave the label pointing at some
+  other run's agent. When a label really is someone else's, the run says
+  which name reaches the agent and which one the tab keeps. Undefined means off, and `agent_name` on its own does not
+  switch it on — that combination warns instead of silently doing nothing.
+  Naming happens in every `[herdr] sandbox` mode, `off` included.
 - `pall8t build --no-cache`: bypass the builder's layer cache and re-run
   every `RUN` step. `pall8t build` alone already rebuilds unconditionally,
   but a step whose instruction text didn't change — e.g. the claude CLI's

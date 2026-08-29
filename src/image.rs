@@ -552,7 +552,7 @@ mod tests {
             watch: vec![],
             command: vec!["claude".to_string()],
             mounts: vec![],
-            deprecations: vec![],
+            warnings: vec![],
             herdr: crate::config::HerdrConfig::default(),
         }
     }
