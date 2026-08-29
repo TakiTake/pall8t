@@ -75,7 +75,14 @@ It is still bound by the rule above — no live runtime, no live herdr:
 - **Nothing may hang.** `herdr relay` serves until its parent exits, so the
   test for its refusal-to-run guard waits with a deadline
   (`Sandbox::run_bounded`) — if the guard ever stopped firing, the suite
-  must fail, not block.
+  must fail, not block. The same applies to every blocking read: a
+  `read_line` on a Unix socket waits forever by default, so the relay's
+  own unit tests read replies through `read_reply`, which sets a socket
+  deadline and prints the relay's audit log when it fires. The cost of
+  getting this wrong is not one slow test: `cargo mutants` derives its
+  per-mutant timeout from a baseline run that has *no* timeout itself, so
+  a single stalled read there wedges the whole mutation run — no report,
+  no output, until someone notices.
 
 ## Coverage
 

@@ -832,16 +832,25 @@ mod tests {
         let upstream = UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
             for conn in upstream.incoming() {
-                let Ok(mut conn) = conn else { continue };
+                // `continue` here would spin on a permanent accept error
+                // (fd pressure, a closed listener) while the client waits
+                // for a reply that can never come. Ending the loop instead
+                // closes the socket, so the relay's connect fails and the
+                // client's `read_reply` reports it.
+                let Ok(mut conn) = conn else { break };
                 std::thread::spawn(move || {
                     let mut line = String::new();
                     let mut r = BufReader::new(conn.try_clone().unwrap());
-                    if r.read_line(&mut line).is_ok() {
-                        let _ = conn.write_all(
-                            format!("{{\"id\":\"x\",\"result\":{{\"echo\":{}}}}}\n", line.trim())
-                                .as_bytes(),
-                        );
-                    }
+                    // A read that fails must still answer *something*:
+                    // silence is indistinguishable from a stall, and the
+                    // client would wait out its whole deadline to learn
+                    // nothing.
+                    let body = match r.read_line(&mut line) {
+                        Ok(_) => format!("{{\"echo\":{}}}", line.trim()),
+                        Err(e) => format!("{{\"fake_upstream_read_failed\":\"{e}\"}}"),
+                    };
+                    let _ =
+                        conn.write_all(format!("{{\"id\":\"x\",\"result\":{body}}}\n").as_bytes());
                 });
             }
         });
@@ -853,12 +862,11 @@ mod tests {
         (listen, log)
     }
 
-    fn roundtrip(listen: &Path, request: &str) -> serde_json::Value {
+    fn roundtrip(listen: &Path, log: &Path, request: &str) -> serde_json::Value {
         let mut conn = UnixStream::connect(listen).unwrap();
         conn.write_all(request.as_bytes()).unwrap();
         conn.write_all(b"\n").unwrap();
-        let mut line = String::new();
-        BufReader::new(conn).read_line(&mut line).unwrap();
+        let line = read_reply(conn, request, log);
         serde_json::from_str(line.trim()).unwrap()
     }
 
@@ -871,18 +879,67 @@ mod tests {
         dir
     }
 
+    /// How long a test waits for a reply that should take microseconds.
+    /// Generous enough that a loaded machine never trips it, short enough
+    /// that a stall is reported while someone is still watching.
+    const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Reads one reply line from `conn`, under a deadline.
+    ///
+    /// The deadline is the point. These tests wire a client to a relay to
+    /// a fake herdr socket, and every link is a blocking read: any one of
+    /// them stalling used to park the *whole test binary* forever, because
+    /// `read_line` on a Unix socket has no timeout of its own. `cargo
+    /// test` would sit there until someone noticed, and `cargo mutants`
+    /// worse — its baseline run is what *derives* the per-mutant timeout,
+    /// so it has none itself, and a stalled baseline wedges the entire
+    /// mutation run with no output at all (observed on this suite, which
+    /// is why this exists). docs/testing.md's "nothing may hang" is the
+    /// rule; this is its enforcement for socket reads, the way
+    /// `Sandbox::run_bounded` is for spawned processes.
+    ///
+    /// A timeout therefore fails the test with the state that produced it,
+    /// rather than hanging: the peer that owed a reply is named, so the
+    /// next reader starts from a fact instead of a stack trace.
+    fn read_reply(conn: UnixStream, what: &str, log: &Path) -> String {
+        conn.set_read_timeout(Some(REPLY_DEADLINE))
+            .expect("a read deadline is what keeps a stall from hanging the suite");
+        let mut line = String::new();
+        let outcome = BufReader::new(conn).read_line(&mut line);
+        if let Ok(1..) = outcome {
+            return line;
+        }
+        // The relay's own audit log says how far the request got: no line
+        // at all means it never classified one, an "allow" with nothing
+        // after it means it forwarded and the fake never answered.
+        let audit = std::fs::read_to_string(log).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        let detail = match outcome {
+            Ok(_) => "the relay closed the connection without replying".to_string(),
+            Err(e) => format!("no reply within {REPLY_DEADLINE:?} ({e})"),
+        };
+        panic!("{what}: {detail}\nrelay audit log:\n{audit}");
+    }
+
     #[test]
     fn relay_forwards_allowed_and_denies_blocked() {
         let dir = test_dir("fwd");
         let (listen, log) = start_relay(Mode::Full, &dir);
 
-        let resp = roundtrip(&listen, r#"{"id":"r1","method":"pane.list","params":{}}"#);
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r1","method":"pane.list","params":{}}"#,
+        );
         assert_eq!(
             resp["result"]["echo"]["method"], "pane.list",
             "an allowed request reaches the (fake) herdr socket and its reply comes back"
         );
 
-        let resp = roundtrip(&listen, r#"{"id":"r2","method":"server.stop","params":{}}"#);
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r2","method":"server.stop","params":{}}"#,
+        );
         assert_eq!(resp["id"], "r2");
         assert_eq!(
             resp["error"]["code"], "sandbox_denied",
@@ -913,18 +970,28 @@ mod tests {
         let upstream = UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
             for conn in upstream.incoming() {
-                let Ok(mut conn) = conn else { continue };
+                // `continue` here would spin on a permanent accept error
+                // (fd pressure, a closed listener) while the client waits
+                // for a reply that can never come. Ending the loop instead
+                // closes the socket, so the relay's connect fails and the
+                // client's `read_reply` reports it.
+                let Ok(mut conn) = conn else { break };
                 std::thread::spawn(move || {
                     let mut all = String::new();
                     let mut r = conn.try_clone().unwrap();
-                    if r.read_to_string(&mut all).is_ok() {
-                        let _ = conn.write_all(
-                            serde_json::json!({"id":"x","result":{"received": all}})
-                                .to_string()
-                                .as_bytes(),
-                        );
-                        let _ = conn.write_all(b"\n");
-                    }
+                    // As above: a failed read still answers, naming the
+                    // failure, so the assertion reports it instead of the
+                    // client waiting out its deadline in silence.
+                    let received = match r.read_to_string(&mut all) {
+                        Ok(_) => all,
+                        Err(e) => format!("<upstream read failed: {e}>"),
+                    };
+                    let _ = conn.write_all(
+                        serde_json::json!({"id":"x","result":{"received": received}})
+                            .to_string()
+                            .as_bytes(),
+                    );
+                    let _ = conn.write_all(b"\n");
                 });
             }
         });
@@ -939,8 +1006,7 @@ mod tests {
         )
         .unwrap();
         conn.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut line = String::new();
-        BufReader::new(conn).read_line(&mut line).unwrap();
+        let line = read_reply(conn, "two pipelined requests", &log);
         let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         let received = resp["result"]["received"].as_str().unwrap();
         assert!(
@@ -953,15 +1019,23 @@ mod tests {
     #[test]
     fn relay_readonly_denies_mutations() {
         let dir = test_dir("ro");
-        let (listen, _) = start_relay(Mode::Readonly, &dir);
+        let (listen, log) = start_relay(Mode::Readonly, &dir);
 
-        let resp = roundtrip(&listen, r#"{"id":"r1","method":"pane.read","params":{}}"#);
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r1","method":"pane.read","params":{}}"#,
+        );
         assert_eq!(resp["result"]["echo"]["method"], "pane.read");
 
-        let resp = roundtrip(&listen, r#"{"id":"r2","method":"pane.split","params":{}}"#);
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r2","method":"pane.split","params":{}}"#,
+        );
         assert_eq!(resp["error"]["code"], "sandbox_denied");
 
-        let resp = roundtrip(&listen, "not json at all");
+        let resp = roundtrip(&listen, &log, "not json at all");
         assert_eq!(
             resp["error"]["code"], "sandbox_denied",
             "readonly cannot classify an unparseable request, so it must not forward it"
