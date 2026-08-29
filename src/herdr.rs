@@ -24,7 +24,7 @@ pub struct HerdrEnv {
 }
 
 impl HerdrEnv {
-    fn herdr_bin(&self) -> &str {
+    pub fn herdr_bin(&self) -> &str {
         self.bin_path.as_deref().unwrap_or("herdr")
     }
 }
@@ -71,14 +71,20 @@ pub fn agent_hint(env: &HerdrEnv, command: &[String]) -> Option<String> {
 
 /// The one herdr-pane identity entry point for `pall8t run`: derives the
 /// agent hint, explains a shadowed `HERDR_AGENT`, reports the sidebar
-/// display name, and returns the hint for the exec's argv0. Everything
-/// here is best-effort chrome — failures warn and the run continues — and
-/// with no derivable name it does nothing at all: better to leave the
-/// pane's herdr-side identity alone than to assert a guess.
+/// display name, names the tab and agent when the user opted into that
+/// and returns the hint for the exec's argv0. Best-effort chrome — a
+/// failure warns and the run continues.
+///
+/// Does nothing at all with no derivable name: better to leave the pane's
+/// herdr-side identity alone than to assert a guess. Naming the tab and
+/// the agent is a separate step ([`crate::naming::name_pane`]), called
+/// alongside this one from `cmd_run` — it runs under different conditions
+/// (a tab whose pane hosts no recognized agent is still a tab a human has
+/// to find) and belongs to the top-level sequence, not inside this.
 pub fn announce_pane_identity(env: &HerdrEnv, command: &[String]) -> Option<String> {
     let agent = agent_hint(env, command)?;
-    // The command wins over HERDR_AGENT (see agent_hint); say so when they
-    // disagree, or the shadowed env var is undebuggable.
+    // The command wins over HERDR_AGENT (see agent_hint); say so when
+    // they disagree, or the shadowed env var is undebuggable.
     if let Some(env_agent) = env.agent.as_deref().filter(|a| *a != agent) {
         eprintln!(
             "pall8t: note: herdr pane agent is {agent:?} (from the run \

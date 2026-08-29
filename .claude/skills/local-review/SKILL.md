@@ -90,6 +90,30 @@ local review failed to catch first (source PRs noted).
 - A banner or status line added to a doc must not contradict a claim
   further down the same doc, or the ADR/CHANGELOG describing the change.
 
+**Guards that infer ownership from current state** (PR #72)
+- A guard that decides "may I overwrite this?" by reading the value as it
+  stands now cannot recognize the writes it made *itself* on an earlier
+  run — so it protects only the first pass, and every run after it takes
+  the wrong branch. pall8t skipped renaming a tab whose label wasn't
+  herdr's auto label; after its own first run the label was no longer the
+  auto one, so run 2 read its own handiwork as a human's and left the tab
+  pointing at a name that by then belonged to a different agent.
+  Enumerate the second run explicitly, not just the first.
+- Where the actor can't tell its own past writes apart from a third
+  party's (the derivation changed between runs, so the old value is
+  unreachable), the residual case doesn't disappear — decide what the
+  user is told. Silence there means the divergence is created without
+  anyone seeing it.
+
+**Two sites claiming the same bound** (PR #72)
+- When a limit constant is spelled out in more than one walk, check they
+  actually agree — off-by-one between "the list we offer" and "the list
+  we try" is invisible in review and in normal runs. `candidates` yielded
+  `name` plus `2..=N` (N names); the retry loop ran `for counter in
+  2..=N` around a mutable accumulator and tried N-1. Prefer one iterator
+  both sites share; where they can't share, a test asserting equal length
+  is the pin.
+
 **Probes that decide destructive actions** (PR #62)
 - A health/liveness probe whose "no" triggers a delete, kill, or unlink
   must distinguish *the peer answered no* from *the probe failed to ask*.

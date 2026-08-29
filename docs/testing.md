@@ -16,8 +16,21 @@ The test strategy starts in the production code, not the test file:
 - **Dependencies are arguments.** Probes with real IO (a socket connect, a
   `--version` spawn) are computed by the caller and passed in, so the
   logic under test stays pure and parallel-test-safe
-  (`herdr::doctor_checks(&snap, socket_reachable, bin_resolvable)`).
+  (`herdr::doctor_checks(&snap, socket_reachable, bin_resolvable)`,
+  `stale_sockets(candidates, grace, is_live)`,
+  `reap_stale_sockets(dir, grace, is_live)`).
   Never mutate `std::env` in a test — the suite runs in parallel.
+- **A socket this process closed is not necessarily dead, and a half-close
+  it performed is not necessarily seen.** macOS has no atomic
+  close-on-exec for socket creation, so a subprocess another test spawns
+  in that instant inherits the socket and holds it open for its own
+  lifetime. Two tests here assumed otherwise and failed roughly once in
+  every 300-900 full-suite runs — a bound-then-dropped socket that kept
+  answering `connect`, and an upstream half-close that never reached its
+  peer. Assert what the code under test decides, and inject the probe;
+  the connect itself belongs in the one place that interprets it
+  (`connect_says_dead`). The same goes for any resource the suite assumes
+  is private while `Command::spawn` runs in parallel.
 - **External CLI output is parsed by a pure `parse_*` function**, tested
   against *literal captured output* of the real tool, including a comment
   saying which version it was captured from (`parse_list_all`,
@@ -75,7 +88,14 @@ It is still bound by the rule above — no live runtime, no live herdr:
 - **Nothing may hang.** `herdr relay` serves until its parent exits, so the
   test for its refusal-to-run guard waits with a deadline
   (`Sandbox::run_bounded`) — if the guard ever stopped firing, the suite
-  must fail, not block.
+  must fail, not block. The same applies to every blocking read: a
+  `read_line` on a Unix socket waits forever by default, so the relay's
+  own unit tests read replies through `read_reply`, which sets a socket
+  deadline and prints the relay's audit log when it fires. The cost of
+  getting this wrong is not one slow test: `cargo mutants` derives its
+  per-mutant timeout from a baseline run that has *no* timeout itself, so
+  a single stalled read there wedges the whole mutation run — no report,
+  no output, until someone notices.
 
 ## Coverage
 
