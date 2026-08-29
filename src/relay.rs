@@ -304,9 +304,18 @@ fn socket_is_live(path: &Path) -> bool {
 
 /// Best-effort reaping of sockets left behind by exited runs. Failure is
 /// silent by design: an unreapable leftover costs a stale file, never a
-/// launch. `grace` is a parameter so a test can drive the real filesystem
-/// walk without waiting out [`SOCKET_REAP_GRACE`].
-fn reap_stale_sockets(dir: &Path, grace: std::time::Duration) {
+/// launch.
+///
+/// `grace` and `is_live` are parameters so a test can drive the real
+/// filesystem walk without waiting out [`SOCKET_REAP_GRACE`] and without
+/// depending on a socket it closed actually being unreachable. That last
+/// one is not hypothetical: macOS has no atomic close-on-exec for socket
+/// creation, so a subprocess spawned by another thread in the same instant
+/// inherits the listener, and a socket the test dropped keeps answering
+/// `connect` for as long as that child lives. Injecting the probe keeps
+/// the walk — which files get deleted — real, and leaves the connect
+/// itself to [`connect_says_dead`], where it is decided.
+fn reap_stale_sockets(dir: &Path, grace: std::time::Duration, is_live: impl Fn(&Path) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -319,7 +328,7 @@ fn reap_stale_sockets(dir: &Path, grace: std::time::Duration) {
                 .then(|| (path, crate::util::entry_age(&e)))
         })
         .collect();
-    for path in stale_sockets(candidates, grace, socket_is_live) {
+    for path in stale_sockets(candidates, grace, is_live) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -417,7 +426,7 @@ pub fn run(socket: &Path, listen: &Path, mode: Mode, log_path: &Path) -> Result<
     // blocks when a live peer's backlog is full — the very case the grace
     // window exists for, turning one wedged relay into slow launches for
     // every other sandbox.
-    reap_stale_sockets(dir, SOCKET_REAP_GRACE);
+    reap_stale_sockets(dir, SOCKET_REAP_GRACE, socket_is_live);
     watch_parent(parent);
     audit(
         log_path,
@@ -775,15 +784,26 @@ mod tests {
     /// "which ones" is worth proving against the filesystem rather than
     /// only through the pure decision. No container and no herdr involved
     /// — just Unix sockets, like the forwarding tests above.
+    ///
+    /// The liveness probe is injected rather than real, and that is not
+    /// tidiness. It used to bind a socket, drop it, and take "nothing is
+    /// listening" for granted — which the suite falsified: with tests that
+    /// spawn subprocesses running alongside, a `git` child forked in the
+    /// instant between `socket()` and its close-on-exec flag inherits the
+    /// listener, so the dropped socket kept answering `connect` and the
+    /// walk correctly refused to reap it. Roughly one run in 900. What the
+    /// walk decides is this test's subject; whether a connect succeeds is
+    /// [`connect_says_dead`]'s.
     #[test]
     fn reaping_removes_dead_sockets_and_leaves_everything_else() {
         let dir = test_dir("reap");
         let live_path = dir.join("live.sock");
-        let live = UnixListener::bind(&live_path).unwrap();
         let dead_path = dir.join("dead.sock");
-        // Binding and dropping leaves the file behind with nothing
-        // listening — exactly what an exited run leaves.
-        drop(UnixListener::bind(&dead_path).unwrap());
+        for p in [&live_path, &dead_path] {
+            // A real socket file either way — the walk filters on the
+            // extension and stats the file, so both have to exist.
+            drop(UnixListener::bind(p).unwrap());
+        }
         let other_path = dir.join("relay.log");
         std::fs::write(&other_path, b"audit").unwrap();
         // Age is read from mtime against the wall clock, and a
@@ -793,7 +813,8 @@ mod tests {
         // puts every file safely past a zero grace.
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        reap_stale_sockets(&dir, std::time::Duration::ZERO);
+        let live_name = live_path.clone();
+        reap_stale_sockets(&dir, std::time::Duration::ZERO, |p| p == live_name);
 
         assert!(
             !dead_path.exists(),
@@ -808,7 +829,6 @@ mod tests {
             other_path.exists(),
             "only .sock files are candidates; the audit log lives here too"
         );
-        drop(live);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -956,8 +976,8 @@ mod tests {
     /// `BufReader`'s internal buffer — the pump must forward those bytes,
     /// not drop them (which `BufReader::into_inner()` would do; the code
     /// unwraps only the `Take` cap). The client sends two NDJSON lines in
-    /// one write and half-closes; the fake upstream echoes everything it
-    /// received, so the reply proves both lines crossed the bridge. (One
+    /// one write and half-closes; the fake upstream echoes back the two
+    /// lines it read, so the reply proves both crossed the bridge. (One
     /// small write on a Unix stream socket arrives as one chunk, which is
     /// what puts line 2 in the prefetch buffer; if the kernel ever did
     /// split it, the bytes still arrive via the pump and the test still
@@ -977,15 +997,37 @@ mod tests {
                 // client's `read_reply` reports it.
                 let Ok(mut conn) = conn else { break };
                 std::thread::spawn(move || {
-                    let mut all = String::new();
-                    let mut r = conn.try_clone().unwrap();
-                    // As above: a failed read still answers, naming the
-                    // failure, so the assertion reports it instead of the
-                    // client waiting out its deadline in silence.
-                    let received = match r.read_to_string(&mut all) {
-                        Ok(_) => all,
-                        Err(e) => format!("<upstream read failed: {e}>"),
-                    };
+                    // Read the two lines the client sent, rather than
+                    // everything up to EOF.
+                    //
+                    // What this test proves is that both pipelined lines
+                    // cross the bridge, and reading them is what proves it.
+                    // Reading to EOF instead made the reply wait on the
+                    // client's half-close travelling all the way through
+                    // the relay — something this test does not claim, and
+                    // which was observed not to arrive: with the relay's
+                    // `shutdown(SHUT_WR)` returning `Ok(())` and `lsof`
+                    // showing the two sockets correctly paired, this read
+                    // still blocked forever, about once in 300-900
+                    // full-suite runs. It needed the rest of the suite:
+                    // 0 in 1500 runs with the tests that spawn
+                    // subprocesses skipped, and a standalone program of the
+                    // same shape never lost the EOF in 600 trials. So the
+                    // dependency was the bug, not the relay — which is
+                    // measurably doing its part.
+                    let raw = conn.try_clone().unwrap();
+                    // …and a line that never comes is reported rather than
+                    // waited on, well before the client's own deadline.
+                    let _ = raw.set_read_timeout(Some(REPLY_DEADLINE / 4));
+                    let mut r = BufReader::new(raw);
+                    let mut received = String::new();
+                    for _ in 0..2 {
+                        let mut line = String::new();
+                        match r.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => received.push_str(&line),
+                        }
+                    }
                     let _ = conn.write_all(
                         serde_json::json!({"id":"x","result":{"received": received}})
                             .to_string()
