@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`skills/pall8t-herdr/SKILL.md`** — a published skill for delegating to a
+  sibling agent from inside a sandbox over the herdr bridge. herdr's own skill
+  documents the CLI; this one documents the pall8t-specific half, led by the
+  settled-state trap: `herdr agent prompt … --wait --until idle` can never match
+  a pane the human isn't watching (it settles into `done`, not `idle`), so it
+  runs to its timeout long after the target answered — which reads as a stalled
+  bridge. Focusing the tab is the only thing that clears `done`, which is why
+  `--until idle` survives attended testing and fails unattended. Measured on a
+  live pair: plain `--wait` returned in 2.2 s, the same call with `--until idle`
+  ran its full timeout; in the original report the target settled 3.3 s in and
+  the caller stayed blocked a further 121 s. The bridge itself adds no latency
+  (4.4 s host-direct vs 4.0 s via the relay socket vs 2.0 s from inside the
+  container).
+
 - `pall8t build --no-cache`: bypass the builder's layer cache and re-run
   every `RUN` step. `pall8t build` alone already rebuilds unconditionally,
   but a step whose instruction text didn't change — e.g. the claude CLI's
