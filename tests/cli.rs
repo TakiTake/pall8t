@@ -1083,14 +1083,10 @@ exit 0
 /// command returns; a deadline turns "the child was never spawned" into a
 /// failed assertion instead of a hung suite.
 fn wait_for_line(path: &Path, needle: &str, limit: std::time::Duration) -> String {
-    let deadline = std::time::Instant::now() + limit;
-    loop {
-        let body = std::fs::read_to_string(path).unwrap_or_default();
-        if body.contains(needle) || std::time::Instant::now() >= deadline {
-            return body;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    wait_until(limit, || {
+        std::fs::read_to_string(path).is_ok_and(|body| body.contains(needle))
+    });
+    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 /// Seeds `~/.pall8t/tools/herdr/<version>/herdr` and the sha256 sidecar
@@ -1250,25 +1246,25 @@ fn a_run_inside_a_herdr_pane_builds_the_socket_bridge() {
     drop(host_herdr);
 }
 
-/// Naming, opted into (issue #71). `sandbox = "off"` on purpose: naming is
-/// about herdr's view of the pane, not about the bridge, so it has to
-/// happen with the bridge switched off entirely — the mode that spawns no
-/// relay, and the reason the agent half is its own child rather than the
-/// relay's job.
-#[test]
-fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
-    let sb = Sandbox::new("run-naming");
+/// One opted-in `pall8t run` in herdr pane `w13:p3`, whose tab `w13:t2` is
+/// the sole tab of `w13` — so herdr's own auto label for it is `"1"` and
+/// `tab_label` decides whether pall8t sees the label as its own to take.
+/// The tab's *number* is 2 while its position is 1, which is what makes
+/// the expected name `demo-2` rather than `demo-1`.
+///
+/// Returns the sandbox (for the log and argv files the detached agent
+/// namer writes after the run returns) and the run's stderr.
+fn opted_in_naming_run(sandbox: &str, tab_label: &str) -> (Sandbox, String) {
+    let sb = Sandbox::new(sandbox);
     let fake = FakeRuntime::current(&sb);
     let tag = build_once(&sb, &fake);
     fake.set_images(std::slice::from_ref(&tag));
     let herdr_bin = fake_host_herdr(&sb, "0.8.2");
-    // This pane's tab is `w13:t2`: created second (number 2) but sitting
-    // first, so herdr's own auto label for it is "1". A tab still on that
-    // label is pall8t's to rename — and the suffix comes from the number,
-    // not the position, so the name is "demo-2".
     std::fs::write(
         sb.root.join("herdr-tab-list.json"),
-        r#"{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"unknown","focused":true,"label":"1","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}],"type":"tab_list"}}"#,
+        format!(
+            r#"{{"id":"cli:tab:list","result":{{"tabs":[{{"agent_status":"unknown","focused":true,"label":"{tab_label}","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}}],"type":"tab_list"}}}}"#
+        ),
     )
     .unwrap();
     std::fs::write(
@@ -1291,8 +1287,19 @@ fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
         .env("HERDR_BIN_PATH", &herdr_bin)
         .output()
         .unwrap();
-
     let err = stderr(&out);
+    (sb, err)
+}
+
+/// Naming, opted into (issue #71). `sandbox = "off"` on purpose: naming is
+/// about herdr's view of the pane, not about the bridge, so it has to
+/// happen with the bridge switched off entirely — the mode that spawns no
+/// relay, and the reason the agent half is its own child rather than the
+/// relay's job.
+#[test]
+fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
+    // A tab still on herdr's own auto label ("1") is pall8t's to rename.
+    let (sb, err) = opted_in_naming_run("run-naming", "1");
     assert!(
         err.contains(r#"naming this tab "demo-2""#)
             && err.contains("its agent takes the same name"),
@@ -1346,40 +1353,9 @@ fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
 /// `cargo mutants` caught).
 #[test]
 fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
-    let sb = Sandbox::new("run-naming-mine");
-    let fake = FakeRuntime::current(&sb);
-    let tag = build_once(&sb, &fake);
-    fake.set_images(std::slice::from_ref(&tag));
-    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
-    // Sole tab of its workspace, so herdr's own label for it would be
-    // "1" — this one reads "release work", which only a human types.
-    std::fs::write(
-        sb.root.join("herdr-tab-list.json"),
-        r#"{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"unknown","focused":true,"label":"release work","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}],"type":"tab_list"}}"#,
-    )
-    .unwrap();
-    std::fs::write(
-        sb.root.join("herdr-agent-list.json"),
-        r#"{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}"#,
-    )
-    .unwrap();
-    sb.write_project_config(
-        "[herdr]\nsandbox = \"off\"\nauto_rename = true\nagent_name = \"demo\"\n",
-    );
-    fake.vanish_after_image_list();
-
-    let out = sb
-        .command()
-        .args(["run", "--", "claude"])
-        .env("HERDR_ENV", "1")
-        .env("HERDR_PANE_ID", "w13:p3")
-        .env("HERDR_TAB_ID", "w13:t2")
-        .env("HERDR_WORKSPACE_ID", "w13")
-        .env("HERDR_BIN_PATH", &herdr_bin)
-        .output()
-        .unwrap();
-
-    let err = stderr(&out);
+    // "release work" is neither herdr's auto label nor a name pall8t
+    // could have written here — only a human types it.
+    let (sb, err) = opted_in_naming_run("run-naming-mine", "release work");
     let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
     assert!(
         !calls.contains("tab rename"),

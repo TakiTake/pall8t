@@ -178,6 +178,16 @@ pub(crate) fn pall8t_root() -> Result<PathBuf> {
         .join(".pall8t"))
 }
 
+/// `~/.pall8t/logs`, created on demand — where both append-only logs in
+/// this crate live (the relay's audit log, the agent namer's). A named
+/// root per directory is this module's convention; two callers spelling
+/// the join out themselves is how they drift.
+pub(crate) fn logs_dir() -> Result<PathBuf> {
+    let dir = pall8t_root()?.join("logs");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 pub fn global_path() -> Result<PathBuf> {
     Ok(pall8t_root()?.join("config.toml"))
 }

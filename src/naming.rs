@@ -81,13 +81,17 @@ const AGENT_POLL: Duration = Duration::from_millis(500);
 /// [`AGENT_NAME_MAX`]'s alphabet with `invalid_agent_name`, so passing
 /// `agent_name = "API server"` through verbatim would turn a setting the
 /// user typed into a rename that silently never happens.
-pub fn base_name(configured: Option<&str>, workspace_dir: &Path) -> String {
+fn base_name(configured: Option<&str>, workspace_dir: &Path) -> String {
+    // No basename (`/`) leaves `slug` an empty string, whose documented
+    // answer is already "workspace" — restating that default here would
+    // give it a second home.
     let raw = configured.map_or_else(
         || {
-            workspace_dir.file_name().map_or_else(
-                || "workspace".to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            )
+            workspace_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
         },
         str::to_string,
     );
@@ -112,22 +116,15 @@ pub fn base_name(configured: Option<&str>, workspace_dir: &Path) -> String {
 /// renumbers it and a name fixed at launch keeps matching its tab. The
 /// position is a different number entirely, and only
 /// [`tab_is_auto_named`] wants that one.
-pub fn tab_number(tab_id: &str) -> Option<usize> {
+fn tab_number(tab_id: &str) -> Option<usize> {
     tab_id.rsplit_once(':')?.1.strip_prefix('t')?.parse().ok()
 }
 
-/// `name`, cut to `budget` characters and re-trimmed of trailing dashes
-/// (a cut landing inside a run of them would leave `foo--2`). Counted in
-/// `char`s the way [`crate::util::slug`] produces them — ASCII, so the
-/// byte count herdr checks agrees. `"p"` when nothing survives: a name
-/// herdr refuses outright is worse than a placeholder letter.
+/// [`crate::util::cut_at`] plus herdr's own requirement: `"p"` when
+/// nothing survives, because a name herdr refuses outright is worse than
+/// a placeholder letter.
 fn capped_to(name: &str, budget: usize) -> String {
-    let cut = name
-        .chars()
-        .take(budget)
-        .collect::<String>()
-        .trim_end_matches('-')
-        .to_string();
+    let cut = crate::util::cut_at(name, budget);
     if cut.is_empty() {
         "p".to_string()
     } else {
@@ -138,7 +135,7 @@ fn capped_to(name: &str, budget: usize) -> String {
 /// `<name>-<counter>`, with the *name* shortened if the pair would exceed
 /// [`AGENT_NAME_MAX`] — the counter is what makes the name unique, so it
 /// is never the part that gets cut.
-pub fn with_counter(name: &str, counter: usize) -> String {
+fn with_counter(name: &str, counter: usize) -> String {
     let tail = format!("-{counter}");
     let head = capped_to(name, AGENT_NAME_MAX.saturating_sub(tail.len()));
     format!("{head}{tail}")
@@ -152,14 +149,19 @@ pub fn with_counter(name: &str, counter: usize) -> String {
 /// this version doesn't parse) gets the bare base — a name without the
 /// suffix still beats a pane id, and the collision counter still makes it
 /// unique.
-pub fn candidates(base: &str, tab_number: Option<usize>) -> Vec<String> {
-    let first = match tab_number {
+fn candidates(base: &str, tab_number: Option<usize>) -> impl Iterator<Item = String> {
+    let first = first_candidate(base, tab_number);
+    std::iter::once(first.clone())
+        .chain((2..=COLLISION_TRIES).map(move |k| with_counter(&first, k)))
+}
+
+/// The name before any collision counter — the one every other candidate
+/// extends.
+fn first_candidate(base: &str, tab_number: Option<usize>) -> String {
+    match tab_number {
         Some(n) => with_counter(base, n),
         None => capped_to(base, AGENT_NAME_MAX),
-    };
-    let mut out = vec![first.clone()];
-    out.extend((2..=COLLISION_TRIES).map(|k| with_counter(&first, k)));
-    out
+    }
 }
 
 /// Whether `label` is one pall8t itself could have written in this tab —
@@ -176,8 +178,8 @@ pub fn candidates(base: &str, tab_number: Option<usize>) -> Vec<String> {
 /// The one false positive is a human who typed exactly a name pall8t would
 /// have picked here; overwriting `foo-2` with `foo-2-2` in that case is
 /// benign, since it stays inside the same name family.
-pub fn label_is_pall8t_own(label: &str, base: &str, tab_number: Option<usize>) -> bool {
-    candidates(base, tab_number).iter().any(|c| c == label)
+fn label_is_pall8t_own(label: &str, base: &str, tab_number: Option<usize>) -> bool {
+    candidates(base, tab_number).any(|c| c == label)
 }
 
 /// The first of [`candidates`] no live agent already answers to, so
@@ -185,16 +187,15 @@ pub fn label_is_pall8t_own(label: &str, base: &str, tab_number: Option<usize>) -
 /// With every candidate taken, the last one is returned anyway: the
 /// rename then fails with herdr's own `agent_name_taken`, which says more
 /// than a name pall8t declined to try.
-pub fn first_free(base: &str, tab_number: Option<usize>, taken: &BTreeSet<String>) -> String {
-    let names = candidates(base, tab_number);
-    let fallback = names
-        .last()
-        .cloned()
-        .unwrap_or_else(|| capped_to(base, AGENT_NAME_MAX));
-    names
-        .into_iter()
-        .find(|n| !taken.contains(n))
-        .unwrap_or(fallback)
+fn first_free(base: &str, tab_number: Option<usize>, taken: &BTreeSet<String>) -> String {
+    let mut last = first_candidate(base, tab_number);
+    for name in candidates(base, tab_number) {
+        if !taken.contains(&name) {
+            return name;
+        }
+        last = name;
+    }
+    last
 }
 
 // ---------------------------------------------------------------------------
@@ -204,11 +205,11 @@ pub fn first_free(base: &str, tab_number: Option<usize>, taken: &BTreeSet<String
 /// The fields of herdr's `TabInfo` this module reads. Unknown fields are
 /// ignored (serde's default), so a newer herdr adding to the shape can't
 /// break the parse.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct TabRow {
-    pub tab_id: String,
-    pub workspace_id: String,
-    pub label: String,
+#[derive(serde::Deserialize)]
+struct TabRow {
+    tab_id: String,
+    workspace_id: String,
+    label: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -234,7 +235,7 @@ struct AgentRow {
 
 /// `herdr tab list` -> the tabs it reported, or `None` when the output
 /// isn't the shape this version knows.
-pub fn parse_tabs(stdout: &str) -> Option<Vec<TabRow>> {
+fn parse_tabs(stdout: &str) -> Option<Vec<TabRow>> {
     serde_json::from_str::<Envelope<TabListResult>>(stdout)
         .ok()
         .map(|e| e.result.tabs)
@@ -243,7 +244,7 @@ pub fn parse_tabs(stdout: &str) -> Option<Vec<TabRow>> {
 /// `herdr agent list` -> the names live agents already answer to.
 /// Unparseable output yields no names: the worst case is picking one that
 /// is taken, which the rename itself then rejects and retries past.
-pub fn parse_agent_names(stdout: &str) -> BTreeSet<String> {
+fn parse_agent_names(stdout: &str) -> BTreeSet<String> {
     serde_json::from_str::<Envelope<AgentListResult>>(stdout)
         .ok()
         .map(|e| e.result.agents.into_iter().filter_map(|a| a.name).collect())
@@ -264,7 +265,7 @@ pub fn parse_agent_names(stdout: &str) -> BTreeSet<String> {
 ///
 /// `None` when the tab isn't in the list at all; the one false positive
 /// is a human who renamed a tab to exactly its own position string.
-pub fn tab_is_auto_named(tabs: &[TabRow], tab_id: &str) -> Option<bool> {
+fn tab_is_auto_named(tabs: &[TabRow], tab_id: &str) -> Option<bool> {
     let row = tabs.iter().find(|t| t.tab_id == tab_id)?;
     let position = tabs
         .iter()
@@ -274,6 +275,18 @@ pub fn tab_is_auto_named(tabs: &[TabRow], tab_id: &str) -> Option<bool> {
     Some(row.label == position.to_string())
 }
 
+/// What this run's tab label is, as far as `tab.list` can tell.
+enum TabLabel {
+    /// pall8t's to overwrite: herdr's own auto label, or one pall8t wrote
+    /// here itself.
+    Ours,
+    /// Somebody else's. Carried so the announcement can name it.
+    Theirs(String),
+    /// No usable answer: the call failed, the reply's shape changed, or
+    /// this tab isn't in the list.
+    Unknown,
+}
+
 /// Whether a failed `herdr agent rename` failed *because the name is
 /// taken* — the one error worth retrying under another name.
 ///
@@ -281,7 +294,7 @@ pub fn tab_is_auto_named(tabs: &[TabRow], tab_id: &str) -> Option<bool> {
 /// [`crate::util::run_ok`] is this crate's one contract for a CLI call,
 /// and it embeds herdr's stderr (the error JSON, verbatim) in its message.
 /// A second CLI-call contract would buy nothing else here.
-pub fn is_name_taken(err: &str) -> bool {
+fn is_name_taken(err: &str) -> bool {
     err.contains(r#""code":"agent_name_taken""#)
 }
 
@@ -289,19 +302,19 @@ pub fn is_name_taken(err: &str) -> bool {
 /// label ([`tab_is_auto_named`]), or one pall8t wrote here itself
 /// ([`label_is_pall8t_own`]).
 ///
-/// `None` when the tab isn't in the list at all — not knowing is a reason
-/// to keep the label, not to overwrite it.
-pub fn tab_is_ours_to_label(
-    tabs: &[TabRow],
-    tab_id: &str,
-    base: &str,
-    tab_number: Option<usize>,
-) -> Option<bool> {
-    if tab_is_auto_named(tabs, tab_id)? {
-        return Some(true);
+/// [`TabLabel::Unknown`] when the tab isn't in the list at all — not
+/// knowing is a reason to keep the label, not to overwrite it.
+fn tab_label_of(tabs: &[TabRow], tab_id: &str, base: &str, tab_number: Option<usize>) -> TabLabel {
+    let Some(row) = tabs.iter().find(|t| t.tab_id == tab_id) else {
+        return TabLabel::Unknown;
+    };
+    if tab_is_auto_named(tabs, tab_id) == Some(true)
+        || label_is_pall8t_own(&row.label, base, tab_number)
+    {
+        TabLabel::Ours
+    } else {
+        TabLabel::Theirs(row.label.clone())
     }
-    let label = &tabs.iter().find(|t| t.tab_id == tab_id)?.label;
-    Some(label_is_pall8t_own(label, base, tab_number))
 }
 
 /// The one line `pall8t run` prints about naming, or `None` when it named
@@ -315,12 +328,7 @@ pub fn tab_is_ours_to_label(
 /// was. `kept_label` is the foreign label being left in place, when there is
 /// one: naming it is what lets a human see that the tab and the agent no
 /// longer match.
-pub fn announcement(
-    name: &str,
-    tab: bool,
-    agent: bool,
-    kept_label: Option<&str>,
-) -> Option<String> {
+fn announcement(name: &str, tab: bool, agent: bool, kept_label: Option<&str>) -> Option<String> {
     let log = "~/.pall8t/logs/herdr-naming.log";
     match (tab, agent) {
         (false, false) => None,
@@ -381,18 +389,35 @@ pub fn name_pane(req: &Request<'_>) {
     }
     let base = base_name(req.cfg.agent_name.as_deref(), req.workspace_dir);
     let number = req.tab_id.and_then(tab_number);
-    let name = first_free(&base, number, &live_agent_names(req.herdr_bin));
 
-    let mut renamed_tab = None;
+    // Whose the label is depends only on `base` and the number, so it is
+    // asked first: a run with no tab of its own to name and no agent
+    // coming has nothing to spend an `agent list` round trip on.
+    let owner = req.tab_id.map(|tab_id| {
+        (
+            tab_id,
+            tab_label_owner(req.herdr_bin, tab_id, &base, number),
+        )
+    });
     let mut kept_label = None;
-    if let Some(tab_id) = req.tab_id {
-        match tab_label_owner(req.herdr_bin, tab_id, &base, number) {
-            TabLabel::Ours => match rename_tab(req.herdr_bin, tab_id, &name) {
-                Ok(()) => renamed_tab = Some(tab_id),
-                Err(e) => eprintln!("pall8t: warning: could not name the herdr tab: {e:#}"),
-            },
-            TabLabel::Theirs(label) => kept_label = Some(label),
-            TabLabel::Unknown => {}
+    let to_label = match owner {
+        Some((tab_id, TabLabel::Ours)) => Some(tab_id),
+        Some((_, TabLabel::Theirs(label))) => {
+            kept_label = Some(label);
+            None
+        }
+        _ => None,
+    };
+    if to_label.is_none() && !req.expect_agent {
+        return;
+    }
+
+    let name = first_free(&base, number, &live_agent_names(req.herdr_bin));
+    let mut renamed_tab = None;
+    if let Some(tab_id) = to_label {
+        match rename_tab(req.herdr_bin, tab_id, &name) {
+            Ok(()) => renamed_tab = Some(tab_id),
+            Err(e) => eprintln!("pall8t: warning: could not name the herdr tab: {e:#}"),
         }
     }
 
@@ -415,31 +440,26 @@ pub fn name_pane(req: &Request<'_>) {
     }
 }
 
+/// [`crate::util::run_ok`] bound to the herdr CLI, so the call sites read
+/// as the commands they are. `container::run_ok` is the same adapter for
+/// the other program this crate drives.
+fn herdr<const N: usize>(bin: &str, args: [&str; N]) -> Result<String> {
+    crate::util::run_ok(bin, &args.map(str::to_string))
+}
+
 /// Names live agents already answer to. A failed call yields none rather
 /// than blocking the run: picking a taken name only costs the agent half
 /// one rejected rename, which [`run_agent_namer`] retries past.
 fn live_agent_names(bin: &str) -> BTreeSet<String> {
-    crate::util::run_ok(bin, &["agent".to_string(), "list".to_string()])
+    herdr(bin, ["agent", "list"])
         .map(|out| parse_agent_names(&out))
         .unwrap_or_default()
 }
 
-/// What this run's tab label is, as far as the one `tab.list` call the
-/// feature makes can tell. Not knowing whether a human named the tab is a
-/// reason to keep their name, not to overwrite it — so every unreadable
-/// answer lands on [`TabLabel::Unknown`].
-enum TabLabel {
-    /// pall8t's to overwrite.
-    Ours,
-    /// Somebody else's. Carried so the announcement can name it.
-    Theirs(String),
-    /// No usable answer: the call failed, the reply's shape changed, or
-    /// this tab isn't in the list.
-    Unknown,
-}
-
+/// The one `tab.list` call the feature makes, decided by [`tab_label_of`].
+/// Every unreadable answer lands on [`TabLabel::Unknown`].
 fn tab_label_owner(bin: &str, tab_id: &str, base: &str, number: Option<usize>) -> TabLabel {
-    let out = match crate::util::run_ok(bin, &["tab".to_string(), "list".to_string()]) {
+    let out = match herdr(bin, ["tab", "list"]) {
         Ok(out) => out,
         Err(e) => {
             eprintln!(
@@ -461,49 +481,22 @@ fn tab_label_owner(bin: &str, tab_id: &str, base: &str, number: Option<usize>) -
         );
         return TabLabel::Unknown;
     };
-    match tab_is_ours_to_label(&tabs, tab_id, base, number) {
-        Some(true) => TabLabel::Ours,
-        Some(false) => tabs
-            .iter()
-            .find(|t| t.tab_id == tab_id)
-            .map_or(TabLabel::Unknown, |t| TabLabel::Theirs(t.label.clone())),
-        None => TabLabel::Unknown,
-    }
+    tab_label_of(&tabs, tab_id, base, number)
 }
 
 fn rename_tab(bin: &str, tab_id: &str, label: &str) -> Result<()> {
-    crate::util::run_ok(
-        bin,
-        &[
-            "tab".to_string(),
-            "rename".to_string(),
-            tab_id.to_string(),
-            label.to_string(),
-        ],
-    )?;
-    Ok(())
+    herdr(bin, ["tab", "rename", tab_id, label]).map(drop)
 }
 
 fn rename_agent(bin: &str, pane_id: &str, name: &str) -> Result<()> {
-    crate::util::run_ok(
-        bin,
-        &[
-            "agent".to_string(),
-            "rename".to_string(),
-            pane_id.to_string(),
-            name.to_string(),
-        ],
-    )?;
-    Ok(())
+    herdr(bin, ["agent", "rename", pane_id, name]).map(drop)
 }
 
 /// Where [`run_agent_namer`] reports what it did — it runs after the exec,
 /// where the pane's terminal belongs to the agent's UI and a stray
 /// `eprintln!` would land in the middle of it.
 fn log_path() -> Result<PathBuf> {
-    let dir = crate::config::pall8t_root()?.join("logs");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("herdr-naming.log"))
+    Ok(crate::config::logs_dir()?.join("herdr-naming.log"))
 }
 
 /// Spawns the detached `pall8t herdr name-agent` child that owns the
@@ -563,9 +556,8 @@ pub fn run_agent_namer(
 ) -> Result<()> {
     // The parent is the `pall8t run` that spawned this child — the same
     // pid, once it has exec'd into the `container` client. Sampled first
-    // thing, for the reason `util::spawning_run_alive` explains.
-    // SAFETY: getppid cannot fail and has no preconditions.
-    let parent = unsafe { libc::getppid() };
+    // thing, for the reason `util::spawning_run` explains.
+    let parent = crate::util::spawning_run();
     name_agent(bin, pane_id, name, tab_id, log, parent);
     // Outlive the run rather than exiting the moment the work is done.
     // This process is a child of a `pall8t run` that has since become the
@@ -629,7 +621,7 @@ fn name_agent(
 
 /// How the wait for herdr to detect an agent ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Wait {
+enum Wait {
     Detected,
     /// The `pall8t run` that spawned the wait is gone, so no agent will
     /// ever appear in this pane.
@@ -667,7 +659,7 @@ fn wait_for_agent(
 
 /// What became of the agent rename.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Named {
+enum Named {
     /// The name the agent ended up with — `name` itself, or an extension
     /// of it if a collision forced one.
     Ok(String),
@@ -686,14 +678,12 @@ pub enum Named {
 /// immediately: retrying `agent_not_found` under a different name would
 /// only fail nineteen more times.
 fn rename_with_retries(name: &str, mut rename: impl FnMut(&str) -> Result<()>) -> Named {
-    // Built the same way, and to the same length, as [`candidates`]: the
-    // name itself, then its counter extensions. Walking it as one iterator
-    // is what keeps the two from drifting — writing the loop as
-    // `2..=COLLISION_TRIES` around a mutable `attempt` silently tried one
-    // name fewer than `candidates` offers.
-    let attempts = std::iter::once(name.to_string())
-        .chain((2..=COLLISION_TRIES).map(|k| with_counter(name, k)));
-    for attempt in attempts {
+    // The same walk the pre-exec scan offered, from the same builder —
+    // `name` arrives from `first_free` already capped and dash-trimmed, so
+    // it is `candidates`' own first element. Sharing it is what keeps the
+    // two from drifting: restating the range here once tried one name
+    // fewer than `candidates` offers.
+    for attempt in candidates(name, None) {
         match rename(&attempt) {
             Ok(()) => return Named::Ok(attempt),
             Err(e) if is_name_taken(&format!("{e:#}")) => {}
@@ -728,13 +718,10 @@ fn agent_detected(bin: &str, pane_id: &str) -> bool {
 /// One line per outcome, appended. Best-effort: a log that can't be
 /// written must not turn into a failed rename.
 fn note(log: &Path, subject: &str, message: &str) {
-    use std::io::Write;
-    let line = format!("{} {subject} {message}\n", crate::util::epoch_secs());
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .and_then(|mut f| f.write_all(line.as_bytes()));
+    crate::util::append_line(
+        log,
+        &format!("{} {subject} {message}\n", crate::util::epoch_secs()),
+    );
 }
 
 #[cfg(test)]
@@ -850,7 +837,7 @@ mod tests {
 
     #[test]
     fn candidates_suffix_the_tab_number_then_extend_that_whole_name() {
-        let names = candidates("foo", Some(2));
+        let names: Vec<String> = candidates("foo", Some(2)).collect();
         assert_eq!(
             &names[..3],
             ["foo-2", "foo-2-2", "foo-2-3"],
@@ -858,13 +845,13 @@ mod tests {
              number stays readable in every candidate"
         );
         assert_eq!(
-            candidates("foo", None)[0],
+            first_candidate("foo", None),
             "foo",
             "with no tab id there is no suffix — a bare name still beats a \
              pane id"
         );
         assert_eq!(
-            candidates("foo", Some(3))[0],
+            first_candidate("foo", Some(3)),
             "foo-3",
             "a different tab number is a different first candidate"
         );
@@ -1067,30 +1054,39 @@ mod tests {
             "it genuinely no longer carries herdr's auto label — that is what \
              made this look like a human's name"
         );
-        assert_eq!(
-            tab_is_ours_to_label(&tabs, "w13:t2", "foo", Some(2)),
-            Some(true),
+        assert!(
+            matches!(
+                tab_label_of(&tabs, "w13:t2", "foo", Some(2)),
+                TabLabel::Ours
+            ),
             "but `foo-2` is exactly what pall8t itself writes in tab 2 of a \
              `foo` workspace, so it is pall8t's to move to `foo-2-2` rather \
              than a label that must be preserved"
         );
-        assert_eq!(
-            tab_is_ours_to_label(&tabs, "w13:t2", "foo", Some(9)),
-            Some(false),
+        assert!(
+            matches!(
+                tab_label_of(&tabs, "w13:t2", "foo", Some(9)),
+                TabLabel::Theirs(ref l) if l == "foo-2"
+            ),
             "the same string in a different tab is not a name pall8t could \
-             have written here"
+             have written here — and the label it keeps is carried out, so \
+             the announcement can name it"
         );
-        assert_eq!(
-            tab_is_ours_to_label(&tabs, "w13:t2", "web", Some(2)),
-            Some(false),
+        assert!(
+            matches!(
+                tab_label_of(&tabs, "w13:t2", "web", Some(2)),
+                TabLabel::Theirs(ref l) if l == "foo-2"
+            ),
             "and after `[herdr] agent_name` changes, the old label is \
              indistinguishable from a human's — kept, and reported by \
              `announcement`'s kept-label arm instead"
         );
-        assert_eq!(
-            tab_is_ours_to_label(&tabs, "w13:t9", "foo", Some(9)),
-            None,
-            "a tab that isn't in the list at all stays unknown, never `true`"
+        assert!(
+            matches!(
+                tab_label_of(&tabs, "w13:t9", "foo", Some(9)),
+                TabLabel::Unknown
+            ),
+            "a tab that isn't in the list at all stays unknown, never `Ours`"
         );
     }
 
@@ -1109,7 +1105,7 @@ mod tests {
         assert!(matches!(outcome, Named::AllTaken), "every name was refused");
         assert_eq!(
             tried.len(),
-            candidates("foo", Some(2)).len(),
+            candidates("foo", Some(2)).count(),
             "the walk gives up only after trying as many names as the \
              pre-exec scan would have offered: {tried:?}"
         );

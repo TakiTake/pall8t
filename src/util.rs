@@ -149,15 +149,40 @@ pub(crate) fn path_key(path: &Path) -> String {
 /// `slug` trims both ends, so the slug starts with an alphanumeric and at
 /// least that first character always survives.
 fn capped_slug(name: &str) -> String {
-    let s = slug(name);
-    if s.chars().count() <= SLUG_MAX {
-        return s;
-    }
+    cut_at(&slug(name), SLUG_MAX)
+}
+
+/// `s`, cut to `budget` characters and re-trimmed of trailing dashes.
+/// Counted in `char`s the way apple/container counts them (`name.count`,
+/// over Swift Characters) and the way herdr counts its own cap — every
+/// caller feeds this ASCII, so char and byte counts agree.
+///
+/// The re-trim is the whole reason this is shared: a cut landing inside a
+/// run of `-` leaves a dangling one (`foo--` before a hash, `foo--2`
+/// before a counter), and that rule having two homes is how the two caps
+/// ([`SLUG_MAX`] and herdr's, in [`crate::naming`]) would drift apart.
+pub(crate) fn cut_at(s: &str, budget: usize) -> String {
+    // The trim is unconditional, not just on the cutting path: a caller
+    // whose input can already end in `-` (a name a user typed, unlike a
+    // `slug`, which trims both ends itself) needs it either way.
     s.chars()
-        .take(SLUG_MAX)
+        .take(budget)
         .collect::<String>()
         .trim_end_matches('-')
         .to_string()
+}
+
+/// Appends one line to a best-effort log, creating it if needed. Both
+/// append-only logs in this crate are written this way, and neither may
+/// turn a failed write into a failed operation — so errors are dropped
+/// here rather than at each call site.
+pub(crate) fn append_line(path: &Path, line: &str) {
+    use std::io::Write;
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
 /// The pid an orphaned child is reparented to.
@@ -179,8 +204,17 @@ const PARENT_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 /// therefore sampled as early as the spawned process can manage: whatever
 /// runs before the sample is time the parent can exit in.
 pub(crate) fn spawning_run_alive(original: libc::pid_t) -> bool {
+    original != INIT_PID && spawning_run() == original
+}
+
+/// This process's parent right now. Every spawned helper samples it as
+/// its first act — whatever runs before the sample is time the parent can
+/// exit in, and a value sampled late can already be init's. Keeping the
+/// sample here keeps it next to the rule that makes it load-bearing, and
+/// leaves no `unsafe` in the callers.
+pub(crate) fn spawning_run() -> libc::pid_t {
     // SAFETY: getppid cannot fail and has no preconditions.
-    original != INIT_PID && unsafe { libc::getppid() } == original
+    unsafe { libc::getppid() }
 }
 
 /// Blocks until [`spawning_run_alive`] stops holding. Polling getppid is
@@ -225,6 +259,39 @@ mod tests {
         assert_eq!(slug("--x--"), "x");
         assert_eq!(slug(""), "workspace");
         assert_eq!(slug("日本語"), "workspace");
+    }
+
+    /// Regression pin: extracting `cut_at` out of `capped_slug` first gave
+    /// it `capped_slug`'s short-circuit — return `s` untouched when it
+    /// already fits — which silently dropped the trim for the caller whose
+    /// input can end in a dash without being cut. `capped_to("foo---", 30)`
+    /// then yielded `foo---`, and the agent name came out `foo----2`.
+    #[test]
+    fn cut_at_trims_the_tail_even_when_nothing_was_cut() {
+        assert_eq!(
+            cut_at("foo---", 30),
+            "foo",
+            "a name well inside the budget still may not end on a dash: the \
+             caller appends `-<counter>` to whatever comes back"
+        );
+        assert_eq!(
+            cut_at("foo", 30),
+            "foo",
+            "and one that is already clean \
+             round-trips byte for byte"
+        );
+        assert_eq!(
+            cut_at("ab---cd", 5),
+            "ab",
+            "a cut landing inside a run of dashes drops the whole run, not \
+             just the one character it split"
+        );
+        assert_eq!(
+            cut_at("---", 30),
+            "",
+            "nothing has to survive — the \
+             callers decide what an empty result means"
+        );
     }
 
     #[test]
