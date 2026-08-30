@@ -85,8 +85,11 @@ RUN curl --proto '=https' --tlsv1.2 -fsSL https://install.determinate.systems/ni
       --no-update-lock-file --out-link /usr/local/tools && \
     /nix/var/nix/profiles/default/bin/nix store gc --quiet && \
     npm install -g @anthropic-ai/claude-code && \
-    curl -fsSL https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com \(.)"' \
-      >> /etc/ssh/ssh_known_hosts && \
+    curl -fsSL https://api.github.com/meta -o /tmp/gh-meta.json && \
+    jq -r '.ssh_keys[] | "github.com \(.)"' /tmp/gh-meta.json > /tmp/known_hosts.gh && \
+    test -s /tmp/known_hosts.gh && \
+    cat /tmp/known_hosts.gh >> /etc/ssh/ssh_known_hosts && \
+    rm -f /tmp/gh-meta.json /tmp/known_hosts.gh && \
     mkdir -p /usr/local/cargo && \
     printf '%s\n' \
       '[target.x86_64-unknown-linux-gnu]' \

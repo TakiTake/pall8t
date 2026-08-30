@@ -20,6 +20,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reboot exports. The runtime would otherwise forward nothing silently
   while still setting `SSH_AUTH_SOCK` in the guest.
 
+### Security
+
+- **A project's `.pall8t/config.toml` can no longer switch SSH forwarding
+  on** — only your own `~/.pall8t/config.toml` or `pall8t run --ssh` can.
+  A project config ships with the repository, so honoring `ssh = true`
+  there let cloned code vote itself the use of your SSH agent, silently.
+  A project may still turn forwarding *off*, and one that asks to enable
+  it is now told the request was ignored and how to ask legitimately.
+- **A run that forwards the agent says so on stderr.** Previously only
+  the failure path spoke, so a working forward left nothing on screen.
+- **The `known_hosts` bake no longer fails open.** `curl … | jq …` in a
+  `RUN` step runs under `/bin/sh` with no `pipefail`, so a failed fetch
+  left `jq` to exit 0 on empty input and the image built with an empty
+  `/etc/ssh/ssh_known_hosts`. The steps are now separate and each is
+  checked, including that the extracted key list is non-empty.
+
 ### Changed
 
 - **The default image bakes GitHub's SSH host keys into

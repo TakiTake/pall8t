@@ -69,6 +69,23 @@ the run has nothing to do with. An agent is not required to be
 adversarial for that to be the wrong ambient default; it only has to be
 wrong. A capability that broad is worth one word of config.
 
+**Only the human may switch it on.** `[container] ssh` is read from the
+user's own `~/.pall8t/config.toml` or from `--ssh`; a project's
+`.pall8t/config.toml` may turn forwarding **off**, never on, and is told
+when its request was ignored. The asymmetry is deliberate and is the one
+rule in this ADR that is about trust rather than ergonomics:
+
+> A project config ships with the repository, so it is authored by
+> whoever wrote the repository — which is exactly the code the sandbox
+> exists to contain. Project config may shape what runs **inside** the
+> box (the command, the image, the mounts it needs); it must not be able
+> to widen what the box can reach **outside** it.
+
+Without that rule, cloning a repository whose `.pall8t/config.toml` says
+`ssh = true` and running `pall8t run` hands that repository's code the
+user's agent, with nothing on screen saying so. Narrowing stays free:
+a project declining a capability is always safe to honor.
+
 **Warn when forwarding is on and the host has no agent.** Because the
 runtime's own report goes to its own log, pall8t checks first and says
 so on stderr (`config::ssh_warning`). Two ways to have no agent, not
@@ -80,6 +97,11 @@ existence probe is passed in rather than performed inside, per
 `docs/testing.md`; a probe that cannot answer counts as absent and warns,
 since a spurious warning costs a line of text and a spurious silence
 costs the failure this exists to prevent.
+
+**Say so when it is actually on**, not only when it is broken. A
+capability this wide that announces itself only on failure is one a run
+can carry unnoticed; the herdr bridge, which is narrower, already prints
+`herdr bridge active`.
 
 **Bake GitHub's host keys into the image.** A forwarded agent is only
 half of what git-over-SSH needs. The sandbox runs non-interactively, so
@@ -111,6 +133,38 @@ project's own dev image already did this; the default image now does too.
   written themselves. That is a subsystem, not a line; it is the right
   follow-up if the two consequences above start biting, and it can
   replace the image bake without changing anything users write.
+- **The whole agent is forwarded, not one key.** There is no per-key or
+  per-host narrowing in the SSH agent protocol as forwarded here: every
+  identity loaded in the agent is usable by the sandbox, against every
+  host that trusts it, for the length of the run. Three mitigations are
+  worth knowing and none of them is pall8t's to apply:
+  - `ssh-add -c` — the agent asks the human to confirm **each** signature.
+    This is the strongest control available and turns a silent capability
+    into an observable one.
+  - `ssh-add -t <seconds>` — the key expires from the agent on a timer.
+  - Run a dedicated agent holding only the key that run needs, and point
+    `SSH_AUTH_SOCK` at it. This is the narrowest option and composes with
+    the two above.
+- **For GitHub specifically, a scoped token is the tighter credential.**
+  A fine-grained PAT can be limited to chosen repositories and
+  permissions; an SSH *user* key cannot be scoped at all — it is
+  everything that key can reach. pall8t already carries a token into the
+  container home for `gh`. Agent forwarding earns its place where a token
+  is not an option (a self-hosted git server, a bastion, a signing key),
+  not as the default answer to "push to GitHub".
+- **Forwarding exposes the host's `ssh-agent` to the sandbox.** No key
+  material crosses, but a *channel* does: the sandbox can send arbitrary
+  agent-protocol messages to a process running as the user on the host.
+  That is the class CVE-2023-38408 lived in (RCE via the agent's PKCS#11
+  provider, reachable from the forwarded side, fixed in OpenSSH 9.3p2).
+  "The key does not cross the boundary" is true and is not the same
+  claim as "nothing crosses the boundary".
+- **Nothing audits what the sandbox signs.** The herdr bridge logs every
+  request it forwards; the agent socket is an unlogged byte pipe, and
+  pall8t cannot say what was signed or for whom. Parsing the agent
+  protocol to change that is not planned — the honest position is that
+  this capability is unaudited, and `ssh-add -c` is where the visibility
+  has to come from.
 - **`ssh = true` with no agent is a warning, not an error.** The run
   proceeds. Forwarding is one thing a run does, not its purpose, and a
   run that would otherwise succeed should not be blocked by it.

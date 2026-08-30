@@ -1150,23 +1150,26 @@ fn run_line(fake: &FakeRuntime) -> String {
         .to_string()
 }
 
-/// `[container] ssh` has to survive the whole trip — config file, the
-/// `--ssh` override, `ssh_enabled`, `RunSpec`, `run_argv` — and the only
+/// `[container] ssh` has to survive the whole trip — config files, the
+/// `--ssh` override, the merge rule, `RunSpec`, `run_argv` — and the only
 /// place its effect is observable is the argv pall8t hands the runtime.
 /// The unit tests cover each link; this one pins that they are actually
 /// joined, so a wiring slip (`let ssh = false;` in `cmd_run`) has
-/// somewhere to go red. The runtime is left in place rather than vanished:
-/// the fake logs the `run` line and exits, which is the launch this needs
-/// to read.
+/// somewhere to go red. It also pins the asymmetry that matters most: a
+/// *project* config cannot switch forwarding on, only off. The runtime is
+/// left in place rather than vanished: the fake logs the `run` line and
+/// exits, which is the launch this needs to read.
 #[test]
-fn ssh_forwarding_travels_from_config_to_the_runtimes_argv() {
+fn only_the_human_can_forward_the_agent_never_a_projects_own_config() {
     let sb = Sandbox::new("run-ssh-argv");
     let fake = FakeRuntime::current(&sb);
     let tag = build_once(&sb, &fake);
     fake.set_images(std::slice::from_ref(&tag));
 
-    let cases: [(&str, &[&str], bool, &str); 4] = [
+    // (global config, project config, argv, --ssh expected, why)
+    let cases: [(&str, &str, &[&str], bool, &str); 5] = [
         (
+            "",
             "",
             &["run"],
             false,
@@ -1175,29 +1178,40 @@ fn ssh_forwarding_travels_from_config_to_the_runtimes_argv() {
         ),
         (
             "",
+            "",
             &["run", "--ssh"],
             true,
-            "`pall8t run --ssh` is the one-run way in, with nothing in the \
-             config file saying anything",
+            "`pall8t run --ssh` is the human saying it out loud, per run",
         ),
         (
             "[container]\nssh = true\n",
+            "",
             &["run"],
             true,
-            "and `[container] ssh = true` is the standing way in — the form \
-             the README documents",
+            "and the user's own ~/.pall8t/config.toml is the standing way in",
+        ),
+        (
+            "",
+            "[container]\nssh = true\n",
+            &["run"],
+            false,
+            "but a project config must NOT be able to switch it on: it ships \
+             with the repository, so this is cloned code voting itself \
+             access to the user's keys",
         ),
         (
             "[container]\nssh = true\n",
-            &["run", "--ssh=false"],
+            "[container]\nssh = false\n",
+            &["run"],
             false,
-            "`--ssh=false` beats a config that switched it on: one run \
-             without handing over the agent, config left alone",
+            "narrowing stays honored — a project may always decline what the \
+             global allowed",
         ),
     ];
 
-    for (config, args, expected, why) in cases {
-        sb.write_project_config(config);
+    for (global, project, args, expected, why) in cases {
+        sb.write_global_config(global);
+        sb.write_project_config(project);
         fake.clear_log();
         sb.run(args);
         let line = run_line(&fake);
@@ -1205,13 +1219,37 @@ fn ssh_forwarding_travels_from_config_to_the_runtimes_argv() {
     }
 }
 
-/// The other half of the same wiring: when forwarding is on but the host
-/// has no agent behind `SSH_AUTH_SOCK`, the run has to say so. The runtime
-/// forwards nothing in that case and still sets `SSH_AUTH_SOCK` inside the
-/// guest, so this warning is the only thing standing between the user and
-/// an unexplained `ssh` connect failure.
+/// Refusing a project's request is only half the job: dropping a stated
+/// intent in silence is this repo's definition of a bug, and here the
+/// silence would hide that a repository tried to reach the user's keys.
 #[test]
-fn the_ssh_warning_says_which_way_the_hosts_agent_is_missing() {
+fn a_project_config_that_asked_for_ssh_is_told_it_was_ignored() {
+    let sb = Sandbox::new("run-ssh-ignored");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    sb.write_project_config("[container]\nssh = true\n");
+    let out = sb.run(&["run"]);
+    let err = stderr(&out);
+    assert!(
+        err.contains("was ignored"),
+        "a project asking to enable forwarding must be told it did not \
+         happen: {err}"
+    );
+    assert!(
+        err.contains("--ssh"),
+        "and told how to ask legitimately, or the message is a refusal with \
+         no remedy: {err}"
+    );
+}
+
+/// The other half of the same wiring: what the run says about the host's
+/// agent. A capability this wide that announces itself only on failure is
+/// one a run can carry without anyone noticing, so the working path speaks
+/// too.
+#[test]
+fn the_run_says_whether_the_agent_is_being_forwarded_or_is_missing() {
     let sb = Sandbox::new("run-ssh-warn");
     let fake = FakeRuntime::current(&sb);
     let tag = build_once(&sb, &fake);
@@ -1228,8 +1266,8 @@ fn the_ssh_warning_says_which_way_the_hosts_agent_is_missing() {
 
     let off = sb.run(&["run"]);
     assert!(
-        !stderr(&off).contains("SSH_AUTH_SOCK"),
-        "and a run that never asked to forward has nothing to warn about: {}",
+        !stderr(&off).contains("SSH_AUTH_SOCK") && !stderr(&off).contains("ssh is on"),
+        "and a run that never asked to forward has nothing to say: {}",
         stderr(&off)
     );
 
@@ -1247,6 +1285,23 @@ fn the_ssh_warning_says_which_way_the_hosts_agent_is_missing() {
         "a socket path with nothing behind it must be named, not treated as \
          a working agent: {}",
         stderr(&stale)
+    );
+
+    // And the working path: pall8t only stats the socket, so any existing
+    // file stands in for a live agent here.
+    let live = sb.root.join("live-agent.sock");
+    std::fs::write(&live, b"").unwrap();
+    let on = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &live)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&on).contains("ssh is on"),
+        "forwarding that actually happens must announce itself, or a run can \
+         carry the user's agent with nothing on screen saying so: {}",
+        stderr(&on)
     );
 }
 

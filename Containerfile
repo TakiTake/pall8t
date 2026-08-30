@@ -19,8 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
       > /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && apt-get install -y --no-install-recommends gh && \
-    curl -fsSL https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com \(.)"' \
-      >> /etc/ssh/ssh_known_hosts && \
+    curl -fsSL https://api.github.com/meta -o /tmp/gh-meta.json && \
+    jq -r '.ssh_keys[] | "github.com \(.)"' /tmp/gh-meta.json > /tmp/known_hosts.gh && \
+    test -s /tmp/known_hosts.gh && \
+    cat /tmp/known_hosts.gh >> /etc/ssh/ssh_known_hosts && \
+    rm -f /tmp/gh-meta.json /tmp/known_hosts.gh && \
     (getent group ${GID} || groupadd -g ${GID} dev) && \
     useradd -m -u ${UID} -g ${GID} -s /bin/bash dev && \
     echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev

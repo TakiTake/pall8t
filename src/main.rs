@@ -307,6 +307,15 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
     let host_auth_sock = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
     if let Some(msg) = config::ssh_warning(ssh, host_auth_sock.as_deref(), Path::exists) {
         eprintln!("{msg}");
+    } else if ssh {
+        // Say so on the *working* path too, not only when it is broken.
+        // A capability this wide that announces itself only on failure is
+        // one a run can carry without anyone noticing — and the herdr
+        // bridge, which is narrower, already says "herdr bridge active".
+        eprintln!(
+            "pall8t: [container] ssh is on — this run can use your SSH agent \
+             to authenticate as you anywhere your keys are trusted"
+        );
     }
 
     let herdr_env = herdr::detect();

@@ -69,6 +69,23 @@ local review failed to catch first (source PRs noted).
   is silent exactly where a confused user looks first (a `doctor`-style
   diagnostic).
 
+**Config a repository can ship** (PR #63)
+- pall8t merges a project's `.pall8t/config.toml` over the user's global
+  one, per field. That file arrives *with the repository*, so for any new
+  setting ask: if a repo I cloned set this, what would it get? Sort the
+  setting first — does it shape what runs **inside** the sandbox (command,
+  image, mounts it needs), or does it widen what the sandbox reaches
+  **outside** itself (credentials, host sockets, bridge policy)? The first
+  is the project's business. The second must take the human's global
+  config or an explicit flag, and `project.or(global)` is the wrong
+  merge for it — `[container] ssh = true` in a cloned repo would have
+  handed that repo the user's SSH agent.
+- Narrowing is always safe to honor; widening is the direction that needs
+  an owner. A setting that can only be *turned off* by the project needs
+  no gate.
+- Refusing is half the fix: a dropped intent must still be reported, or
+  the silence hides that the repository asked at all.
+
 **Fallback to a secondary tool** (PR #50)
 - A fallback that invokes a manager/helper tool (`rustup`, `nvm`, a
   package manager) to repair the active environment must first check the

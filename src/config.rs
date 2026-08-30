@@ -122,6 +122,26 @@ pub fn mount_readonly(entry: &MountEntry, cli_override: Option<bool>) -> bool {
     cli_override.or(entry.readonly).unwrap_or(false)
 }
 
+/// A project config that asked to *enable* SSH forwarding, on a host
+/// whose global config did not. [`merge`] ignores it by design — but
+/// ignoring a stated intent in silence is the failure mode this repo
+/// treats as a bug, and here the silence would hide the more alarming
+/// half: that a repository tried to switch on access to the user's keys.
+/// `None` when the project asked for nothing, asked to disable, or agrees
+/// with a global that already allows it.
+fn project_ssh_ignored_warning(global: &Raw, project: &Raw, project_path: &Path) -> Option<String> {
+    (project.container.ssh == Some(true) && global.container.ssh != Some(true)).then(|| {
+        format!(
+            "[container] ssh = true in {} was ignored: a project config can \
+             turn SSH agent forwarding off, never on. It ships with the \
+             repository, and forwarding lets whatever runs in the sandbox \
+             authenticate as you anywhere your keys are trusted. Enable it \
+             in ~/.pall8t/config.toml, or per run with `pall8t run --ssh`.",
+            project_path.display()
+        )
+    })
+}
+
 /// Whether this run forwards the host SSH agent, given the merged config
 /// and the `--ssh` override from the command line.
 ///
@@ -382,12 +402,14 @@ pub fn load(project_dir: &Path) -> Result<Config> {
         .into_iter()
         .chain(deprecations_in(&project, &project_path))
         .collect();
+    let ssh_ignored = project_ssh_ignored_warning(&global, &project, &project_path);
     let merged = merge(global, project);
     // The inert-setting check reads the *merged* config, not each file:
     // a global `auto_rename = true` enables a project's `agent_name`, and
     // warning per file would call that combination inert.
     let warnings = per_file
         .into_iter()
+        .chain(ssh_ignored)
         .chain(inert_agent_name_warning(&merged.herdr))
         .collect();
     Ok(Config { warnings, ..merged })
@@ -440,11 +462,20 @@ fn merge(global: Raw, project: Raw) -> Config {
             .command
             .or(global.run.command)
             .unwrap_or_else(|| vec!["claude".to_string()]),
-        ssh: project
-            .container
-            .ssh
-            .or(global.container.ssh)
-            .unwrap_or(false),
+        // NOT `project.or(global)` like every other field here, and the
+        // asymmetry is the point. A project's `.pall8t/config.toml` ships
+        // with the repository, so it is authored by whoever wrote the
+        // repository — which is exactly the code the sandbox exists to
+        // contain. Project config may shape what runs *inside* the box
+        // (command, image, mounts); it must not be able to widen what the
+        // box can reach *outside* it. Forwarding the agent is the sharpest
+        // outward capability pall8t has, so it takes the human's own
+        // global config or an explicit `--ssh`. A project may still turn
+        // it *off* — narrowing is always safe.
+        ssh: match (global.container.ssh, project.container.ssh) {
+            (_, Some(false)) => false,
+            (g, _) => g.unwrap_or(false),
+        },
         mounts: project.mounts.or(global.mounts).unwrap_or_default(),
         // `[home]` is parsed and ignored; `load` turns its presence into a
         // deprecation message, which `merge` (path-less) can't produce.
@@ -690,22 +721,87 @@ mod tests {
     }
 
     #[test]
-    fn ssh_is_off_until_asked_for_and_merges_per_field() {
+    fn ssh_is_off_until_asked_for_and_only_the_human_may_switch_it_on() {
+        let on = || parse("[container]\nssh = true\n");
+        let off = || parse("[container]\nssh = false\n");
+        let quiet = Raw::default;
+
+        // (global, project, expected, why)
+        let cases: [(Raw, Raw, bool, &str); 6] = [
+            (
+                quiet(),
+                quiet(),
+                false,
+                "forwarding the host agent is a capability the sandbox \
+                 otherwise lacks — it must never arrive by default",
+            ),
+            (on(), quiet(), true, "the human's own global file opts in"),
+            (
+                on(),
+                off(),
+                false,
+                "a project may narrow: turning off what the global switched \
+                 on is always safe, so it is honored",
+            ),
+            (
+                quiet(),
+                on(),
+                false,
+                "but a project may NOT widen. `.pall8t/config.toml` ships \
+                 with the repository, so honoring this would let cloned code \
+                 vote itself access to the user's keys",
+            ),
+            (
+                off(),
+                on(),
+                false,
+                "and an explicit global `false` is not something a repository \
+                 gets to overrule either",
+            ),
+            (
+                on(),
+                on(),
+                true,
+                "a project agreeing with a global that already allows it \
+                 changes nothing",
+            ),
+        ];
+
+        for (global, project, expected, why) in cases {
+            assert_eq!(merge(global, project).ssh, expected, "{why}");
+        }
+    }
+
+    #[test]
+    fn a_project_asking_to_enable_ssh_is_told_it_was_ignored() {
+        let path = Path::new("/x/.pall8t/config.toml");
+        let on = parse("[container]\nssh = true\n");
+        let off = parse("[container]\nssh = false\n");
+
+        let warning = project_ssh_ignored_warning(&Raw::default(), &on, path)
+            .expect("a dropped intent must never be silent — least of all this one");
         assert!(
-            !merge(Raw::default(), Raw::default()).ssh,
-            "forwarding the host agent is a capability the sandbox otherwise \
-             lacks — it must never arrive by default"
+            warning.contains("/x/.pall8t/config.toml"),
+            "the warning must name the file that tried, or the user cannot \
+             tell which repository asked: {warning}"
         );
-        let global = parse("[container]\nssh = true\n");
         assert!(
-            merge(global.clone(), Raw::default()).ssh,
-            "the global file opts in"
+            warning.contains("--ssh") && warning.contains("~/.pall8t/config.toml"),
+            "and must name both legitimate ways in, or it reads as a refusal \
+             with no remedy: {warning}"
         );
-        let project_off = parse("[container]\nssh = false\n");
+
         assert!(
-            !merge(global, project_off).ssh,
-            "a project can turn off what the global file switched on — merging \
-             is per field, and the project is the more specific intent"
+            project_ssh_ignored_warning(&on, &on, path).is_none(),
+            "nothing was ignored when the global already allows it"
+        );
+        assert!(
+            project_ssh_ignored_warning(&Raw::default(), &off, path).is_none(),
+            "a project turning it off is honored, so there is nothing to say"
+        );
+        assert!(
+            project_ssh_ignored_warning(&Raw::default(), &Raw::default(), path).is_none(),
+            "and a project that said nothing asked for nothing"
         );
     }
 
