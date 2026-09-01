@@ -38,13 +38,25 @@ Three facts, verified on apple/container 1.2.2 by reading
 | condition | what the runtime does |
 | --- | --- |
 | `--ssh`, `SSH_AUTH_SOCK` set and live | forwards the socket; guest `SSH_AUTH_SOCK` points at it |
-| `--ssh`, `SSH_AUTH_SOCK` unset | logs to its **own** log, forwards nothing — **and still sets guest `SSH_AUTH_SOCK`** |
-| no `--ssh` | forwards nothing, sets nothing |
+| `--ssh`, `SSH_AUTH_SOCK` unset or stale | logs to its **own** log, forwards nothing — **and still sets guest `SSH_AUTH_SOCK`** |
+| no `--ssh` | forwards nothing, sets nothing, no `/var/host-services` |
 
-The middle row is the trap. The guest gets a path with no socket behind
-it, so the only symptom the user sees is `ssh` failing to connect to
-something that was never there — and the explanation is in a log they
-have no reason to open.
+The middle row is the trap, and it is worse than a missing file. Measured
+on 1.2.2: with `SSH_AUTH_SOCK` unset the guest's `/var/host-services`
+does not exist at all; with a stale one the guest gets the directory and
+a mode-`000` socket node with no process behind it. Neither reaches the
+user as an error about the agent, because `ssh` treats an agent it cannot
+talk to as one holding no identities and carries on without it. So the
+whole symptom is
+
+```
+git@github.com: Permission denied (publickey).
+```
+
+— a line that names a key problem the user does not have (barring a
+private key left in the container home, which is the mechanism this ADR
+declines), while the explanation sits in a log they have no reason to
+open.
 
 ## Decision
 
@@ -168,5 +180,16 @@ project's own dev image already did this; the default image now does too.
 - **`ssh = true` with no agent is a warning, not an error.** The run
   proceeds. Forwarding is one thing a run does, not its purpose, and a
   run that would otherwise succeed should not be blocked by it.
-- **Nothing is forwarded to `pall8t exec`.** The flag belongs to the run
-  that asked for it.
+- **Forwarding is a property of the container, not of one invocation, so
+  `pall8t exec` inherits it.** `exec_argv` adds no `--ssh`, and `container
+  exec` has no such flag to add — but forwarding is not a flag the runtime
+  remembers per process: `ssh` is a field on the *container* config, and
+  `RuntimeService.configureProcessConfig` re-appends
+  `SSH_AUTH_SOCK=/var/host-services/ssh-auth.sock` to every process it
+  starts in a container whose field is set, `startExecProcess` included.
+  Verified on 1.2.2: `pall8t exec <run-with-ssh> -- ssh-add -l` lists the
+  host's keys. So the capability's scope is the container's lifetime — which
+  is what "for the length of the run" above means, with `exec` inside it —
+  and the narrowing that does hold is the other direction: a container
+  started without `--ssh` has no socket in the guest at all, so no later
+  `exec` into it can reach one.

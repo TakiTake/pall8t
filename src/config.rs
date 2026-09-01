@@ -160,9 +160,19 @@ pub fn ssh_enabled(config: bool, cli_override: Option<bool>) -> bool {
 /// deliver. Verified on container 1.2.2: the runtime logs "ssh forwarding
 /// requested but no `SSH_AUTH_SOCK` found" to its *own* log, forwards
 /// nothing — and still sets `SSH_AUTH_SOCK` inside the container, so the
-/// sandbox sees a path with no socket behind it. Without this warning the
-/// user gets only a connect failure from `ssh` and no cause. `None` when
-/// there is nothing to say.
+/// sandbox sees a path with no agent behind it. `None` when there is
+/// nothing to say.
+///
+/// What the sandbox is left holding was measured on 1.2.2, both shapes:
+/// an unset host `SSH_AUTH_SOCK` leaves `/var/host-services` absent
+/// entirely, a stale one leaves a mode-`000` socket node there that no
+/// process is behind. Neither reaches the user as an error about the
+/// agent — `ssh` ignores an agent it cannot reach instead of reporting
+/// it, and falls through to the identities in the container home, which
+/// is normally none — so the whole symptom is `git@github.com: Permission
+/// denied (publickey).`, naming a key problem the user does not have.
+/// Hence the warning quotes that line: it is the string they will be
+/// searching for.
 ///
 /// Two ways to have no agent, not one. Unset is the obvious one; the
 /// commonly hit one is a **stale** `SSH_AUTH_SOCK` — a tmux session or a
@@ -174,7 +184,7 @@ pub fn ssh_enabled(config: bool, cli_override: Option<bool>) -> bool {
 /// answer). A probe that
 /// cannot tell — an unreadable parent directory — reads as absent and
 /// warns: the cost of a wrong warning is one line of text, the cost of a
-/// wrong silence is the unexplained connect failure this exists to
+/// wrong silence is the unexplained publickey denial this exists to
 /// prevent.
 pub fn ssh_warning(
     enabled: bool,
@@ -200,9 +210,11 @@ pub fn ssh_warning(
     // literally. Starting one is what the situation calls for.
     Some(format!(
         "pall8t: warning: [container] ssh is on, but {cause} — there is no \
-         agent to forward. SSH_AUTH_SOCK is still set inside the sandbox, \
-         pointing at a socket that isn't there, so git-over-SSH will fail on \
-         connect. Start an agent (eval \"$(ssh-agent -s)\" && ssh-add) or set \
+         agent to forward. SSH_AUTH_SOCK is still set inside the sandbox with \
+         no agent behind it, and ssh ignores an agent it cannot reach rather \
+         than reporting it, so unless a key is sitting in the container home, \
+         git-over-SSH fails with `Permission denied (publickey)` and names no \
+         cause. Start an agent (eval \"$(ssh-agent -s)\" && ssh-add) or set \
          ssh = false."
     ))
 }
@@ -502,7 +514,8 @@ fn merge(global: Raw, project: Raw) -> Config {
 
 /// Skeleton written by `pall8t init` as `~/.pall8t/config.toml`.
 pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project .pall8t/config.toml overrides
-# these values field by field.
+# these values field by field — except `ssh`, which a project may only
+# turn off (see below).
 
 [container]
 # cpus = 4
@@ -513,7 +526,8 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # over SSH without a private key ever entering the container home. Off by
 # default: while it is running, code in the sandbox can authenticate as
 # you anywhere your keys are trusted. Override for one run with
-# `pall8t run --ssh` / `--ssh=false`.
+# `pall8t run --ssh` / `--ssh=false`. Honored here and from the flag
+# only: a project's .pall8t/config.toml may turn it off, never on.
 # ssh = false
 
 [run]
@@ -557,7 +571,8 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 
 /// Skeleton written by `pall8t init` as `.pall8t/config.toml`.
 pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set here override
-# ~/.pall8t/config.toml.
+# ~/.pall8t/config.toml — except `ssh`, which this file may only turn off
+# (see below).
 
 [container]
 # cpus = 4
@@ -580,7 +595,10 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 # watch = ["flake.nix", "flake.lock"]
 #
 # Forward the host's SSH agent into this project's sandbox — see
-# ~/.pall8t/config.toml for what that grants. Off by default.
+# ~/.pall8t/config.toml for what that grants. Off by default, and here
+# it can only be turned *off*: this file ships with the repository, so
+# `ssh = true` in it is ignored (with a warning). Switching it on is the
+# human's call — ~/.pall8t/config.toml or `pall8t run --ssh`.
 # ssh = false
 
 [run]
@@ -846,7 +864,7 @@ mod tests {
         // resumed after a reboot still exports the path of a socket that
         // died with its agent. `container` forwards nothing, sets
         // SSH_AUTH_SOCK in the guest anyway, and the user sees only a
-        // connect failure — the exact silence this function exists to break.
+        // publickey denial — the exact silence this function exists to break.
         let stale = ssh_warning(true, Some(Path::new("/private/tmp/dead-agent.sock")), gone)
             .expect("a stale SSH_AUTH_SOCK has no agent behind it either");
         assert!(
@@ -870,6 +888,16 @@ mod tests {
         assert!(
             unset.contains("ssh-agent -s"),
             "the fix for 'no agent' is starting one, not ssh-add: {unset}"
+        );
+        // Measured on container 1.2.2 for both no-agent shapes: `ssh` never
+        // complains about the agent it could not reach, so the line the user
+        // actually gets — and searches for — is the publickey denial. A
+        // warning that predicted a connect failure would send them looking
+        // for a string that is never printed.
+        assert!(
+            unset.contains("publickey"),
+            "the warning must name the symptom the run will actually show: \
+             {unset}"
         );
     }
 
