@@ -34,6 +34,9 @@ pub struct Config {
     /// path validation and [`crate::image::combined_hash`] for the hash.
     pub watch: Vec<PathBuf>,
     pub command: Vec<String>,
+    /// Forward the host's SSH agent socket into the sandbox
+    /// (`container run --ssh`). Off by default — see [`ssh_enabled`].
+    pub ssh: bool,
     pub mounts: Vec<MountEntry>,
     /// `[herdr]` — how much of the host herdr session a sandboxed agent
     /// may reach through the relay bridge (see [`crate::relay`]).
@@ -119,6 +122,103 @@ pub fn mount_readonly(entry: &MountEntry, cli_override: Option<bool>) -> bool {
     cli_override.or(entry.readonly).unwrap_or(false)
 }
 
+/// A project config that asked to *enable* SSH forwarding, on a host
+/// whose global config did not. [`merge`] ignores it by design — but
+/// ignoring a stated intent in silence is the failure mode this repo
+/// treats as a bug, and here the silence would hide the more alarming
+/// half: that a repository tried to switch on access to the user's keys.
+/// `None` when the project asked for nothing, asked to disable, or agrees
+/// with a global that already allows it.
+fn project_ssh_ignored_warning(global: &Raw, project: &Raw, project_path: &Path) -> Option<String> {
+    (project.container.ssh == Some(true) && global.container.ssh != Some(true)).then(|| {
+        format!(
+            "[container] ssh = true in {} was ignored: a project config can \
+             turn SSH agent forwarding off, never on. It ships with the \
+             repository, and forwarding lets whatever runs in the sandbox \
+             authenticate as you anywhere your keys are trusted. Enable it \
+             in ~/.pall8t/config.toml, or per run with `pall8t run --ssh`.",
+            project_path.display()
+        )
+    })
+}
+
+/// Whether this run forwards the host SSH agent, given the merged config
+/// and the `--ssh` override from the command line.
+///
+/// Same precedence as [`mount_readonly`] — flag beats config beats
+/// default — and the default is **off**. Forwarding the agent lets the
+/// sandboxed agent authenticate as the user anywhere the user's keys are
+/// trusted, for the lifetime of the run; that is a capability the sandbox
+/// otherwise lacks, so it is opt-in even though it is *safer* than the
+/// alternative it replaces (a private key copied into the container
+/// home, which the sandbox can read and keeps after the run).
+pub fn ssh_enabled(config: bool, cli_override: Option<bool>) -> bool {
+    cli_override.unwrap_or(config)
+}
+
+/// Warning for a run that asked for SSH forwarding the host cannot
+/// deliver. Verified on container 1.2.2: the runtime logs "ssh forwarding
+/// requested but no `SSH_AUTH_SOCK` found" to its *own* log, forwards
+/// nothing — and still sets `SSH_AUTH_SOCK` inside the container, so the
+/// sandbox sees a path with no agent behind it. `None` when there is
+/// nothing to say.
+///
+/// What the sandbox is left holding was measured on 1.2.2, both shapes:
+/// an unset host `SSH_AUTH_SOCK` leaves `/var/host-services` absent
+/// entirely, a stale one leaves a mode-`000` socket node there that no
+/// process is behind. Neither reaches the user as an error about the
+/// agent — `ssh` ignores an agent it cannot reach instead of reporting
+/// it, and falls through to the identities in the container home, which
+/// is normally none — so the whole symptom is `git@github.com: Permission
+/// denied (publickey).`, naming a key problem the user does not have.
+/// Hence the warning quotes that line: it is the string they will be
+/// searching for.
+///
+/// Two ways to have no agent, not one. Unset is the obvious one; the
+/// commonly hit one is a **stale** `SSH_AUTH_SOCK` — a tmux session or a
+/// shell resumed after a reboot still exports the path of a socket that
+/// died with the agent that made it. Testing only for unset lets exactly
+/// the confusing case through silently, so existence is asked as well,
+/// via `sock_exists` rather than by touching the filesystem here (the
+/// caller hands over `Path::exists` itself; the tests hand over an
+/// answer). A probe that
+/// cannot tell — an unreadable parent directory — reads as absent and
+/// warns: the cost of a wrong warning is one line of text, the cost of a
+/// wrong silence is the unexplained publickey denial this exists to
+/// prevent.
+pub fn ssh_warning(
+    enabled: bool,
+    host_auth_sock: Option<&Path>,
+    sock_exists: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    // `filter` folds an empty SSH_AUTH_SOCK in with an unset one: both mean
+    // "no agent", and only one of them has a path worth printing.
+    let cause = match host_auth_sock.filter(|s| !s.as_os_str().is_empty()) {
+        None => "SSH_AUTH_SOCK is unset on the host".to_string(),
+        Some(sock) if sock_exists(sock) => return None,
+        Some(sock) => format!(
+            "SSH_AUTH_SOCK on the host points at {}, which isn't there",
+            sock.display()
+        ),
+    };
+    // `ssh-add` alone is not the remedy: with no agent to talk to it just
+    // fails with "Could not open a connection to your authentication
+    // agent", which is a second dead end for anyone following the advice
+    // literally. Starting one is what the situation calls for.
+    Some(format!(
+        "pall8t: warning: [container] ssh is on, but {cause} — there is no \
+         agent to forward. SSH_AUTH_SOCK is still set inside the sandbox with \
+         no agent behind it, and ssh ignores an agent it cannot reach rather \
+         than reporting it, so unless a key is sitting in the container home, \
+         git-over-SSH fails with `Permission denied (publickey)` and names no \
+         cause. Start an agent (eval \"$(ssh-agent -s)\" && ssh-add) or set \
+         ssh = false."
+    ))
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Raw {
     #[serde(default)]
@@ -162,6 +262,7 @@ struct RawContainer {
     memory: Option<String>,
     containerfile: Option<PathBuf>,
     watch: Option<Vec<PathBuf>>,
+    ssh: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -313,12 +414,14 @@ pub fn load(project_dir: &Path) -> Result<Config> {
         .into_iter()
         .chain(deprecations_in(&project, &project_path))
         .collect();
+    let ssh_ignored = project_ssh_ignored_warning(&global, &project, &project_path);
     let merged = merge(global, project);
     // The inert-setting check reads the *merged* config, not each file:
     // a global `auto_rename = true` enables a project's `agent_name`, and
     // warning per file would call that combination inert.
     let warnings = per_file
         .into_iter()
+        .chain(ssh_ignored)
         .chain(inert_agent_name_warning(&merged.herdr))
         .collect();
     Ok(Config { warnings, ..merged })
@@ -371,6 +474,20 @@ fn merge(global: Raw, project: Raw) -> Config {
             .command
             .or(global.run.command)
             .unwrap_or_else(|| vec!["claude".to_string()]),
+        // NOT `project.or(global)` like every other field here, and the
+        // asymmetry is the point. A project's `.pall8t/config.toml` ships
+        // with the repository, so it is authored by whoever wrote the
+        // repository — which is exactly the code the sandbox exists to
+        // contain. Project config may shape what runs *inside* the box
+        // (command, image, mounts); it must not be able to widen what the
+        // box can reach *outside* it. Forwarding the agent is the sharpest
+        // outward capability pall8t has, so it takes the human's own
+        // global config or an explicit `--ssh`. A project may still turn
+        // it *off* — narrowing is always safe.
+        ssh: match (global.container.ssh, project.container.ssh) {
+            (_, Some(false)) => false,
+            (g, _) => g.unwrap_or(false),
+        },
         mounts: project.mounts.or(global.mounts).unwrap_or_default(),
         // `[home]` is parsed and ignored; `load` turns its presence into a
         // deprecation message, which `merge` (path-less) can't produce.
@@ -397,12 +514,21 @@ fn merge(global: Raw, project: Raw) -> Config {
 
 /// Skeleton written by `pall8t init` as `~/.pall8t/config.toml`.
 pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project .pall8t/config.toml overrides
-# these values field by field.
+# these values field by field — except `ssh`, which a project may only
+# turn off (see below).
 
 [container]
 # cpus = 4
 # memory = "8g"
 # containerfile = "/absolute/path/to/Containerfile"
+#
+# Forward the host's SSH agent into the sandbox, so the agent can push
+# over SSH without a private key ever entering the container home. Off by
+# default: while it is running, code in the sandbox can authenticate as
+# you anywhere your keys are trusted. Override for one run with
+# `pall8t run --ssh` / `--ssh=false`. Honored here and from the flag
+# only: a project's .pall8t/config.toml may turn it off, never on.
+# ssh = false
 
 [run]
 # Command run by `pall8t run`. --dangerously-skip-permissions is NOT in
@@ -445,7 +571,8 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 
 /// Skeleton written by `pall8t init` as `.pall8t/config.toml`.
 pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set here override
-# ~/.pall8t/config.toml.
+# ~/.pall8t/config.toml — except `ssh`, which this file may only turn off
+# (see below).
 
 [container]
 # cpus = 4
@@ -466,6 +593,13 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 # Containerfile (containerfile above or .pall8t/Containerfile); paths are
 # relative to the project dir and must exist.
 # watch = ["flake.nix", "flake.lock"]
+#
+# Forward the host's SSH agent into this project's sandbox — see
+# ~/.pall8t/config.toml for what that grants. Off by default, and here
+# it can only be turned *off*: this file ships with the repository, so
+# `ssh = true` in it is ignored (with a warning). Switching it on is the
+# human's call — ~/.pall8t/config.toml or `pall8t run --ssh`.
+# ssh = false
 
 [run]
 # command = ["claude"]
@@ -601,6 +735,169 @@ mod tests {
             toml::from_str::<Raw>("[herdr]\nauto_renam = true\n").is_err(),
             "a misspelled key fails the parse rather than silently renaming \
              nothing (deny_unknown_fields)"
+        );
+    }
+
+    #[test]
+    fn ssh_is_off_until_asked_for_and_only_the_human_may_switch_it_on() {
+        let on = || parse("[container]\nssh = true\n");
+        let off = || parse("[container]\nssh = false\n");
+        let quiet = Raw::default;
+
+        // (global, project, expected, why)
+        let cases: [(Raw, Raw, bool, &str); 6] = [
+            (
+                quiet(),
+                quiet(),
+                false,
+                "forwarding the host agent is a capability the sandbox \
+                 otherwise lacks — it must never arrive by default",
+            ),
+            (on(), quiet(), true, "the human's own global file opts in"),
+            (
+                on(),
+                off(),
+                false,
+                "a project may narrow: turning off what the global switched \
+                 on is always safe, so it is honored",
+            ),
+            (
+                quiet(),
+                on(),
+                false,
+                "but a project may NOT widen. `.pall8t/config.toml` ships \
+                 with the repository, so honoring this would let cloned code \
+                 vote itself access to the user's keys",
+            ),
+            (
+                off(),
+                on(),
+                false,
+                "and an explicit global `false` is not something a repository \
+                 gets to overrule either",
+            ),
+            (
+                on(),
+                on(),
+                true,
+                "a project agreeing with a global that already allows it \
+                 changes nothing",
+            ),
+        ];
+
+        for (global, project, expected, why) in cases {
+            assert_eq!(merge(global, project).ssh, expected, "{why}");
+        }
+    }
+
+    #[test]
+    fn a_project_asking_to_enable_ssh_is_told_it_was_ignored() {
+        let path = Path::new("/x/.pall8t/config.toml");
+        let on = parse("[container]\nssh = true\n");
+        let off = parse("[container]\nssh = false\n");
+
+        let warning = project_ssh_ignored_warning(&Raw::default(), &on, path)
+            .expect("a dropped intent must never be silent — least of all this one");
+        assert!(
+            warning.contains("/x/.pall8t/config.toml"),
+            "the warning must name the file that tried, or the user cannot \
+             tell which repository asked: {warning}"
+        );
+        assert!(
+            warning.contains("--ssh") && warning.contains("~/.pall8t/config.toml"),
+            "and must name both legitimate ways in, or it reads as a refusal \
+             with no remedy: {warning}"
+        );
+
+        assert!(
+            project_ssh_ignored_warning(&on, &on, path).is_none(),
+            "nothing was ignored when the global already allows it"
+        );
+        assert!(
+            project_ssh_ignored_warning(&Raw::default(), &off, path).is_none(),
+            "a project turning it off is honored, so there is nothing to say"
+        );
+        assert!(
+            project_ssh_ignored_warning(&Raw::default(), &Raw::default(), path).is_none(),
+            "and a project that said nothing asked for nothing"
+        );
+    }
+
+    #[test]
+    fn ssh_enabled_precedence_table() {
+        assert!(!ssh_enabled(false, None), "config off, no flag: off");
+        assert!(ssh_enabled(true, None), "config on, no flag: on");
+        assert!(
+            ssh_enabled(false, Some(true)),
+            "`pall8t run --ssh` turns it on for one run without editing config"
+        );
+        assert!(
+            !ssh_enabled(true, Some(false)),
+            "`--ssh=false` beats a config that switched it on — the way to run \
+             one sandbox without handing it the agent"
+        );
+    }
+
+    #[test]
+    fn ssh_warning_only_when_it_would_forward_nothing() {
+        let live = |_: &Path| true;
+        let gone = |_: &Path| false;
+        assert!(
+            ssh_warning(true, None, live).is_some(),
+            "forwarding asked for with no SSH_AUTH_SOCK at all: the runtime \
+             forwards nothing and says so only in its own log"
+        );
+        assert!(
+            ssh_warning(true, Some(Path::new("")), live).is_some(),
+            "an empty SSH_AUTH_SOCK is unset with extra steps"
+        );
+        assert!(
+            ssh_warning(true, Some(Path::new("/private/tmp/agent.sock")), live).is_none(),
+            "a live agent is the whole point; saying nothing is correct"
+        );
+        assert!(
+            ssh_warning(false, None, live).is_none(),
+            "nothing to warn about when the run never asked to forward"
+        );
+
+        // The case a presence-only check misses: a tmux session or a shell
+        // resumed after a reboot still exports the path of a socket that
+        // died with its agent. `container` forwards nothing, sets
+        // SSH_AUTH_SOCK in the guest anyway, and the user sees only a
+        // publickey denial — the exact silence this function exists to break.
+        let stale = ssh_warning(true, Some(Path::new("/private/tmp/dead-agent.sock")), gone)
+            .expect("a stale SSH_AUTH_SOCK has no agent behind it either");
+        assert!(
+            stale.contains("/private/tmp/dead-agent.sock"),
+            "and it must name the dead path, since that is the one clue the \
+             user cannot get anywhere else: {stale}"
+        );
+        // An empty path is "unset", not a path to complain about.
+        assert!(
+            ssh_warning(true, Some(Path::new("")), gone)
+                .unwrap()
+                .contains("is unset on the host"),
+            "an empty SSH_AUTH_SOCK must read as unset, not as a nameless \
+             missing socket"
+        );
+
+        // The remedy has to be one that works. `ssh-add` on its own fails
+        // with "Could not open a connection to your authentication agent"
+        // in precisely the situation this warning is printed in.
+        let unset = ssh_warning(true, None, gone).unwrap();
+        assert!(
+            unset.contains("ssh-agent -s"),
+            "the fix for 'no agent' is starting one, not ssh-add: {unset}"
+        );
+        // Measured on container 1.2.2 for both no-agent shapes: `ssh` never
+        // complains about the agent it could not reach, so the line the user
+        // actually gets — and searches for — is the publickey denial. A
+        // warning that predicted a connect failure would send them looking
+        // for a string that is never printed.
+        assert!(
+            unset.contains("publickey"),
+            "the warning must name the symptom the run will actually show: \
+             {unset}"
         );
     }
 

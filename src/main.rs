@@ -27,6 +27,10 @@ enum Cmd {
         /// forces them all writable instead
         #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
         readonly: Option<bool>,
+        /// Forward the host's SSH agent into the sandbox for this run,
+        /// overriding `[container] ssh`. `--ssh=false` forces it off
+        #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+        ssh: Option<bool>,
         /// Command to run instead of the configured one (after --)
         #[arg(last = true)]
         command: Vec<String>,
@@ -124,7 +128,11 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Init => cmd_init(),
-        Cmd::Run { readonly, command } => cmd_run(command, readonly),
+        Cmd::Run {
+            readonly,
+            ssh,
+            command,
+        } => cmd_run(command, readonly, ssh),
         Cmd::Build { no_cache } => cmd_build(no_cache),
         Cmd::Ls { json } => cmd_ls(json),
         Cmd::Exec { id, command } => cmd_exec(&id, &command),
@@ -256,7 +264,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
+fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<bool>) -> Result<()> {
     let (cwd, cfg, uid, gid, resolved) = workspace_image(image::BuildMode::IfMissing)?;
     let run_name = container::run_name(&cwd);
 
@@ -292,6 +300,23 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
         .filter(|m| m.readonly)
         .map(|m| m.dest.clone())
         .collect();
+
+    let ssh = config::ssh_enabled(cfg.ssh, cli_ssh);
+    // `var_os`, not `var`: SSH_AUTH_SOCK is a path, and a path is not
+    // required to be UTF-8. `Path::exists` goes in as the probe itself.
+    let host_auth_sock = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
+    if let Some(msg) = config::ssh_warning(ssh, host_auth_sock.as_deref(), Path::exists) {
+        eprintln!("{msg}");
+    } else if ssh {
+        // Say so on the *working* path too, not only when it is broken.
+        // A capability this wide that announces itself only on failure is
+        // one a run can carry without anyone noticing — and the herdr
+        // bridge, which is narrower, already says "herdr bridge active".
+        eprintln!(
+            "pall8t: [container] ssh is on — this run can use your SSH agent \
+             to authenticate as you anywhere your keys are trusted"
+        );
+    }
 
     let herdr_env = herdr::detect();
     // An explicit `-- <cmd>` override is user intent and bypasses the
@@ -349,6 +374,7 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
         gid,
         tty: stdin_is_tty(),
         env: env_vars,
+        ssh,
         command,
     };
     exec_container(&container::run_argv(&spec), herdr_agent.as_deref())

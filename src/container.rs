@@ -698,6 +698,13 @@ pub struct RunSpec {
     /// producer today is the herdr bridge (`HERDR_*` identity — see
     /// [`crate::herdr`]).
     pub env: Vec<(String, String)>,
+    /// Forward the host's SSH agent socket (`--ssh`). apple/container
+    /// takes `SSH_AUTH_SOCK` from *this* process's environment and
+    /// forwards that socket into the guest at
+    /// `/var/host-services/ssh-auth.sock`, setting the guest's own
+    /// `SSH_AUTH_SOCK` to it — so no key material crosses the boundary,
+    /// only signing requests. Opt-in per [`crate::config::ssh_enabled`].
+    pub ssh: bool,
     pub command: Vec<String>,
 }
 
@@ -710,6 +717,9 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
         argv.push("-t".into());
     }
     argv.extend(["--rm".into(), "--name".into(), spec.name.clone()]);
+    if spec.ssh {
+        argv.push("--ssh".into());
+    }
     for m in &spec.mounts {
         let (flag, value) = m.spec();
         argv.push(flag.into());
@@ -1402,6 +1412,28 @@ mod tests {
 
     /// The herdr bridge's socket is the one mount that must go out as
     /// `-v`: 1.2.2's `--mount` parser accepts only a directory source,
+    /// The scalar scaffolding every `run_argv` test needs and none of them
+    /// is about: a name, an image, a workdir, host ids. Tests state only
+    /// the fields they actually assert on (`..base_spec()`), the way
+    /// `run_argv_shape` already reads its no-TTY variant. Three hand-copied
+    /// literals is what made adding one field a three-site edit.
+    fn base_spec() -> RunSpec {
+        RunSpec {
+            name: "pall8t-x-abc12345-99".into(),
+            image: "img".into(),
+            workdir: PathBuf::from("/Users/me/src/x"),
+            mounts: vec![],
+            cpus: 4,
+            memory: "8g".into(),
+            uid: 501,
+            gid: 20,
+            tty: false,
+            env: vec![],
+            ssh: false,
+            command: vec!["claude".into()],
+        }
+    }
+
     /// while the runtime behind `-v` forwards a socket source into the
     /// guest as a live socket (verified on 1.2.2). Two colon-separated
     /// fields and no third — the unvalidated-options hazard ADR-0009
@@ -1409,9 +1441,6 @@ mod tests {
     #[test]
     fn socket_mount_goes_out_as_two_field_v() {
         let spec = RunSpec {
-            name: "pall8t-x-abc12345-99".into(),
-            image: "img".into(),
-            workdir: PathBuf::from("/Users/me/src/x"),
             mounts: vec![
                 Mount::identity(PathBuf::from("/Users/me/src/x")),
                 Mount::socket(
@@ -1420,13 +1449,7 @@ mod tests {
                 )
                 .unwrap(),
             ],
-            cpus: 4,
-            memory: "8g".into(),
-            uid: 501,
-            gid: 20,
-            tty: false,
-            env: vec![],
-            command: vec!["claude".into()],
+            ..base_spec()
         };
         let argv = run_argv(&spec);
         let v = argv
@@ -1493,11 +1516,29 @@ mod tests {
     }
 
     #[test]
+    fn ssh_forwarding_emits_the_flag() {
+        let spec = RunSpec {
+            ssh: true,
+            ..base_spec()
+        };
+        let argv = run_argv(&spec);
+        assert!(
+            argv.contains(&"--ssh".to_string()),
+            "`ssh = true` must reach the runtime as --ssh; the flag is the whole \
+             feature, and nothing else in the argv hints at it"
+        );
+        let image_pos = argv.iter().position(|a| a == "img").unwrap();
+        assert!(
+            argv.iter().position(|a| a == "--ssh").unwrap() < image_pos,
+            "flags precede the image positional, or the runtime reads --ssh as \
+             an argument to the container command"
+        );
+    }
+
+    #[test]
     fn run_argv_shape() {
         let spec = RunSpec {
-            name: "pall8t-x-abc12345-99".into(),
             image: "pall8t-x:501-20-abc123456789".into(),
-            workdir: PathBuf::from("/Users/me/src/x"),
             mounts: vec![
                 Mount::identity(PathBuf::from("/Users/me/src/x")),
                 Mount::rw(
@@ -1509,15 +1550,16 @@ mod tests {
                     PathBuf::from("/Users/me/src/lib"),
                 ),
             ],
-            cpus: 4,
-            memory: "8g".into(),
-            uid: 501,
-            gid: 20,
             tty: true,
             env: vec![("HERDR_ENV".into(), "1".into())],
-            command: vec!["claude".into()],
+            ..base_spec()
         };
         let argv = run_argv(&spec);
+        assert!(
+            !argv.contains(&"--ssh".to_string()),
+            "agent forwarding is opt-in: a run that didn't ask for it must not \
+             hand the sandbox the host's SSH agent"
+        );
         let e = argv.iter().position(|a| a == "-e").unwrap();
         assert_eq!(
             argv[e + 1],
