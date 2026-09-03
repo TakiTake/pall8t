@@ -213,6 +213,13 @@ const OWN_LABEL_SEARCH_BOUND: usize = 50;
 /// always supplies a number) or a position beyond the bound — any `Some(n)`
 /// with `n <= OWN_LABEL_SEARCH_BOUND` is already one of the sweep's own
 /// iterations, so running it twice would just duplicate that work.
+///
+/// `n > OWN_LABEL_SEARCH_BOUND` vs. `n >= OWN_LABEL_SEARCH_BOUND` is one
+/// case `cargo mutants` will keep flagging and no test here can close:
+/// at exactly `n == OWN_LABEL_SEARCH_BOUND` the sweep already answers for
+/// this label either way, so which side of `>`/`>=` the boundary falls on
+/// changes nothing about what the function returns — a genuinely
+/// equivalent mutant, not a coverage gap.
 fn label_is_pall8t_own(label: &str, base: &str, tab_number: Option<usize>) -> bool {
     if tab_number.is_none_or(|n| n > OWN_LABEL_SEARCH_BOUND)
         && candidates(base, tab_number).any(|c| c == label)
@@ -1299,6 +1306,29 @@ mod tests {
         assert!(
             label_is_pall8t_own(&format!("foo-{OWN_LABEL_SEARCH_BOUND}"), "foo", Some(1)),
             "right at the bound — still recognized"
+        );
+    }
+
+    /// `mutation testing pin`: the sweep in [`label_is_pall8t_own`] only
+    /// ever tries `1..=OWN_LABEL_SEARCH_BOUND`, so a position *beyond* the
+    /// bound is reachable only through the function's direct check on
+    /// `tab_number` itself — every other test here uses an in-bound
+    /// position, where that guard is redundant with the sweep and so
+    /// invisible to `cargo mutants` (a mutated `>`/`&&`/`==` there changes
+    /// no test's outcome). This is the one case that actually exercises it.
+    #[test]
+    fn a_position_beyond_the_bound_is_recognized_only_by_exact_match() {
+        let far = OWN_LABEL_SEARCH_BOUND + 5;
+        assert!(
+            label_is_pall8t_own(&format!("foo-{far}"), "foo", Some(far)),
+            "the sweep never reaches this far, so only the direct check on \
+             `tab_number` itself can recognize it"
+        );
+        assert!(
+            !label_is_pall8t_own(&format!("foo-{}", far + 1), "foo", Some(far)),
+            "and it really is an exact match, not another sweep: a label \
+             for a different far-out position isn't recognized just \
+             because both are past the bound"
         );
     }
 
