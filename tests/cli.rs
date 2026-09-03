@@ -1387,6 +1387,68 @@ fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
     );
 }
 
+/// Regression pin (review finding on the issue #76 fix): before this,
+/// numbering read straight off the tab id and needed no herdr call at
+/// all, so it survived a broken `tab.list` untouched. Position-based
+/// numbering (issue #76) made the suffix depend on that same call
+/// succeeding — this pins that a failure there still leaves the agent
+/// addressable by a number (falling back to the id), rather than dropping
+/// the suffix outright.
+#[test]
+fn a_broken_herdr_tab_list_still_names_the_agent_from_the_id() {
+    let sb = Sandbox::new("run-naming-tablist-broken");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
+    // Unparseable: simulates `tab.list`'s reply shape having changed, or
+    // any other failure `fetch_tabs` treats the same way.
+    std::fs::write(sb.root.join("herdr-tab-list.json"), "not json").unwrap();
+    std::fs::write(
+        sb.root.join("herdr-agent-list.json"),
+        r#"{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}"#,
+    )
+    .unwrap();
+    sb.write_project_config(
+        "[herdr]\nsandbox = \"off\"\nauto_rename = true\nagent_name = \"demo\"\n",
+    );
+    fake.vanish_after_image_list();
+
+    let out = sb
+        .command()
+        .args(["run", "--", "claude"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "w13:p3")
+        .env("HERDR_TAB_ID", "w13:t9")
+        .env("HERDR_WORKSPACE_ID", "w13")
+        .env("HERDR_BIN_PATH", &herdr_bin)
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(
+        err.contains("could not make sense of the herdr tab list"),
+        "the failure is surfaced, not swallowed: {err}"
+    );
+    assert!(
+        !err.contains("naming this tab"),
+        "with no usable tab list, ownership of the label is unknown, so \
+         the tab itself is never touched: {err}"
+    );
+
+    let log = wait_for_line(
+        &sb.pall8t_root().join("logs").join("herdr-naming.log"),
+        "named the agent",
+        std::time::Duration::from_secs(10),
+    );
+    assert!(
+        log.contains(r#"named the agent "demo-9""#),
+        "the agent still gets a numbered name, falling back to the number \
+         encoded in the tab id (`w13:t9` -> 9) since the position could not \
+         be read — dropping the suffix entirely here would be the \
+         regression this pins: {log}"
+    );
+}
+
 /// The agent half on its own, driven through the hidden subcommand the
 /// run spawns.
 ///
