@@ -1249,8 +1249,11 @@ fn a_run_inside_a_herdr_pane_builds_the_socket_bridge() {
 /// One opted-in `pall8t run` in herdr pane `w13:p3`, whose tab `w13:t2` is
 /// the sole tab of `w13` — so herdr's own auto label for it is `"1"` and
 /// `tab_label` decides whether pall8t sees the label as its own to take.
-/// The tab's *number* is 2 while its position is 1, which is what makes
-/// the expected name `demo-2` rather than `demo-1`.
+/// The fixture's `number` field is deliberately 2, different from the
+/// tab's position (1): pall8t's own suffix now reads the *position*, the
+/// same number herdr's own auto label already shows (issue #76), so the
+/// expected name is `demo-1` — a regression here would mean something
+/// started reading the id-encoded `number` field again.
 ///
 /// Returns the sandbox (for the log and argv files the detached agent
 /// namer writes after the run returns) and the run's stderr.
@@ -1301,14 +1304,14 @@ fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
     // A tab still on herdr's own auto label ("1") is pall8t's to rename.
     let (sb, err) = opted_in_naming_run("run-naming", "1");
     assert!(
-        err.contains(r#"naming this tab "demo-2""#)
+        err.contains(r#"naming this tab "demo-1""#)
             && err.contains("its agent takes the same name"),
         "the run says what it named, with [herdr] agent_name overriding the \
-         directory basename and the tab's number as the suffix: {err}"
+         directory basename and the tab's position as the suffix: {err}"
     );
     let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
     assert!(
-        calls.contains("tab rename w13:t2 demo-2"),
+        calls.contains("tab rename w13:t2 demo-1"),
         "the tab is renamed before the exec — it needs no detected agent, so \
          the human sees the right label from the moment the run starts: {calls}"
     );
@@ -1322,7 +1325,7 @@ fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
         std::time::Duration::from_secs(10),
     );
     assert!(
-        log.contains(r#"named the agent "demo-2""#),
+        log.contains(r#"named the agent "demo-1""#),
         "the agent gets the same name as the tab, from a process that \
          outlives the exec: {log}"
     );
@@ -1330,7 +1333,7 @@ fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
     // calls land in the log only once the wait above has seen it work.
     let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
     assert!(
-        calls.contains("agent rename w13:p3 demo-2"),
+        calls.contains("agent rename w13:p3 demo-1"),
         "and it is a real `agent rename` on the pane that does it — the log \
          line alone would still be written by a rename that never happened: \
          {calls}"
@@ -1363,7 +1366,7 @@ fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
     );
     assert!(
         err.contains(r#"this tab keeps its label "release work""#)
-            && err.contains(r#"address the agent as "demo-2""#),
+            && err.contains(r#"address the agent as "demo-1""#),
         "and the run must say so rather than claiming a tab it did not name — \
          naming both strings is what shows the human that the label they will \
          read off the tab is not the name that reaches this agent: {err}"
@@ -1374,12 +1377,12 @@ fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
         std::time::Duration::from_secs(10),
     );
     assert!(
-        log.contains(r#"named the agent "demo-2""#),
+        log.contains(r#"named the agent "demo-1""#),
         "the agent half is independent of the tab half and still runs: {log}"
     );
     let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
     assert!(
-        calls.contains("agent rename w13:p3 demo-2") && !calls.contains("tab rename"),
+        calls.contains("agent rename w13:p3 demo-1") && !calls.contains("tab rename"),
         "the agent really is renamed, and the tab really is not: {calls}"
     );
 }

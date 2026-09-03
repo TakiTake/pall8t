@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`[herdr] auto_rename`'s tab/agent suffix now matches herdr's own default
+  numbering** (issue #76): it's the tab's 1-based *position* in its
+  workspace — the same number herdr's unrenamed tabs already show — instead
+  of the id-encoded creation counter, which could start anywhere above 1 and
+  read as unintuitive next to it. Recognizing a label as pall8t's own to
+  overwrite (so a second run in the same tab doesn't mistake its own past
+  label for a human's rename) now tolerates that number shifting when an
+  earlier tab in the workspace closes, which position-based numbering alone
+  would otherwise reintroduce as drift.
+
 ## [0.5.0] - 2026-08-29
 
 ### Added
