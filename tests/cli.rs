@@ -1246,30 +1246,33 @@ fn a_run_inside_a_herdr_pane_builds_the_socket_bridge() {
     drop(host_herdr);
 }
 
-/// One opted-in `pall8t run` in herdr pane `w13:p3`, whose tab `w13:t2` is
-/// the sole tab of `w13` — so herdr's own auto label for it is `"1"` and
-/// `tab_label` decides whether pall8t sees the label as its own to take.
-/// The fixture's `number` field is deliberately 2, different from the
-/// tab's position (1): pall8t's own suffix now reads the *position*, the
-/// same number herdr's own auto label already shows (issue #76), so the
-/// expected name is `demo-1` — a regression here would mean something
-/// started reading the id-encoded `number` field again.
+/// `herdr tab list`'s reply for a workspace `w13` whose sole tab is
+/// `w13:t2`, carrying `tab_label`. The `number` field is deliberately 2,
+/// different from the tab's position (1) — pall8t's own suffix now reads
+/// the *position*, the same number herdr's own auto label already shows
+/// (issue #76), so a run against this fixture expects `demo-1`; a
+/// regression here would mean something started reading the id-encoded
+/// `number` field again.
+fn tab_list_with_label(tab_label: &str) -> String {
+    format!(
+        r#"{{"id":"cli:tab:list","result":{{"tabs":[{{"agent_status":"unknown","focused":true,"label":"{tab_label}","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}}],"type":"tab_list"}}}}"#
+    )
+}
+
+/// One opted-in `pall8t run` in herdr pane `w13:p3` of workspace `w13`,
+/// replaying `tab_list_body` for `herdr tab list` — the raw reply body, so
+/// a caller can pass a well-formed fixture (see [`tab_list_with_label`])
+/// or deliberately broken content to exercise `fetch_tabs`'s failure path.
 ///
 /// Returns the sandbox (for the log and argv files the detached agent
 /// namer writes after the run returns) and the run's stderr.
-fn opted_in_naming_run(sandbox: &str, tab_label: &str) -> (Sandbox, String) {
+fn opted_in_naming_run(sandbox: &str, tab_id: &str, tab_list_body: &str) -> (Sandbox, String) {
     let sb = Sandbox::new(sandbox);
     let fake = FakeRuntime::current(&sb);
     let tag = build_once(&sb, &fake);
     fake.set_images(std::slice::from_ref(&tag));
     let herdr_bin = fake_host_herdr(&sb, "0.8.2");
-    std::fs::write(
-        sb.root.join("herdr-tab-list.json"),
-        format!(
-            r#"{{"id":"cli:tab:list","result":{{"tabs":[{{"agent_status":"unknown","focused":true,"label":"{tab_label}","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}}],"type":"tab_list"}}}}"#
-        ),
-    )
-    .unwrap();
+    std::fs::write(sb.root.join("herdr-tab-list.json"), tab_list_body).unwrap();
     std::fs::write(
         sb.root.join("herdr-agent-list.json"),
         r#"{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}"#,
@@ -1285,7 +1288,7 @@ fn opted_in_naming_run(sandbox: &str, tab_label: &str) -> (Sandbox, String) {
         .args(["run", "--", "claude"])
         .env("HERDR_ENV", "1")
         .env("HERDR_PANE_ID", "w13:p3")
-        .env("HERDR_TAB_ID", "w13:t2")
+        .env("HERDR_TAB_ID", tab_id)
         .env("HERDR_WORKSPACE_ID", "w13")
         .env("HERDR_BIN_PATH", &herdr_bin)
         .output()
@@ -1302,7 +1305,7 @@ fn opted_in_naming_run(sandbox: &str, tab_label: &str) -> (Sandbox, String) {
 #[test]
 fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
     // A tab still on herdr's own auto label ("1") is pall8t's to rename.
-    let (sb, err) = opted_in_naming_run("run-naming", "1");
+    let (sb, err) = opted_in_naming_run("run-naming", "w13:t2", &tab_list_with_label("1"));
     assert!(
         err.contains(r#"naming this tab "demo-1""#)
             && err.contains("its agent takes the same name"),
@@ -1358,7 +1361,11 @@ fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
 fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
     // "release work" is neither herdr's auto label nor a name pall8t
     // could have written here — only a human types it.
-    let (sb, err) = opted_in_naming_run("run-naming-mine", "release work");
+    let (sb, err) = opted_in_naming_run(
+        "run-naming-mine",
+        "w13:t2",
+        &tab_list_with_label("release work"),
+    );
     let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
     assert!(
         !calls.contains("tab rename"),
@@ -1396,35 +1403,9 @@ fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
 /// the suffix outright.
 #[test]
 fn a_broken_herdr_tab_list_still_names_the_agent_from_the_id() {
-    let sb = Sandbox::new("run-naming-tablist-broken");
-    let fake = FakeRuntime::current(&sb);
-    let tag = build_once(&sb, &fake);
-    fake.set_images(std::slice::from_ref(&tag));
-    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
-    // Unparseable: simulates `tab.list`'s reply shape having changed, or
-    // any other failure `fetch_tabs` treats the same way.
-    std::fs::write(sb.root.join("herdr-tab-list.json"), "not json").unwrap();
-    std::fs::write(
-        sb.root.join("herdr-agent-list.json"),
-        r#"{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}"#,
-    )
-    .unwrap();
-    sb.write_project_config(
-        "[herdr]\nsandbox = \"off\"\nauto_rename = true\nagent_name = \"demo\"\n",
-    );
-    fake.vanish_after_image_list();
-
-    let out = sb
-        .command()
-        .args(["run", "--", "claude"])
-        .env("HERDR_ENV", "1")
-        .env("HERDR_PANE_ID", "w13:p3")
-        .env("HERDR_TAB_ID", "w13:t9")
-        .env("HERDR_WORKSPACE_ID", "w13")
-        .env("HERDR_BIN_PATH", &herdr_bin)
-        .output()
-        .unwrap();
-    let err = stderr(&out);
+    // "not json": simulates `tab.list`'s reply shape having changed, or any
+    // other failure `fetch_tabs` treats the same way.
+    let (sb, err) = opted_in_naming_run("run-naming-tablist-broken", "w13:t9", "not json");
     assert!(
         err.contains("could not make sense of the herdr tab list"),
         "the failure is surfaced, not swallowed: {err}"

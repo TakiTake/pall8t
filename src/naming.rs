@@ -208,25 +208,15 @@ const OWN_LABEL_SEARCH_BOUND: usize = 50;
 /// have picked here, at some position; overwriting `foo-2` with `foo-2-2`
 /// in that case is benign, since it stays inside the same name family.
 ///
-/// The direct check on `tab_number` only earns its keep for `None` (the
-/// bare, unsuffixed candidates the sweep below never visits, since it
-/// always supplies a number) or a position beyond the bound — any `Some(n)`
-/// with `n <= OWN_LABEL_SEARCH_BOUND` is already one of the sweep's own
-/// iterations, so running it twice would just duplicate that work.
-///
-/// `n > OWN_LABEL_SEARCH_BOUND` vs. `n >= OWN_LABEL_SEARCH_BOUND` is one
-/// case `cargo mutants` will keep flagging and no test here can close:
-/// at exactly `n == OWN_LABEL_SEARCH_BOUND` the sweep already answers for
-/// this label either way, so which side of `>`/`>=` the boundary falls on
-/// changes nothing about what the function returns — a genuinely
-/// equivalent mutant, not a coverage gap.
+/// The direct check on `tab_number` is also what covers `None` (the bare,
+/// unsuffixed candidates the sweep below never visits, since it always
+/// supplies a number) and a position beyond the bound — it overlaps the
+/// sweep for `Some(n)` with `n <= OWN_LABEL_SEARCH_BOUND`, but skipping it
+/// there would only save a few thousand short-lived allocations at most
+/// (see the const's doc comment), not worth the extra branch.
 fn label_is_pall8t_own(label: &str, base: &str, tab_number: Option<usize>) -> bool {
-    if tab_number.is_none_or(|n| n > OWN_LABEL_SEARCH_BOUND)
-        && candidates(base, tab_number).any(|c| c == label)
-    {
-        return true;
-    }
-    (1..=OWN_LABEL_SEARCH_BOUND).any(|n| candidates(base, Some(n)).any(|c| c == label))
+    candidates(base, tab_number).any(|c| c == label)
+        || (1..=OWN_LABEL_SEARCH_BOUND).any(|n| candidates(base, Some(n)).any(|c| c == label))
 }
 
 /// The first of [`candidates`] no live agent already answers to, so
@@ -449,21 +439,9 @@ pub fn name_pane(req: &Request<'_>) {
     // parsing the id directly.
     let number = resolved_number(insight.as_ref().and_then(|(_, i)| i.number), req.tab_id);
     let mut kept_label = None;
-    let to_label = match insight {
-        Some((
-            tab_id,
-            TabInsight {
-                label: TabLabel::Ours,
-                ..
-            },
-        )) => Some(tab_id),
-        Some((
-            _,
-            TabInsight {
-                label: TabLabel::Theirs(label),
-                ..
-            },
-        )) => {
+    let to_label = match insight.map(|(tab_id, insight)| (tab_id, insight.label)) {
+        Some((tab_id, TabLabel::Ours)) => Some(tab_id),
+        Some((_, TabLabel::Theirs(label))) => {
             kept_label = Some(label);
             None
         }
@@ -1309,13 +1287,12 @@ mod tests {
         );
     }
 
-    /// `mutation testing pin`: the sweep in [`label_is_pall8t_own`] only
-    /// ever tries `1..=OWN_LABEL_SEARCH_BOUND`, so a position *beyond* the
-    /// bound is reachable only through the function's direct check on
-    /// `tab_number` itself — every other test here uses an in-bound
-    /// position, where that guard is redundant with the sweep and so
-    /// invisible to `cargo mutants` (a mutated `>`/`&&`/`==` there changes
-    /// no test's outcome). This is the one case that actually exercises it.
+    /// The sweep in [`label_is_pall8t_own`] only ever tries
+    /// `1..=OWN_LABEL_SEARCH_BOUND`, but the function's direct check on
+    /// `tab_number` itself has no such ceiling — so a position beyond the
+    /// bound is still recognized when it's an *exact* match, just not
+    /// reachable through the drift-tolerant sweep the way an in-bound
+    /// position is.
     #[test]
     fn a_position_beyond_the_bound_is_recognized_only_by_exact_match() {
         let far = OWN_LABEL_SEARCH_BOUND + 5;
