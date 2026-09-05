@@ -64,7 +64,7 @@ stayed blocked a further **121 s**.
    `working`, it is simply still working; if it went `blocked`, it is waiting on
    an approval dialog, and `--wait` returns that state rather than hanging.
 3. **The bridge, last.** Every forwarded request is audit-logged on the host to
-   `~/.pall8t/logs/herdr-relay-<container>-<pid>.log`: a `start` line, then one
+   `~/.pall8t/logs/herdr-relay-<container>.log` (the container name already ends in the run's pid): a `start` line, then one
    timestamped JSON line per forwarded request — which tells the human exactly
    when each call crossed, and so whether a gap is before or after the bridge.
    The bridge is a byte pump with no buffering: the same delegation measured
