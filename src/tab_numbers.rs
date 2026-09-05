@@ -440,8 +440,14 @@ fn write_state(path: &Path, state: &State) -> anyhow::Result<()> {
 /// the lost update.
 ///
 /// `flock` and not a lock file's existence, because the kernel drops it when
-/// a run is killed mid-allocation.
-struct Lock(std::fs::File);
+/// a run is killed mid-allocation — and for the same reason there is no
+/// explicit unlock here. An `flock` is released when the last descriptor on
+/// the open file description closes, so dropping the file *is* the release;
+/// an `LOCK_UN` before it would be a no-op that reads like the thing doing
+/// the work.
+struct Lock {
+    _file: std::fs::File,
+}
 
 impl Lock {
     /// Non-blocking, retried up to [`LOCK_TRIES`] times. The hold is
@@ -459,7 +465,7 @@ impl Lock {
             .write(true)
             .open(path)
             .ok()?;
-        for attempt in 0..LOCK_TRIES {
+        for _ in 0..LOCK_TRIES {
             // SAFETY: `file` owns the fd for the whole call.
             let taken = unsafe {
                 libc::flock(
@@ -468,25 +474,16 @@ impl Lock {
                 )
             } == 0;
             if taken {
-                return Some(Lock(file));
+                return Some(Lock { _file: file });
             }
-            if attempt + 1 < LOCK_TRIES {
-                std::thread::sleep(LOCK_RETRY);
-            }
+            // Sleeps once more than strictly needed, after the last failed
+            // try. Skipping that would mean a branch whose only effect is
+            // 25 ms on a path that has already spent half a second failing
+            // — untestable by construction, and not worth an untested
+            // branch in a lock.
+            std::thread::sleep(LOCK_RETRY);
         }
         None
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        // SAFETY: same fd, still owned by `self.0`.
-        unsafe {
-            libc::flock(
-                std::os::unix::io::AsRawFd::as_raw_fd(&self.0),
-                libc::LOCK_UN,
-            );
-        }
     }
 }
 
@@ -640,19 +637,26 @@ mod tests {
     #[test]
     fn a_different_base_counts_separately_even_in_the_same_tab() {
         let srv = server(1);
-        let (foo, state) = allocate(State::default(), Some(&srv), &alloc("foo", "w:t1"));
-        let (web, state) = allocate(state, Some(&srv), &alloc("web", "w:t1"));
+        let (_, state) = allocate(State::default(), Some(&srv), &alloc("foo", "w:t1"));
+        // The second tab is what makes this test bite: its recorded number
+        // is 2, so a reused record and a fresh `web` sequence give
+        // different answers. Had the rename happened in `w:t1`, whose
+        // record is 1, both would have said 1 and the guard below could
+        // have been dropped without a test noticing.
+        let (foo, state) = allocate(state, Some(&srv), &alloc("foo", "w:t2"));
+        let (web, state) = allocate(state, Some(&srv), &alloc("web", "w:t2"));
         assert_eq!(
             (foo, web),
-            (1, 1),
-            "`[herdr] agent_name` changing in one tab starts that name's own \
-             sequence — `web-1` is not taken just because `foo-1` was"
+            (2, 1),
+            "`[herdr] agent_name` changing starts that name's own sequence — \
+             `web-1` is not taken just because `foo-1` was, and the number \
+             this tab held under its old base belongs to the old base's count"
         );
-        let (foo_again, _) = allocate(state, Some(&srv), &alloc("foo", "w:t2"));
+        let (foo_again, _) = allocate(state, Some(&srv), &alloc("foo", "w:t3"));
         assert_eq!(
-            foo_again, 2,
+            foo_again, 3,
             "and the base the tab used to answer to still remembers where it \
-             was: a single shared counter would have said 3 here"
+             was: a single shared counter would have said 2 here"
         );
     }
 
