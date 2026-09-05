@@ -37,6 +37,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no uniqueness on labels and a tab whose agent has exited is invisible to
   `agent.list`.
 
+- **Docs corrected against the code.** The README claimed a project
+  Containerfile builds with its own directory as the build context — ADR-0010
+  moved that to the project root, so `COPY` paths shown as unreachable were
+  in fact the supported ones. The `pall8t init` config skeletons still
+  described `auto_rename`'s suffix as "the tab's number", a scheme
+  [ADR-0011](docs/adr/0011-tab-numbering-state.md) replaced. Also: the herdr
+  section now leads with a sample `[herdr]` block, the four denied host-admin
+  namespaces are named rather than sampled, and the herdr skill points at the
+  relay audit log's real filename.
+
 ### Removed
 
 - **The tmux integration is gone**: the images no longer install tmux or
