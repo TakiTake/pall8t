@@ -37,6 +37,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no uniqueness on labels and a tab whose agent has exited is invisible to
   `agent.list`.
 
+### Removed
+
+- **The tmux integration is gone**: the images no longer install tmux or
+  ship an `/etc/tmux.conf`, and pall8t no longer rewrites a configured
+  `tmux` command when it runs inside a herdr pane. The README section on
+  Claude Code's agent-teams split panes goes with them.
+
+  Nothing about `[run] command` changes shape — a tmux command still runs
+  if tmux is in the image, it is simply no longer provided or special-cased.
+  Two consequences worth knowing:
+
+  - **Breaking: the default image loses tmux**, so `command = ["tmux", …]`
+    against it now fails at launch. Add `tmux` back in your own Containerfile
+    (`~/.pall8t/Containerfile` for every project, `.pall8t/Containerfile`
+    for one) if you want it. An existing `~/.pall8t/Containerfile` is never
+    overwritten, so an already-initialized user keeps tmux until they take
+    it out themselves.
+  - **A configured `tmux` command now reaches the runtime verbatim in a
+    herdr pane**, where before it was replaced with plain `claude`. That
+    substitution also caught tmux commands wrapping a *different* agent,
+    which is one reason it went.
 ## [0.5.0] - 2026-08-29
 
 ### Added

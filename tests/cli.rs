@@ -1141,6 +1141,38 @@ fn run_hands_the_runtime_the_workspace_mount_and_the_configured_command() {
     );
 }
 
+/// pall8t hands the runtime the command the config names, verbatim — in a
+/// herdr pane as anywhere else. Until the tmux integration was dropped, a
+/// configured command whose first token was `tmux` was silently replaced
+/// with plain `claude` here, on the theory that herdr already multiplexes;
+/// it also caught tmux commands wrapping some *other* agent. Nothing
+/// rewrites the command now, and this is what says so.
+#[test]
+fn a_configured_command_reaches_the_runtime_verbatim_inside_a_herdr_pane() {
+    let sb = Sandbox::new("run-herdr-command");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+    sb.write_project_config(
+        "[run]\ncommand = [\"tmux\", \"new\", \"-A\", \"-s\", \"claude\", \"claude\"]\n",
+    );
+
+    let out = sb
+        .command()
+        .arg("run")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "w13:p3")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        fake.called("tmux new -A -s claude claude"),
+        "the configured command is what runs in the sandbox, unrewritten: {}",
+        fake.argv_log()
+    );
+}
+
 /// The whole bridge, assembled: a herdr pane's environment, a host herdr
 /// CLI, a verified cached Linux build, and a real socket to forward to.
 /// `pall8t run` must announce the pane's agent to herdr, spawn the relay,

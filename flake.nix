@@ -58,7 +58,7 @@
         # see the Containerfile).
         sandbox-tools = pkgs.buildEnv {
           name = "pall8t-sandbox-tools";
-          paths = with pkgs; [ git ripgrep jq less vim tmux gh nodejs_22 ];
+          paths = with pkgs; [ git ripgrep jq less vim gh nodejs_22 ];
         };
 
         default = rust-toolchain;
