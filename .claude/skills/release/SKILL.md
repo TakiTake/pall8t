@@ -27,13 +27,22 @@ Two things this skill adds on top:
 
 - Decide `$VERSION` from this skill's argument if given, otherwise ask
   before invoking `/bump`.
-- After `/bump` opens the PR, run the review loop (`/code-review`,
-  `/skeptical-review`) and fix findings until both come back clean.
-  `/bump` runs `local-review` on the diff it creates; every revision you
-  push on top of that is a diff nobody has reviewed, so run it again
-  before each push, per `CLAUDE.md`.
+- After `/bump` opens the PR, run `/code-review` on it and fix what it
+  finds. `/bump` runs `local-review` on the diff it creates; every
+  revision you push on top of that is a diff nobody has reviewed, so run
+  that again before each push, per `CLAUDE.md`. Findings from a reviewer
+  on the PR itself go through the `review-loop` skill like any other.
+- The bots do not review this PR unprompted. CodeRabbit's automatic
+  review is off (`.coderabbit.yaml`), so it reviews only when someone
+  comments `@coderabbitai review` — the human's call, per `CLAUDE.md` —
+  and the Codex workflow, while it does run and report green, skips every
+  step until an `OPENAI_API_KEY` secret exists. Waiting for either review
+  to arrive on its own is waiting forever.
 
-**Do not merge the PR.**
+**Do not merge the PR.** If it turns out to be merged already when this
+step runs — `/release` invoked after the human merged the bump — say what
+review the diff did and didn't get, and carry on from step 2 rather than
+reopening it.
 
 ## 2. (user) Merge and tag
 
