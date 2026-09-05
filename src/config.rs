@@ -188,6 +188,21 @@ pub(crate) fn logs_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// `~/.pall8t/state`, created on demand — where the small JSON files
+/// pall8t writes for itself and reads back on a later run live. Sibling
+/// of [`logs_dir`], and named here for the same reason: two callers
+/// spelling the join out themselves is how they drift.
+///
+/// Deliberately neither of the two neighbours it could have joined.
+/// `logs/` is append-only human artifacts nobody parses; `config.toml`
+/// at the root is the *user's* file, and burying machine state beside it
+/// invites editing one while meaning the other.
+pub(crate) fn state_dir() -> Result<PathBuf> {
+    let dir = pall8t_root()?.join("state");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 pub fn global_path() -> Result<PathBuf> {
     Ok(pall8t_root()?.join("config.toml"))
 }
