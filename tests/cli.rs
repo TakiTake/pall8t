@@ -1761,6 +1761,40 @@ fn a_state_file_from_a_newer_pall8t_is_never_clobbered() {
     );
 }
 
+/// "Absent" and "there but unreadable" must not collapse into one quiet
+/// path. The first is every first run and says nothing; the second resets
+/// every number in the project, and doing that silently would look like
+/// pall8t inventing it.
+///
+/// The state path is made a *directory* rather than chmod'd unreadable, so
+/// the read fails the same way for any user the suite runs as, root
+/// included.
+#[test]
+fn a_state_file_that_cannot_be_read_says_so() {
+    let world = naming_world("run-naming-unreadable");
+    std::fs::create_dir_all(world.state_path()).unwrap();
+    world.set_tabs(&tab_list_with_label("1"));
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains("cannot read") && err.contains("numbering"),
+        "a state file that exists and cannot be read is reported. Treating \
+         every read error as a missing file would hide it behind the one \
+         case that is genuinely unremarkable: {err}"
+    );
+    assert!(
+        err.contains(r#"naming this tab "demo-1""#),
+        "and the run still names the tab -- losing the state costs the name \
+         its number at worst, never the run: {err}"
+    );
+    assert!(
+        err.contains("numbers will repeat until this is fixed"),
+        "the number could not be recorded either, since the same path is \
+         unwritable, and that is the consequence worth telling the user \
+         about rather than a bare IO error: {err}"
+    );
+}
+
 /// The opposite decision, and the reason it is the opposite: a file this
 /// version simply cannot read is not evidence that another version needs
 /// it. Refusing to write over it would leave numbering broken forever.
