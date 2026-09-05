@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Development
+
+- **The `/release` skill's review step named a skill that doesn't exist.**
+  Step 1 told the agent to run `/code-review` and `/skeptical-review` "until
+  both come back clean"; there is no `/skeptical-review` in this repo, so
+  half the instruction could never be followed and the step's own success
+  condition was unreachable. It now names `/code-review`, `local-review`,
+  and `review-loop` — the three that exist — and records that neither bot
+  reviews a release PR unprompted since CodeRabbit's automatic review went
+  off, so nothing is waited on that will never arrive. Also: what to do when
+  the bump PR is already merged by the time `/release` runs, which is how
+  0.6.0 actually went.
+
+  `docs/release.md` loses its "first release only" note about the tap repo
+  not existing yet — it has existed since 0.1.0 — and says instead that the
+  tap push is gated to the user, which is the thing an agent actually needs
+  to know there.
+
 ## [0.6.0] - 2026-09-05
 
 ### Changed
