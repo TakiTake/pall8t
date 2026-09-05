@@ -47,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespaces are named rather than sampled, and the herdr skill points at the
   relay audit log's real filename.
 
+- **CodeRabbit reviews on demand only.** With the trial over, the free plan
+  meters reviews, so `.coderabbit.yaml` turns off automatic review and chat
+  auto-reply: a review runs when someone comments `@coderabbitai review`
+  (or `full review`) on the PR, and CodeRabbit answers a comment that
+  addresses it directly. Nothing about how findings are handled changes —
+  the `review-loop` skill still verifies each one before acting.
+
 ### Removed
 
 - **The tmux integration is gone**: the images no longer install tmux or
