@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-05
+
 ### Changed
 
 - **`[herdr] auto_rename`'s tab/agent number is now pall8t's own counter**,
@@ -22,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renumbered every later one, so a name written yesterday stopped meaning
   the tab it was written for, and a new tab landed on a name an older tab
   was still wearing.
+
   A number is now handed out once and never reused while one herdr server
   run lasts, so a tab keeps its name for its whole life. pall8t records the
   counters in `~/.pall8t/state/herdr-naming.json` — its first durable state
@@ -31,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restarted counter starts past the labels still on screen, so a reset
   lands on 1 only when nothing is left wearing one. Numbering no longer
   depends on any herdr call succeeding.
+
 - **A name is checked against the labels the other tabs already wear**, not
   only against the names live agents answer to. Two tabs could otherwise
   end up reading the same thing — as two did, live — because herdr enforces
@@ -75,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     herdr pane**, where before it was replaced with plain `claude`. That
     substitution also caught tmux commands wrapping a *different* agent,
     which is one reason it went.
+
 ## [0.5.0] - 2026-08-29
 
 ### Added
@@ -402,7 +407,8 @@ container home.
   management (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in
   favor of the shared-home mode.
 
-[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.6.0
 [0.5.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.5.0
 [0.4.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.4.0
 [0.3.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.3.0
