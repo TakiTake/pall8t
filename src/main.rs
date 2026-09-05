@@ -313,6 +313,7 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
             herdr_bin: env.herdr_bin(),
             pane_id: &env.pane_id,
             tab_id: env.tab_id.as_deref(),
+            socket_path: env.socket_path.as_deref(),
             workspace_dir: &cwd,
             cfg: &cfg.herdr,
             expect_agent: herdr_agent.is_some(),

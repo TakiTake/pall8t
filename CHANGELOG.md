@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`[herdr] auto_rename`'s tab/agent number is now pall8t's own counter**,
+  reset when the herdr server restarts (issues #76 and its follow-up;
+  [ADR-0011](docs/adr/0011-tab-numbering-state.md)). It replaces two
+  schemes that both read a number out of herdr, and both got a tab's name
+  wrong: the tab id's counter never restarts with the server (herdr
+  persists it in `session.json`), so a fresh project opened at whatever
+  count the workspace had already reached — and it silently produced no
+  number at all past a workspace's ninth tab, since herdr encodes tab ids
+  in base-32 and `tA` does not parse as 10. The tab's *position* restarts
+  correctly but belongs to the list rather than the tab: closing one tab
+  renumbered every later one, so a name written yesterday stopped meaning
+  the tab it was written for, and a new tab landed on a name an older tab
+  was still wearing.
+  A number is now handed out once and never reused while one herdr server
+  run lasts, so a tab keeps its name for its whole life. pall8t records the
+  counters in `~/.pall8t/state/herdr-naming.json` — its first durable state
+  of its own — keyed to the server run by the API socket's identity, since
+  herdr exposes no session id, pid or start time. A tab herdr restored
+  keeps the number its own label carries rather than being renamed, and a
+  restarted counter starts past the labels still on screen, so a reset
+  lands on 1 only when nothing is left wearing one. Numbering no longer
+  depends on any herdr call succeeding.
+- **A name is checked against the labels the other tabs already wear**, not
+  only against the names live agents answer to. Two tabs could otherwise
+  end up reading the same thing — as two did, live — because herdr enforces
+  no uniqueness on labels and a tab whose agent has exited is invisible to
+  `agent.list`.
+
 ## [0.5.0] - 2026-08-29
 
 ### Added

@@ -5,5 +5,6 @@ pub mod image;
 pub mod mounts;
 pub mod naming;
 pub mod relay;
+pub mod tab_numbers;
 pub mod util;
 pub mod worktree;

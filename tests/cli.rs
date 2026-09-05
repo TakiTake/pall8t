@@ -1246,27 +1246,39 @@ fn a_run_inside_a_herdr_pane_builds_the_socket_bridge() {
     drop(host_herdr);
 }
 
-/// One opted-in `pall8t run` in herdr pane `w13:p3`, whose tab `w13:t2` is
-/// the sole tab of `w13` — so herdr's own auto label for it is `"1"` and
-/// `tab_label` decides whether pall8t sees the label as its own to take.
-/// The tab's *number* is 2 while its position is 1, which is what makes
-/// the expected name `demo-2` rather than `demo-1`.
+/// `herdr tab list`'s reply for a workspace `w13` whose sole tab is
+/// `w13:t2`, carrying `tab_label`. The `number` field is deliberately 2,
+/// different from the tab's position (1) — pall8t's own suffix now reads
+/// the *position*, the same number herdr's own auto label already shows
+/// (issue #76), so a run against this fixture expects `demo-1`; a
+/// regression here would mean something started reading the id-encoded
+/// `number` field again.
+fn tab_list_with_label(tab_label: &str) -> String {
+    format!(
+        r#"{{"id":"cli:tab:list","result":{{"tabs":[{{"agent_status":"unknown","focused":true,"label":"{tab_label}","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}}],"type":"tab_list"}}}}"#
+    )
+}
+
+/// A sandbox wired for the naming tests: a built image, an opted-in
+/// project config, a stand-in host `herdr`, an empty `agent list`, and a
+/// file standing in for herdr's API socket.
 ///
-/// Returns the sandbox (for the log and argv files the detached agent
-/// namer writes after the run returns) and the run's stderr.
-fn opted_in_naming_run(sandbox: &str, tab_label: &str) -> (Sandbox, String) {
-    let sb = Sandbox::new(sandbox);
+/// The socket is a plain file, never connected to — `tab_numbers` only
+/// *stats* it, because a herdr server run is identified by the socket's
+/// `(dev, ino, birthtime)` and nothing else. Replacing the file is
+/// therefore exactly how a test says "a different herdr server is
+/// listening now".
+struct NamingWorld {
+    sb: Sandbox,
+    herdr_bin: PathBuf,
+    tag: String,
+}
+
+fn naming_world(name: &str) -> NamingWorld {
+    let sb = Sandbox::new(name);
     let fake = FakeRuntime::current(&sb);
     let tag = build_once(&sb, &fake);
-    fake.set_images(std::slice::from_ref(&tag));
     let herdr_bin = fake_host_herdr(&sb, "0.8.2");
-    std::fs::write(
-        sb.root.join("herdr-tab-list.json"),
-        format!(
-            r#"{{"id":"cli:tab:list","result":{{"tabs":[{{"agent_status":"unknown","focused":true,"label":"{tab_label}","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}}],"type":"tab_list"}}}}"#
-        ),
-    )
-    .unwrap();
     std::fs::write(
         sb.root.join("herdr-agent-list.json"),
         r#"{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}"#,
@@ -1275,20 +1287,129 @@ fn opted_in_naming_run(sandbox: &str, tab_label: &str) -> (Sandbox, String) {
     sb.write_project_config(
         "[herdr]\nsandbox = \"off\"\nauto_rename = true\nagent_name = \"demo\"\n",
     );
-    fake.vanish_after_image_list();
+    let world = NamingWorld { sb, herdr_bin, tag };
+    world.restart_herdr_server();
+    world
+}
 
-    let out = sb
-        .command()
-        .args(["run", "--", "claude"])
-        .env("HERDR_ENV", "1")
-        .env("HERDR_PANE_ID", "w13:p3")
-        .env("HERDR_TAB_ID", "w13:t2")
-        .env("HERDR_WORKSPACE_ID", "w13")
-        .env("HERDR_BIN_PATH", &herdr_bin)
-        .output()
-        .unwrap();
-    let err = stderr(&out);
-    (sb, err)
+/// So the naming tests can keep reaching the sandbox's own paths
+/// (`sb.root`, `sb.pall8t_root()`) through the world that owns it.
+impl std::ops::Deref for NamingWorld {
+    type Target = Sandbox;
+    fn deref(&self) -> &Sandbox {
+        &self.sb
+    }
+}
+
+impl NamingWorld {
+    fn socket(&self) -> PathBuf {
+        self.sb.root.join("herdr.sock")
+    }
+
+    /// Replaces the socket file, so its inode is a different one — what
+    /// `tab_numbers` reads as "a new herdr server run".
+    fn restart_herdr_server(&self) {
+        let _ = std::fs::remove_file(self.socket());
+        std::fs::write(self.socket(), b"").unwrap();
+    }
+
+    fn set_tabs(&self, body: &str) {
+        std::fs::write(self.sb.root.join("herdr-tab-list.json"), body).unwrap();
+    }
+
+    fn state_path(&self) -> PathBuf {
+        self.sb
+            .pall8t_root()
+            .join("state")
+            .join("herdr-naming.json")
+    }
+
+    fn seed_state(&self, body: &str) {
+        let path = self.state_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn state(&self) -> serde_json::Value {
+        let text = std::fs::read_to_string(self.state_path()).unwrap_or_default();
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// The counters recorded for this world's socket — the only session
+    /// key any of these tests uses.
+    fn session(&self) -> serde_json::Value {
+        self.state()["sessions"][self.socket().to_str().unwrap()].clone()
+    }
+
+    /// The `ServerRun` shape `tab_numbers` would record for the socket as
+    /// it stands now, built from the test's own stat of the same file, so
+    /// a seeded state can claim to be either this server run or another.
+    fn server_run_json(&self) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(self.socket()).unwrap();
+        let birth = m
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        let (secs, nanos) = birth.map_or(("null".to_string(), "null".to_string()), |d| {
+            (d.as_secs().to_string(), d.subsec_nanos().to_string())
+        });
+        format!(
+            r#"{{"dev":{},"ino":{},"birth_secs":{secs},"birth_nanos":{nanos}}}"#,
+            m.dev(),
+            m.ino()
+        )
+    }
+
+    /// One `pall8t run` in `tab_id`, returning its stderr. The runtime is
+    /// re-armed each time, since `vanish_after_image_list` consumes it.
+    fn run(&self, tab_id: &str) -> String {
+        self.run_command(tab_id, "claude")
+    }
+
+    fn run_command(&self, tab_id: &str, command: &str) -> String {
+        let fake = FakeRuntime::current(&self.sb);
+        fake.set_images(std::slice::from_ref(&self.tag));
+        fake.vanish_after_image_list();
+        let out = self
+            .sb
+            .command()
+            .args(["run", "--", command])
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", "w13:p3")
+            .env("HERDR_TAB_ID", tab_id)
+            .env("HERDR_WORKSPACE_ID", "w13")
+            .env("HERDR_BIN_PATH", &self.herdr_bin)
+            .env("HERDR_SOCKET_PATH", self.socket())
+            .output()
+            .unwrap();
+        stderr(&out)
+    }
+}
+
+/// A state file whose counters claim to belong to the herdr server run
+/// currently listening on this world's socket. `body` is the rest of the
+/// session object (`"next": {…}, "tabs": {…}`).
+fn seeded_state(world: &NamingWorld, body: &str) -> String {
+    format!(
+        r#"{{"version":1,"sessions":{{"{}":{{"server":{},"last_used":1,{body}}}}}}}"#,
+        world.socket().to_str().unwrap(),
+        world.server_run_json()
+    )
+}
+
+/// One opted-in `pall8t run` in herdr pane `w13:p3` of workspace `w13`,
+/// replaying `tab_list_body` for `herdr tab list` — the raw reply body, so
+/// a caller can pass a well-formed fixture (see [`tab_list_with_label`])
+/// or deliberately broken content to exercise `fetch_tabs`'s failure path.
+///
+/// Returns the world (for the log and argv files the detached agent namer
+/// writes after the run returns) and the run's stderr.
+fn opted_in_naming_run(sandbox: &str, tab_id: &str, tab_list_body: &str) -> (NamingWorld, String) {
+    let world = naming_world(sandbox);
+    world.set_tabs(tab_list_body);
+    let err = world.run(tab_id);
+    (world, err)
 }
 
 /// Naming, opted into (issue #71). `sandbox = "off"` on purpose: naming is
@@ -1298,17 +1419,27 @@ fn opted_in_naming_run(sandbox: &str, tab_label: &str) -> (Sandbox, String) {
 /// relay's job.
 #[test]
 fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
+    let world = naming_world("run-naming");
+    // A count already under way for the server run that is listening. The
+    // number is seeded rather than left at 1 so this assertion can only
+    // pass one way: 1 is also what the tab's position, its id-encoded
+    // number and an empty counter would all have produced, and a test that
+    // cannot tell those apart would have watched the numbering move
+    // between them without noticing.
+    world.seed_state(&seeded_state(&world, r#""next":{"demo":7},"tabs":{}"#));
     // A tab still on herdr's own auto label ("1") is pall8t's to rename.
-    let (sb, err) = opted_in_naming_run("run-naming", "1");
+    world.set_tabs(&tab_list_with_label("1"));
+    let err = world.run("w13:t2");
+    let sb = &world;
     assert!(
-        err.contains(r#"naming this tab "demo-2""#)
+        err.contains(r#"naming this tab "demo-7""#)
             && err.contains("its agent takes the same name"),
         "the run says what it named, with [herdr] agent_name overriding the \
-         directory basename and the tab's number as the suffix: {err}"
+         directory basename and pall8t's own counter as the suffix: {err}"
     );
     let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
     assert!(
-        calls.contains("tab rename w13:t2 demo-2"),
+        calls.contains("tab rename w13:t2 demo-7"),
         "the tab is renamed before the exec — it needs no detected agent, so \
          the human sees the right label from the moment the run starts: {calls}"
     );
@@ -1322,7 +1453,7 @@ fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
         std::time::Duration::from_secs(10),
     );
     assert!(
-        log.contains(r#"named the agent "demo-2""#),
+        log.contains(r#"named the agent "demo-7""#),
         "the agent gets the same name as the tab, from a process that \
          outlives the exec: {log}"
     );
@@ -1330,7 +1461,7 @@ fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
     // calls land in the log only once the wait above has seen it work.
     let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
     assert!(
-        calls.contains("agent rename w13:p3 demo-2"),
+        calls.contains("agent rename w13:p3 demo-7"),
         "and it is a real `agent rename` on the pane that does it — the log \
          line alone would still be written by a rename that never happened: \
          {calls}"
@@ -1355,7 +1486,11 @@ fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
 fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
     // "release work" is neither herdr's auto label nor a name pall8t
     // could have written here — only a human types it.
-    let (sb, err) = opted_in_naming_run("run-naming-mine", "release work");
+    let (sb, err) = opted_in_naming_run(
+        "run-naming-mine",
+        "w13:t2",
+        &tab_list_with_label("release work"),
+    );
     let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
     assert!(
         !calls.contains("tab rename"),
@@ -1363,7 +1498,7 @@ fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
     );
     assert!(
         err.contains(r#"this tab keeps its label "release work""#)
-            && err.contains(r#"address the agent as "demo-2""#),
+            && err.contains(r#"address the agent as "demo-1""#),
         "and the run must say so rather than claiming a tab it did not name — \
          naming both strings is what shows the human that the label they will \
          read off the tab is not the name that reaches this agent: {err}"
@@ -1374,13 +1509,317 @@ fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
         std::time::Duration::from_secs(10),
     );
     assert!(
-        log.contains(r#"named the agent "demo-2""#),
+        log.contains(r#"named the agent "demo-1""#),
         "the agent half is independent of the tab half and still runs: {log}"
     );
     let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
     assert!(
-        calls.contains("agent rename w13:p3 demo-2") && !calls.contains("tab rename"),
+        calls.contains("agent rename w13:p3 demo-1") && !calls.contains("tab rename"),
         "the agent really is renamed, and the tab really is not: {calls}"
+    );
+}
+
+/// Regression pin, from live testing: two tabs wearing the same label is
+/// the failure this whole line of work started from, and the labels the
+/// *other* tabs wear are what stop it.
+///
+/// The state below is one a live herdr actually reached (both tabs
+/// carrying `vpnp-2` in `session.json`), reproduced with this suite's
+/// `demo` base. Numbering alone cannot prevent it: with no record of
+/// either tab, both adopt the number their own restored label carries, so
+/// both ask for `demo-2`. `agent.list` cannot report the clash either --
+/// the older tab's agent had exited, which is why the fixture leaves it
+/// empty. The *label* is the only thing left that can bump the name.
+#[test]
+fn a_label_another_tab_already_wears_is_not_taken_twice() {
+    let collided = r#"{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"unknown","focused":false,"label":"demo-2","number":1,"pane_count":1,"tab_id":"w13:t1","workspace_id":"w13"},{"agent_status":"unknown","focused":true,"label":"demo-2","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}],"type":"tab_list"}}"#;
+    let (sb, err) = opted_in_naming_run("run-naming-collided", "w13:t2", collided);
+    assert!(
+        err.contains(r#"naming this tab "demo-2-2""#),
+        "the name has to step past the label the other tab already wears, or \
+         `herdr agent prompt demo-2` reaches whichever of the two herdr picks \
+         and the label a human reads names nothing in particular: {err}"
+    );
+    let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    // Line-exact on both sides: "demo-2" is a prefix of "demo-2-2", so a
+    // substring test would call the colliding rename a pass.
+    assert!(
+        calls.lines().any(|l| l == "tab rename w13:t2 demo-2-2")
+            && !calls.lines().any(|l| l == "tab rename w13:t2 demo-2"),
+        "and it is the bumped name that reaches `tab.rename`: {calls}"
+    );
+    let log = wait_for_line(
+        &sb.pall8t_root().join("logs").join("herdr-naming.log"),
+        "named the agent",
+        std::time::Duration::from_secs(10),
+    );
+    assert!(
+        log.contains(r#"named the agent "demo-2-2""#),
+        "both halves take the same stepped-past name -- a tab and an agent \
+         that disagree is the drift naming exists to remove: {log}"
+    );
+}
+
+/// Regression pin, rewritten for the numbering rewrite. It used to check
+/// that a broken `tab.list` fell *back* to the tab id for a number -- a
+/// patch over the fact that position-based numbering depended on that call
+/// succeeding. It now checks something stronger: the dependency is gone by
+/// construction, because the number comes from pall8t's own state file and
+/// no herdr call takes part in producing it.
+#[test]
+fn a_broken_herdr_tab_list_still_names_the_agent() {
+    let world = naming_world("run-naming-tablist-broken");
+    // A count already under way for this very server run, so the name the
+    // run produces can only have come from the state file.
+    world.seed_state(&seeded_state(&world, r#""next":{"demo":7},"tabs":{}"#));
+    // "not json": simulates `tab.list`'s reply shape having changed, or any
+    // other failure `fetch_tabs` treats the same way.
+    world.set_tabs("not json");
+    let err = world.run("w13:t9");
+
+    assert!(
+        err.contains("could not make sense of the herdr tab list"),
+        "the failure is surfaced, not swallowed: {err}"
+    );
+    assert!(
+        !err.contains("naming this tab"),
+        "with no usable tab list, ownership of the label is unknown, so \
+         the tab itself is never touched: {err}"
+    );
+    let log = wait_for_line(
+        &world.pall8t_root().join("logs").join("herdr-naming.log"),
+        "named the agent",
+        std::time::Duration::from_secs(10),
+    );
+    assert!(
+        log.contains(r#"named the agent "demo-7""#),
+        "the agent takes the number the state file was already up to. The \
+         old suffix needed `tab.list` to succeed and fell back to parsing \
+         the tab id when it didn't; there is nothing to fall back to now \
+         because there was never a herdr call in the way: {log}"
+    );
+    assert_eq!(
+        world.session()["tabs"]["w13:t9"]["number"],
+        7,
+        "and the number is recorded against the tab, so a rerun here keeps it"
+    );
+}
+
+/// A tab keeps the name it already advertises. Without this a rerun would
+/// take a fresh number, the tab would be relabeled, and every message
+/// already addressed to the old name would miss.
+#[test]
+fn a_second_run_in_the_same_tab_reuses_its_number() {
+    let world = naming_world("run-naming-rerun");
+    world.set_tabs(&tab_list_with_label("1"));
+    let first = world.run("w13:t2");
+    assert!(
+        first.contains(r#"naming this tab "demo-1""#),
+        "the first run in a fresh session starts the count at 1: {first}"
+    );
+
+    // Run 2 sees the label run 1 left, exactly as herdr would report it.
+    world.set_tabs(&tab_list_with_label("demo-1"));
+    let second = world.run("w13:t2");
+    assert!(
+        second.contains(r#"naming this tab "demo-1""#),
+        "the second run in the same tab must land on the same name, not \
+         walk the counter forward: {second}"
+    );
+    assert_eq!(
+        world.session()["next"]["demo"],
+        2,
+        "and the counter is still 2 -- a rerun consumes nothing, or a tab \
+         reopened and rerun a few times would push every later tab's \
+         number up for no reason"
+    );
+    assert_eq!(
+        world.session()["tabs"]["w13:t2"]["number"],
+        1,
+        "one record for the one tab, still holding its number"
+    );
+}
+
+/// The reset the whole design is built around: a new herdr server run
+/// starts the count over. herdr exposes no session id, so this turns
+/// entirely on the API socket being re-bound -- a different inode is the
+/// only evidence there is.
+#[test]
+fn a_new_herdr_server_starts_the_numbering_over() {
+    let world = naming_world("run-naming-restart");
+    world.set_tabs(&tab_list_with_label("1"));
+    world.seed_state(&seeded_state(
+        &world,
+        r#""next":{"demo":8},"tabs":{"w13:t2":{"base":"demo","number":7}}"#,
+    ));
+
+    // The server that was listening when those numbers were counted is
+    // gone; a new one bound a new socket in its place.
+    world.restart_herdr_server();
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains(r#"naming this tab "demo-1""#),
+        "a fresh herdr server means a fresh count -- the 8 the old run had \
+         reached belongs to a server that is no longer listening: {err}"
+    );
+    assert_eq!(
+        world.session()["tabs"]["w13:t2"]["number"],
+        1,
+        "the old per-tab record went with it. Keeping it would have handed \
+         this tab 7 while the counter walked up from 1 to hand 7 out again"
+    );
+}
+
+/// The other half of the reset: herdr restores every tab's `custom_name`
+/// from `session.json`, so a count that restarted blindly at 1 would be
+/// handing out names that are still on screen.
+///
+/// Two rules meet here. The tab keeps the number its own restored label
+/// carries rather than being renamed, and the counter starts past the
+/// highest number any label on screen uses -- so the next tab continues
+/// the sequence a human can already see instead of colliding into it.
+#[test]
+fn a_restored_label_is_kept_and_the_count_continues_past_it() {
+    let world = naming_world("run-naming-restored");
+    // What herdr restored after the restart: our tab still labeled
+    // `demo-3`, a neighbour still labeled `demo-5`. No state file at all,
+    // as if pall8t had never run on this machine.
+    let restored = r#"{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"unknown","focused":false,"label":"demo-5","number":1,"pane_count":1,"tab_id":"w13:t1","workspace_id":"w13"},{"agent_status":"unknown","focused":true,"label":"demo-3","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}],"type":"tab_list"}}"#;
+    world.set_tabs(restored);
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains(r#"naming this tab "demo-3""#),
+        "the tab keeps the number its own label already carries. Renaming a \
+         restored `demo-3` to `demo-1` would break every reference to it \
+         for no gain: {err}"
+    );
+    assert_eq!(
+        world.session()["next"]["demo"],
+        6,
+        "and the counter sits past `demo-5`, the highest number on screen -- \
+         not at 4, which is merely past the number this tab took, and would \
+         walk onto the neighbour's label two tabs from now"
+    );
+    assert!(
+        !err.contains("numbering"),
+        "and no warning: there was no state file, which is what every first \
+         run looks like. Only a file that exists and cannot be read is worth \
+         saying something about: {err}"
+    );
+}
+
+/// A run that names nothing must not consume a number, or the count climbs
+/// on runs that produced no name at all -- and the numbers a human reads
+/// grow gaps nothing explains.
+#[test]
+fn a_run_that_names_nothing_burns_no_number() {
+    let world = naming_world("run-naming-noop");
+    // A label a human chose, so the tab is not pall8t's to rename, and a
+    // command herdr recognizes no agent in, so no agent is coming either.
+    world.set_tabs(&tab_list_with_label("release work"));
+    let err = world.run_command("w13:t2", "./not-an-agent.sh");
+
+    assert!(
+        !err.contains("naming this tab") && !err.contains("address the agent as"),
+        "nothing was named: {err}"
+    );
+    assert!(
+        !world.state_path().exists(),
+        "so nothing was counted either -- the state file was never even \
+         created, which is what pins that the allocation happens *after* \
+         the decision not to name anything"
+    );
+}
+
+/// A state file from a newer pall8t is left exactly as it was. A rollback,
+/// or two builds sharing one `$HOME`, must not have their numbering
+/// silently rewritten by whichever binary ran last.
+#[test]
+fn a_state_file_from_a_newer_pall8t_is_never_clobbered() {
+    let world = naming_world("run-naming-future");
+    let future = r#"{"version":999,"sessions":{},"something_this_version_never_heard_of":true}"#;
+    world.seed_state(future);
+    world.set_tabs(&tab_list_with_label("1"));
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains("written by a newer pall8t (format 999)"),
+        "the run says why it is not numbering, naming the format it will \
+         not touch: {err}"
+    );
+    assert!(
+        err.contains(r#"naming this tab "demo""#),
+        "and it still names the tab, from the bare base -- losing the \
+         number costs the name its suffix, never the run: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(world.state_path()).unwrap(),
+        future,
+        "byte for byte what the newer pall8t wrote"
+    );
+}
+
+/// "Absent" and "there but unreadable" must not collapse into one quiet
+/// path. The first is every first run and says nothing; the second resets
+/// every number in the project, and doing that silently would look like
+/// pall8t inventing it.
+///
+/// The state path is made a *directory* rather than chmod'd unreadable, so
+/// the read fails the same way for any user the suite runs as, root
+/// included.
+#[test]
+fn a_state_file_that_cannot_be_read_says_so() {
+    let world = naming_world("run-naming-unreadable");
+    std::fs::create_dir_all(world.state_path()).unwrap();
+    world.set_tabs(&tab_list_with_label("1"));
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains("cannot read") && err.contains("numbering"),
+        "a state file that exists and cannot be read is reported. Treating \
+         every read error as a missing file would hide it behind the one \
+         case that is genuinely unremarkable: {err}"
+    );
+    assert!(
+        err.contains(r#"naming this tab "demo-1""#),
+        "and the run still names the tab -- losing the state costs the name \
+         its number at worst, never the run: {err}"
+    );
+    assert!(
+        err.contains("numbers will repeat until this is fixed"),
+        "the number could not be recorded either, since the same path is \
+         unwritable, and that is the consequence worth telling the user \
+         about rather than a bare IO error: {err}"
+    );
+}
+
+/// The opposite decision, and the reason it is the opposite: a file this
+/// version simply cannot read is not evidence that another version needs
+/// it. Refusing to write over it would leave numbering broken forever.
+#[test]
+fn a_corrupt_state_file_does_not_stop_the_run() {
+    let world = naming_world("run-naming-corrupt");
+    world.seed_state("{ this is not json");
+    world.set_tabs(&tab_list_with_label("1"));
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains("is not readable as herdr tab numbering state"),
+        "the reset is announced. Every name in the project jumps back down \
+         the count when this happens, and doing that silently would look \
+         like pall8t inventing it: {err}"
+    );
+    assert!(
+        err.contains(r#"naming this tab "demo-1""#),
+        "numbering starts over rather than giving up: {err}"
+    );
+    assert_eq!(
+        world.session()["tabs"]["w13:t2"]["number"],
+        1,
+        "and the unreadable file is replaced with a valid one, so the next \
+         run is back to normal instead of starting over again"
     );
 }
 

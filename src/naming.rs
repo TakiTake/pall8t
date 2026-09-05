@@ -107,17 +107,25 @@ fn base_name(configured: Option<&str>, workspace_dir: &Path) -> String {
     }
 }
 
-/// The tab's `number` out of a tab id — `w13:t3` -> `3`.
+/// The tab's 1-based position within its own workspace's tab list.
 ///
-/// This is deliberately *not* the tab's position: `number` is assigned
-/// from a monotonic counter when the tab is created and encoded straight
-/// into the tab id (`public_tab_id_for_number` is
-/// `format!("{workspace_id}:t{number}")`), so closing or moving tabs never
-/// renumbers it and a name fixed at launch keeps matching its tab. The
-/// position is a different number entirely, and only
-/// [`tab_is_auto_named`] wants that one.
-fn tab_number(tab_id: &str) -> Option<usize> {
-    tab_id.rsplit_once(':')?.1.strip_prefix('t')?.parse().ok()
+/// This is herdr's *own* default label for an unrenamed tab
+/// (`tab_display_name` is `custom_name.unwrap_or_else(|| (tab_idx +
+/// 1).to_string())`), and reading it is the only way to answer "is this
+/// tab still on the label herdr gave it?" — see [`tab_is_auto_named`],
+/// which is now the sole caller.
+///
+/// It is deliberately **not** pall8t's own suffix any more. It was, briefly
+/// (issue #76), and the reason it isn't is that a position belongs to the
+/// list rather than to the tab: closing an earlier tab shifts every later
+/// one, so a name written under it stops meaning the tab it was written
+/// for. [`crate::tab_numbers`] holds what replaced it.
+fn tab_position(tabs: &[TabRow], tab_id: &str) -> Option<usize> {
+    let row = tabs.iter().find(|t| t.tab_id == tab_id)?;
+    tabs.iter()
+        .filter(|t| t.workspace_id == row.workspace_id)
+        .position(|t| t.tab_id == tab_id)
+        .map(|i| i + 1)
 }
 
 /// [`crate::util::cut_at`] plus herdr's own requirement: `"p"` when
@@ -135,10 +143,31 @@ fn capped_to(name: &str, budget: usize) -> String {
 /// `<name>-<counter>`, with the *name* shortened if the pair would exceed
 /// [`AGENT_NAME_MAX`] — the counter is what makes the name unique, so it
 /// is never the part that gets cut.
-fn with_counter(name: &str, counter: usize) -> String {
+pub(crate) fn with_counter(name: &str, counter: usize) -> String {
     let tail = format!("-{counter}");
     let head = capped_to(name, AGENT_NAME_MAX.saturating_sub(tail.len()));
     format!("{head}{tail}")
+}
+
+/// `("foo-2", 3)` out of `"foo-2-3"` — a trailing `-<digits>` group and
+/// the name it was appended to.
+///
+/// The head must be non-empty and the digits must be all of what follows
+/// the final dash, so `"-3"`, `"foo-"` and `"foo-3x"` are not counters.
+/// Splitting is only a candidate generator: whether the split point is
+/// really one pall8t wrote is settled by rebuilding through
+/// [`with_counter`], never by the shape alone. [`crate::tab_numbers`] is
+/// the other caller.
+pub(crate) fn split_counter(s: &str) -> Option<(&str, usize)> {
+    let (head, tail) = s.rsplit_once('-')?;
+    // The digit check is not what `parse` already does: `usize::from_str`
+    // accepts a leading `+`, so without it `foo-+3` would split as counter
+    // 3. An *empty* tail needs no check — `parse` rejects it — and adding
+    // one only looks like a guard.
+    if head.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((head, tail.parse().ok()?))
 }
 
 /// The names to try, in order: `<base>-<tab number>` first, then that
@@ -164,26 +193,60 @@ fn first_candidate(base: &str, tab_number: Option<usize>) -> String {
     }
 }
 
-/// Whether `label` is one pall8t itself could have written in this tab —
-/// exactly the set [`candidates`] walks.
+/// Whether `label` is a name pall8t itself could have written for `base`:
+/// the base as [`with_counter`] would have capped it, followed by a number,
+/// optionally extended once more by the collision walk (`foo-3`, `foo-3-2`)
+/// — or the bare capped base, the name a run with no number available
+/// produces.
 ///
 /// Recognising its own past label is what keeps the tab and the agent from
 /// drifting apart on a *second* run in the same tab. After run 1 the label
-/// reads `foo-2`, which is no longer herdr's auto label, so
+/// reads `foo-3`, which is no longer herdr's auto label, so
 /// [`tab_is_auto_named`] alone would call it a human's and leave it — while
-/// run 2, finding `foo-2` taken by run 1's successor, names its agent
-/// `foo-2-2`. The tab would then advertise a name that reaches somebody
-/// else's agent.
+/// run 2 names its agent something else and the tab ends up advertising a
+/// name that reaches nobody, or worse, somebody else.
 ///
-/// The one false positive is a human who typed exactly a name pall8t would
-/// have picked here; overwriting `foo-2` with `foo-2-2` in that case is
-/// benign, since it stays inside the same name family.
-fn label_is_pall8t_own(label: &str, base: &str, tab_number: Option<usize>) -> bool {
-    candidates(base, tab_number).any(|c| c == label)
+/// **Unbounded in the number, deliberately.** It is tempting to check only
+/// the number this run holds, but that number and the one in the label
+/// routinely disagree: [`crate::tab_numbers`] resets its counter when the
+/// herdr server restarts, while herdr restores every tab's `custom_name`
+/// from `session.json` verbatim. So on the first run after any restart,
+/// every surviving tab's label carries a number from the previous run's
+/// sequence. An exact check would read all of them as a human's work.
+///
+/// Rebuilt through [`with_counter`] rather than pattern-matched, so what
+/// counts as pall8t's own can never drift from what [`candidates`] actually
+/// emits — including the base shortening a long name triggers. Every split
+/// point is tried because a base can itself end in a number
+/// (`agent_name = "api-2"`).
+///
+/// The one false positive is unchanged in kind: a human who typed exactly a
+/// name pall8t would have picked for this base, at some number. Overwriting
+/// it stays inside the same name family.
+pub(crate) fn label_is_pall8t_own(label: &str, base: &str) -> bool {
+    if label == capped_to(base, AGENT_NAME_MAX) {
+        return true;
+    }
+    // `<base>-<n>`, then `<base>-<n>-<k>`: at most two rebuilds, against
+    // the sweep this replaced, which built 50 x COLLISION_TRIES strings.
+    if let Some((_, n)) = split_counter(label) {
+        if with_counter(base, n) == label {
+            return true;
+        }
+    }
+    split_counter(label)
+        .and_then(|(head, _)| split_counter(head).map(|(_, n)| with_counter(base, n) == head))
+        .unwrap_or(false)
 }
 
-/// The first of [`candidates`] no live agent already answers to, so
-/// `herdr agent prompt <name>` always resolves to exactly one agent.
+/// The first of [`candidates`] nothing has already claimed, so `herdr
+/// agent prompt <name>` always resolves to exactly one agent and the label
+/// a human reads off a tab names exactly one tab.
+///
+/// `taken` is both kinds of claim: the names live agents answer to
+/// ([`live_agent_names`]) and the labels other tabs already wear
+/// ([`labels_of_other_tabs`]).
+///
 /// With every candidate taken, the last one is returned anyway: the
 /// rename then fails with herdr's own `agent_name_taken`, which says more
 /// than a name pall8t declined to try.
@@ -251,6 +314,42 @@ fn parse_agent_names(stdout: &str) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// The labels every *other* tab currently wears, read out of the same
+/// `tab.list` snapshot as the rest of [`inspect_tab`].
+///
+/// These are names already spoken for, exactly as a live agent's is. A
+/// position-derived suffix is not unique the way the old id-derived one
+/// was (issue #76): a tab keeps the label it was given at the position it
+/// held *then*, and nothing relabels it afterwards — pall8t only ever
+/// labels the tab it runs in. So a tab that has since shifted down can
+/// wear precisely the name this run's current position would produce, and
+/// `agent.list` cannot see that claim once the old tab's agent has exited.
+/// That is the reported case: closing `vpnp-1` moved the old `vpnp-2` tab
+/// to position 1 with its label intact and its agent gone, so the new tab
+/// at position 2 found nothing taken and became a second `vpnp-2`.
+///
+/// Every workspace, not only this tab's: an agent name resolves across the
+/// whole herdr session, so a duplicate two workspaces away is just as
+/// ambiguous a target.
+///
+/// This tab's own label is excluded — a second run in the same tab must be
+/// free to reuse the name the tab already advertises, which is the whole
+/// point of [`label_is_pall8t_own`].
+///
+/// A snapshot, so it closes the reported hole rather than making labels
+/// unique by construction: two runs starting in different tabs at the same
+/// instant both read a list neither has written to yet, and herdr enforces
+/// nothing on labels (it let the two `vpnp-2` tabs above coexist). The
+/// agent half is where uniqueness is actually enforced — `agent.rename`
+/// answers `agent_name_taken`, which [`rename_with_retries`] walks past —
+/// so the residual race costs a duplicate label, not a misrouted target.
+fn labels_of_other_tabs(tabs: &[TabRow], tab_id: &str) -> BTreeSet<String> {
+    tabs.iter()
+        .filter(|t| t.tab_id != tab_id)
+        .map(|t| t.label.clone())
+        .collect()
+}
+
 /// Whether the tab still carries the label herdr gave it, and may
 /// therefore be renamed — a label a human chose must never be clobbered.
 ///
@@ -267,11 +366,7 @@ fn parse_agent_names(stdout: &str) -> BTreeSet<String> {
 /// is a human who renamed a tab to exactly its own position string.
 fn tab_is_auto_named(tabs: &[TabRow], tab_id: &str) -> Option<bool> {
     let row = tabs.iter().find(|t| t.tab_id == tab_id)?;
-    let position = tabs
-        .iter()
-        .filter(|t| t.workspace_id == row.workspace_id)
-        .position(|t| t.tab_id == tab_id)?
-        + 1;
+    let position = tab_position(tabs, tab_id)?;
     Some(row.label == position.to_string())
 }
 
@@ -304,13 +399,11 @@ fn is_name_taken(err: &str) -> bool {
 ///
 /// [`TabLabel::Unknown`] when the tab isn't in the list at all — not
 /// knowing is a reason to keep the label, not to overwrite it.
-fn tab_label_of(tabs: &[TabRow], tab_id: &str, base: &str, tab_number: Option<usize>) -> TabLabel {
+fn tab_label_of(tabs: &[TabRow], tab_id: &str, base: &str) -> TabLabel {
     let Some(row) = tabs.iter().find(|t| t.tab_id == tab_id) else {
         return TabLabel::Unknown;
     };
-    if tab_is_auto_named(tabs, tab_id) == Some(true)
-        || label_is_pall8t_own(&row.label, base, tab_number)
-    {
+    if tab_is_auto_named(tabs, tab_id) == Some(true) || label_is_pall8t_own(&row.label, base) {
         TabLabel::Ours
     } else {
         TabLabel::Theirs(row.label.clone())
@@ -370,6 +463,11 @@ pub struct Request<'a> {
     pub pane_id: &'a str,
     /// `HERDR_TAB_ID`. Absent means no tab to rename and no suffix.
     pub tab_id: Option<&'a str>,
+    /// `HERDR_SOCKET_PATH`. Not used to talk to herdr — the CLI reads it
+    /// from the environment itself — but to tell one herdr *server run*
+    /// from the next, which is what the tab numbers are counted per. See
+    /// [`crate::tab_numbers`].
+    pub socket_path: Option<&'a str>,
     /// The workspace directory, whose basename is the default name.
     pub workspace_dir: &'a Path,
     pub cfg: &'a crate::config::HerdrConfig,
@@ -388,31 +486,55 @@ pub fn name_pane(req: &Request<'_>) {
         return;
     }
     let base = base_name(req.cfg.agent_name.as_deref(), req.workspace_dir);
-    let number = req.tab_id.and_then(tab_number);
 
-    // Whose the label is depends only on `base` and the number, so it is
-    // asked first: a run with no tab of its own to name and no agent
-    // coming has nothing to spend an `agent list` round trip on.
-    let owner = req.tab_id.map(|tab_id| {
-        (
-            tab_id,
-            tab_label_owner(req.herdr_bin, tab_id, &base, number),
-        )
-    });
+    // Whose the label is, what the other tabs' labels claim, and which
+    // tabs herdr still lists all come from the one `tab.list` call — a run
+    // with no tab of its own to name and no agent coming has nothing to
+    // spend that round trip on.
+    let insight = req
+        .tab_id
+        .map(|tab_id| inspect_tab(req.herdr_bin, tab_id, &base));
+    let (label, own_label, mut taken, live_tabs) = match insight {
+        Some(i) => (i.label, i.own_label, i.other_labels, i.live_tabs),
+        // No tab of our own means no label to judge, nothing to avoid, and
+        // nothing to prune — the same standing as a `tab.list` that failed.
+        None => (TabLabel::Unknown, None, BTreeSet::new(), None),
+    };
+    // The tab to rename can only ever be this run's own, which is what
+    // `insight` was read for; the label decides whether it is pall8t's to
+    // overwrite.
     let mut kept_label = None;
-    let to_label = match owner {
-        Some((tab_id, TabLabel::Ours)) => Some(tab_id),
-        Some((_, TabLabel::Theirs(label))) => {
+    let to_label = match label {
+        TabLabel::Ours => req.tab_id,
+        TabLabel::Theirs(label) => {
             kept_label = Some(label);
             None
         }
-        _ => None,
+        TabLabel::Unknown => None,
     };
     if to_label.is_none() && !req.expect_agent {
         return;
     }
 
-    let name = first_free(&base, number, &live_agent_names(req.herdr_bin));
+    // Numbered only now, past the return above: a run that names nothing
+    // must not consume a number, or the count climbs on runs that produced
+    // no name at all.
+    let number = req.tab_id.and_then(|tab_id| {
+        crate::tab_numbers::number_for(&crate::tab_numbers::Alloc {
+            socket_path: req.socket_path,
+            base: &base,
+            tab_id,
+            own_label: own_label.as_deref(),
+            live_tabs: live_tabs.as_ref(),
+            live_labels: Some(&taken),
+            now: crate::util::epoch_secs(),
+        })
+    });
+
+    // Both kinds of claim on a name, in one set: the labels other tabs
+    // wear (already read above) and the names live agents answer to.
+    taken.extend(live_agent_names(req.herdr_bin));
+    let name = first_free(&base, number, &taken);
     let mut renamed_tab = None;
     if let Some(tab_id) = to_label {
         match rename_tab(req.herdr_bin, tab_id, &name) {
@@ -456,9 +578,58 @@ fn live_agent_names(bin: &str) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// The one `tab.list` call the feature makes, decided by [`tab_label_of`].
-/// Every unreadable answer lands on [`TabLabel::Unknown`].
-fn tab_label_owner(bin: &str, tab_id: &str, base: &str, number: Option<usize>) -> TabLabel {
+/// Everything the one `tab.list` call this feature makes is asked for:
+/// whose the label is ([`tab_label_of`]), the label itself, the names the
+/// other tabs' labels claim ([`labels_of_other_tabs`]), and which tabs
+/// herdr still lists. A failed or unparseable call (see [`fetch_tabs`])
+/// yields the "knows nothing" shape, and every consumer has its own
+/// documented answer for that.
+struct TabInsight {
+    label: TabLabel,
+    /// This tab's label verbatim, for [`crate::tab_numbers`]: a label
+    /// pall8t wrote on an earlier run carries a number this tab may keep
+    /// rather than being renumbered.
+    own_label: Option<String>,
+    /// Empty when the call gave nothing to read — the same "assume free"
+    /// fallback [`live_agent_names`] takes, and with the same worst case:
+    /// one rename that herdr rejects.
+    other_labels: BTreeSet<String>,
+    /// The tab ids herdr listed, for pruning the numbering state of tabs
+    /// that are gone. `None` — not empty — when the call failed, so that
+    /// "herdr lists no tabs" and "we could not ask" stay distinguishable:
+    /// the first is a reason to prune everything, the second to prune
+    /// nothing.
+    live_tabs: Option<BTreeSet<String>>,
+}
+
+fn inspect_tab(bin: &str, tab_id: &str, base: &str) -> TabInsight {
+    let Some(tabs) = fetch_tabs(bin) else {
+        return TabInsight {
+            label: TabLabel::Unknown,
+            own_label: None,
+            other_labels: BTreeSet::new(),
+            live_tabs: None,
+        };
+    };
+    TabInsight {
+        label: tab_label_of(&tabs, tab_id, base),
+        own_label: tabs
+            .iter()
+            .find(|t| t.tab_id == tab_id)
+            .map(|t| t.label.clone()),
+        other_labels: labels_of_other_tabs(&tabs, tab_id),
+        live_tabs: Some(tabs.iter().map(|t| t.tab_id.clone()).collect()),
+    }
+}
+
+/// `herdr tab list`, parsed. `None` (with a warning already printed) when
+/// the call failed or the reply's shape changed — a reply that parsed as
+/// JSON but not as tabs means herdr's `TabInfo` moved under this version.
+/// Silence there would turn tab naming off while the run still told the
+/// user their own label was respected, so it warns, unlike a tab simply
+/// not being in the list (which the announcement already covers: pall8t
+/// never saw this tab's id).
+fn fetch_tabs(bin: &str) -> Option<Vec<TabRow>> {
     let out = match herdr(bin, ["tab", "list"]) {
         Ok(out) => out,
         Err(e) => {
@@ -466,22 +637,17 @@ fn tab_label_owner(bin: &str, tab_id: &str, base: &str, number: Option<usize>) -
                 "pall8t: warning: could not read the herdr tab list ({e:#}) — \
                  leaving this tab's label alone"
             );
-            return TabLabel::Unknown;
+            return None;
         }
     };
-    // A reply that parsed as JSON but not as tabs means herdr's `TabInfo`
-    // moved under this version. Silence there would turn tab naming off
-    // while the run still told the user their own label was respected —
-    // so it warns, unlike a tab simply not being in the list (which the
-    // announcement already covers: pall8t never saw this tab's id).
-    let Some(tabs) = parse_tabs(&out) else {
+    let tabs = parse_tabs(&out);
+    if tabs.is_none() {
         eprintln!(
             "pall8t: warning: could not make sense of the herdr tab list — \
              leaving this tab's label alone"
         );
-        return TabLabel::Unknown;
-    };
-    tab_label_of(&tabs, tab_id, base, number)
+    }
+    tabs
 }
 
 fn rename_tab(bin: &str, tab_id: &str, label: &str) -> Result<()> {
@@ -786,25 +952,63 @@ mod tests {
     }
 
     #[test]
-    fn tab_number_reads_the_number_out_of_the_id_not_the_position() {
-        assert_eq!(tab_number("w13:t3"), Some(3));
+    fn tab_position_reads_the_position_herdrs_auto_label_shows() {
+        let tabs = parse_tabs(TAB_LIST).expect("herdr 0.8.2's tab.list shape");
         assert_eq!(
-            tab_number("w13:t2"),
+            tab_position(&tabs, "w13:t2"),
+            Some(1),
+            "tab id number 2 sits first in w13, and herdr's own default \
+             label for it therefore reads \"1\" — telling that apart from \
+             the id-encoded number is the whole point of this function, \
+             since it is what `tab_is_auto_named` compares the label to"
+        );
+        assert_eq!(
+            tab_position(&tabs, "w13:t3"),
             Some(2),
-            "the id carries `number`, which never changes when tabs are \
-             closed or moved — that is why the suffix is taken from here"
-        );
-        assert_eq!(tab_number("w13"), None, "no tab part at all");
-        assert_eq!(
-            tab_number("w13:p3"),
-            None,
-            "a pane id is not a tab id: `p3` must not read as tab 3"
+            "second in w13 despite carrying id number 3"
         );
         assert_eq!(
-            tab_number("tab_7"),
+            tab_position(&tabs, "w14:t9"),
+            Some(1),
+            "positions are counted within the tab's own workspace, so a \
+             high id-encoded number (9) doesn't stop this from being the \
+             first tab in w14"
+        );
+        assert_eq!(
+            tab_position(&tabs, "w99:t1"),
             None,
-            "an id shape this version doesn't know yields no suffix rather \
-             than a wrong one"
+            "a tab herdr didn't list has no position"
+        );
+    }
+
+    #[test]
+    fn split_counter_reads_a_trailing_number_and_nothing_else() {
+        assert_eq!(
+            split_counter("foo-2-3"),
+            Some(("foo-2", 3)),
+            "the final group is the counter; what it was appended to is the \
+             head, whatever else that head contains"
+        );
+        assert_eq!(split_counter("foo-3"), Some(("foo", 3)));
+        assert_eq!(split_counter("foo"), None, "no dash, no counter");
+        assert_eq!(split_counter("foo-"), None, "no digits after the dash");
+        assert_eq!(
+            split_counter("-3"),
+            None,
+            "an empty head is not a name pall8t appended a counter to"
+        );
+        assert_eq!(
+            split_counter("foo-3x"),
+            None,
+            "the digits must be all of the group, or `web-3x` would read as \
+             a counter and let a human's label be overwritten"
+        );
+        assert_eq!(
+            split_counter("foo-+3"),
+            None,
+            "and the check really is on the digits, not on whether the group \
+             parses: `usize::from_str` accepts a leading `+`, so leaving it \
+             to `parse` would read this as counter 3"
         );
     }
 
@@ -858,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn first_free_skips_the_names_live_agents_already_answer_to() {
+    fn first_free_skips_every_name_already_claimed() {
         let taken: BTreeSet<String> = ["foo-2".to_string(), "foo-2-2".to_string()]
             .into_iter()
             .collect();
@@ -866,7 +1070,8 @@ mod tests {
             first_free("foo", Some(2), &taken),
             "foo-2-3",
             "two runs whose names would collide must end up addressable \
-             separately"
+             separately, whoever holds the name — a live agent or another \
+             tab's label"
         );
         assert_eq!(
             first_free("foo", Some(3), &taken),
@@ -912,6 +1117,55 @@ mod tests {
         assert!(
             parse_tabs("not json").is_none() && parse_tabs(r#"{"error":{}}"#).is_none(),
             "an error reply or garbage is not a tab list"
+        );
+    }
+
+    /// `herdr tab list` captured live on herdr 0.8.2, in the exact state
+    /// the position-based suffix produced when it went wrong: **two tabs
+    /// in `w1E` both labeled `vpnp-2`**. The old tab `w1E:t2` was named at
+    /// position 2, then the tab ahead of it closed and moved it to
+    /// position 1 with its label untouched; the tab opened in its place,
+    /// `w1E:t3`, landed at position 2 and took the same name. `w1E:t2`'s
+    /// `agent_status` is `"unknown"` — its agent had exited, so
+    /// `agent.list` no longer mentioned `vpnp-2` and could not report the
+    /// clash. `w1D:t1` is a second workspace, whose label the same run
+    /// must also count.
+    const COLLIDED_TAB_LIST: &str = r#"{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"working","focused":true,"label":"p-1","number":1,"pane_count":1,"tab_id":"w1D:t1","workspace_id":"w1D"},{"agent_status":"unknown","focused":false,"label":"vpnp-2","number":2,"pane_count":1,"tab_id":"w1E:t2","workspace_id":"w1E"},{"agent_status":"idle","focused":false,"label":"vpnp-2","number":3,"pane_count":1,"tab_id":"w1E:t3","workspace_id":"w1E"}],"type":"tab_list"}}"#;
+
+    #[test]
+    fn a_label_left_behind_by_a_reorder_is_a_name_already_claimed() {
+        let tabs = parse_tabs(COLLIDED_TAB_LIST).expect("herdr 0.8.2's tab.list shape");
+        let claimed = labels_of_other_tabs(&tabs, "w1E:t3");
+
+        assert_eq!(
+            tab_position(&tabs, "w1E:t3"),
+            Some(2),
+            "the new tab sits second in w1E, which is the suffix it derives",
+        );
+        assert_eq!(
+            first_free("vpnp", Some(2), &claimed),
+            "vpnp-2-2",
+            "w1E:t2 still wears vpnp-2 from the position it used to hold, and no \
+             live agent answers to it any more — the label alone has to be what \
+             stops a second tab from reading vpnp-2",
+        );
+        assert!(
+            claimed.contains("p-1"),
+            "a label in another workspace counts too: an agent name resolves \
+             across the whole herdr session, so a duplicate two workspaces away \
+             is just as ambiguous a target",
+        );
+    }
+
+    #[test]
+    fn a_tabs_own_label_never_blocks_its_own_rerun() {
+        let tabs = parse_tabs(COLLIDED_TAB_LIST).expect("herdr 0.8.2's tab.list shape");
+        assert_eq!(
+            first_free("p", Some(1), &labels_of_other_tabs(&tabs, "w1D:t1")),
+            "p-1",
+            "w1D:t1 already reads p-1 from its own earlier run; counting that \
+             label against itself would push every rerun one counter further out \
+             (p-1-2, p-1-3, …) for a name nothing else holds",
         );
     }
 
@@ -1042,12 +1296,21 @@ mod tests {
     /// `foo-2-2`, leaving the tab pointing at run 1's successor.
     #[test]
     fn a_tab_pall8t_labeled_itself_is_still_pall8ts_to_relabel() {
-        // Position 1 in w13, so herdr's auto label would read "1".
-        let tabs = vec![TabRow {
-            tab_id: "w13:t2".into(),
-            workspace_id: "w13".into(),
-            label: "foo-2".into(),
-        }];
+        // w13:t1 sits before it, so w13:t2 is at position 2 — herdr's own
+        // auto label there would read "2", not the "foo-2" it actually
+        // carries.
+        let tabs = vec![
+            TabRow {
+                tab_id: "w13:t1".into(),
+                workspace_id: "w13".into(),
+                label: "other".into(),
+            },
+            TabRow {
+                tab_id: "w13:t2".into(),
+                workspace_id: "w13".into(),
+                label: "foo-2".into(),
+            },
+        ];
         assert_eq!(
             tab_is_auto_named(&tabs, "w13:t2"),
             Some(false),
@@ -1055,38 +1318,84 @@ mod tests {
              made this look like a human's name"
         );
         assert!(
-            matches!(
-                tab_label_of(&tabs, "w13:t2", "foo", Some(2)),
-                TabLabel::Ours
-            ),
+            matches!(tab_label_of(&tabs, "w13:t2", "foo"), TabLabel::Ours),
             "but `foo-2` is exactly what pall8t itself writes in tab 2 of a \
              `foo` workspace, so it is pall8t's to move to `foo-2-2` rather \
              than a label that must be preserved"
         );
         assert!(
             matches!(
-                tab_label_of(&tabs, "w13:t2", "foo", Some(9)),
+                tab_label_of(&tabs, "w13:t2", "web"),
                 TabLabel::Theirs(ref l) if l == "foo-2"
             ),
-            "the same string in a different tab is not a name pall8t could \
-             have written here — and the label it keeps is carried out, so \
-             the announcement can name it"
+            "after `[herdr] agent_name` changes to `web`, the old `foo-2` \
+             label is indistinguishable from a human's — kept, and reported \
+             by `announcement`'s kept-label arm instead"
         );
         assert!(
-            matches!(
-                tab_label_of(&tabs, "w13:t2", "web", Some(2)),
-                TabLabel::Theirs(ref l) if l == "foo-2"
-            ),
-            "and after `[herdr] agent_name` changes, the old label is \
-             indistinguishable from a human's — kept, and reported by \
-             `announcement`'s kept-label arm instead"
-        );
-        assert!(
-            matches!(
-                tab_label_of(&tabs, "w13:t9", "foo", Some(9)),
-                TabLabel::Unknown
-            ),
+            matches!(tab_label_of(&tabs, "w13:t9", "foo"), TabLabel::Unknown),
             "a tab that isn't in the list at all stays unknown, never `Ours`"
+        );
+    }
+
+    /// Regression pin for the numbering rewrite: [`crate::tab_numbers`]
+    /// restarts its counter when the herdr server does, while herdr
+    /// restores every tab's `custom_name` from `session.json` verbatim. So
+    /// on the first run after any restart, a surviving tab's label carries
+    /// a number from the *previous* run's sequence and this run's number
+    /// bears no relation to it. Recognition must not depend on them
+    /// agreeing, or every restart hands every surviving tab back to
+    /// "somebody else's label" and the tab drifts from its agent.
+    #[test]
+    fn a_pall8t_label_survives_a_herdr_restart_resetting_the_count() {
+        // The tab herdr restored, still wearing the label run 1 gave it.
+        let tabs = vec![TabRow {
+            tab_id: "w13:t9".into(),
+            workspace_id: "w13".into(),
+            label: "foo-3".into(),
+        }];
+        assert!(
+            matches!(tab_label_of(&tabs, "w13:t9", "foo"), TabLabel::Ours),
+            "`foo-3` is exactly what pall8t writes for a `foo` workspace at \
+             some number — recognized as its own to relabel, whatever the \
+             counter happens to say today"
+        );
+        assert!(
+            matches!(
+                tab_label_of(&tabs, "w13:t9", "web"),
+                TabLabel::Theirs(ref l) if l == "foo-3"
+            ),
+            "recognition is free in the *number*, never in the *base* — a \
+             genuinely different project's label is still left alone"
+        );
+    }
+
+    /// The number is unbounded on purpose. The bounded sweep this replaced
+    /// could only tolerate a label from a nearby position; after a server
+    /// restart the number in a restored label is whatever the previous run
+    /// reached, and no ceiling is defensible.
+    #[test]
+    fn label_is_pall8t_own_recognizes_any_number_it_could_have_written() {
+        for label in ["foo-3", "foo-99999", "foo-3-2", "foo"] {
+            assert!(
+                label_is_pall8t_own(label, "foo"),
+                "{label} is a name pall8t writes for base `foo` — the plain \
+                 numbered form, one the collision walk bumped, or the bare \
+                 base a run with no number available produces"
+            );
+        }
+        for label in ["web-3", "foo-bar", "3", "release work", "foo-3x"] {
+            assert!(
+                !label_is_pall8t_own(label, "foo"),
+                "{label} is not a name pall8t would have written for `foo`, \
+                 so it belongs to whoever typed it"
+            );
+        }
+        assert!(
+            label_is_pall8t_own("api-2-1", "api-2"),
+            "a base can itself end in a number (`agent_name = \"api-2\"`), so \
+             every split point has to be tried — reading only the last group \
+             would rebuild `api-2-1` as base `api-2-1` and miss it"
         );
     }
 
