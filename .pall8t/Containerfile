@@ -22,16 +22,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     useradd -m -u ${UID} -g ${GID} -s /bin/bash dev && \
     echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
 
-# tmux (from the flake tools below — nixpkgs builds it with sysconfdir=/etc,
-# so it reads this file) ships for Claude Code's agent-teams split-pane
-# display (README: "Claude Code agent teams (split panes)"); keep the chrome
-# minimal by default.
-RUN printf '%s\n' \
-      '# pall8t: keep the tmux chrome minimal inside agent sessions.' \
-      '# Users can override in ~/.tmux.conf (persistent home).' \
-      'set -g status off' \
-      > /etc/tmux.conf
-
 # The Rust toolchain AND the userland tools come from the repo's nix flake,
 # so the sandbox builds with the exact versions flake.lock pins — the Rust
 # side being the same one `nix develop` gives on the host. The COPY works
@@ -51,7 +41,7 @@ RUN printf '%s\n' \
 # GC-rooted out-links to store paths (the Rust toolchain — rustc/cargo/
 # rustfmt/clippy plus rust-analyzer + rust-src for editor tooling and the
 # aarch64-apple-darwin std for scripts/lint.sh's cross-target clippy gate —
-# and the #sandbox-tools env: git, ripgrep, jq, less, vim, tmux, gh,
+# and the #sandbox-tools env: git, ripgrep, jq, less, vim, gh,
 # node; see flake.nix); the closures are self-contained (RPATH into
 # /nix/store), so they run on Ubuntu as-is. `nix store gc` then drops the
 # build-time-only paths (flake inputs, eval caches) the out-links don't

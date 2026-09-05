@@ -295,10 +295,9 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
 
     let herdr_env = herdr::detect();
     // An explicit `-- <cmd>` override is user intent and bypasses the
-    // configured command entirely, so herdr's tmux-wrapper override only
-    // ever applies to the configured default.
+    // configured command entirely.
     let mut command = if cli_command.is_empty() {
-        herdr::maybe_override_for_herdr(cfg.command.clone(), herdr_env.is_some())
+        cfg.command.clone()
     } else {
         cli_command
     };
