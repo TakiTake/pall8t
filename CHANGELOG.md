@@ -17,7 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overwrite (so a second run in the same tab doesn't mistake its own past
   label for a human's rename) now tolerates that number shifting when an
   earlier tab in the workspace closes, which position-based numbering alone
-  would otherwise reintroduce as drift.
+  would otherwise reintroduce as drift. A name is now also checked against
+  the labels the other tabs already wear, not only against the names live
+  agents answer to: a position is not unique the way the id counter was,
+  so a tab that shifted down keeps a label a later tab's position can land
+  on — and once that older tab's agent has exited, `agent.list` no longer
+  reports the clash.
 
 ## [0.5.0] - 2026-08-29
 

@@ -1394,6 +1394,51 @@ fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
     );
 }
 
+/// Regression pin, from live testing of the issue #76 fix: a
+/// position-derived suffix is not unique the way the id-derived one was,
+/// so the *other* tabs' labels have to count as names already claimed.
+///
+/// The reported sequence: `vpnp-1` was closed, which moved the tab named
+/// at position 2 down to position 1 with its `vpnp-2` label untouched —
+/// nothing relabels a tab pall8t is not running in. The tab opened in its
+/// place landed at position 2, derived the same `vpnp-2`, and both tabs
+/// ended up reading it. `agent.list` could not report the clash: the older
+/// tab's agent had already exited, which is why the fixture below leaves
+/// it empty — the *label* alone has to be what bumps the name.
+#[test]
+fn a_label_a_reorder_left_on_another_tab_is_not_taken_twice() {
+    // w13:t1 first, so our w13:t2 sits at position 2 and derives "demo-2"
+    // — exactly the label w13:t1 is still wearing from when it held that
+    // position. Our own label is "2", herdr's auto label for position 2,
+    // so the tab is still pall8t's to rename.
+    let stale = r#"{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"unknown","focused":false,"label":"demo-2","number":1,"pane_count":1,"tab_id":"w13:t1","workspace_id":"w13"},{"agent_status":"unknown","focused":true,"label":"2","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}],"type":"tab_list"}}"#;
+    let (sb, err) = opted_in_naming_run("run-naming-stale", "w13:t2", stale);
+    assert!(
+        err.contains(r#"naming this tab "demo-2-2""#),
+        "the name has to step past the label the other tab already wears, or \
+         `herdr agent prompt demo-2` reaches whichever of the two herdr picks \
+         and the label a human reads names nothing in particular: {err}"
+    );
+    let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    // Line-exact on both sides: "demo-2" is a prefix of "demo-2-2", so a
+    // substring test would call the colliding rename a pass.
+    assert!(
+        calls.lines().any(|l| l == "tab rename w13:t2 demo-2-2")
+            && !calls.lines().any(|l| l == "tab rename w13:t2 demo-2"),
+        "and it is the bumped name that reaches `tab.rename`: {calls}"
+    );
+    let log = wait_for_line(
+        &sb.pall8t_root().join("logs").join("herdr-naming.log"),
+        "named the agent",
+        std::time::Duration::from_secs(10),
+    );
+    assert!(
+        log.contains(r#"named the agent "demo-2-2""#),
+        "both halves take the same stepped-past name — a tab and an agent that \
+         disagree is the drift naming exists to remove: {log}"
+    );
+}
+
 /// Regression pin (review finding on the issue #76 fix): before this,
 /// numbering read straight off the tab id and needed no herdr call at
 /// all, so it survived a broken `tab.list` untouched. Position-based
