@@ -121,7 +121,7 @@ sandbox = "full"       # what the *sandboxed* agent may do to your herdr session
 auto_rename = true     # opt-in: name this run's tab *and* agent `<base>-<n>`, so what
                        #   you read off the tab is what other agents can address.
                        #   Undefined (the default) = pall8t renames nothing.
-agent_name = "api"     # base name instead of the workspace dir's basename → `api-1`.
+# agent_name = "api"   # base name instead of the workspace dir's basename → `api-1`.
                        #   Inert on its own — without auto_rename it warns on stderr.
 ```
 
