@@ -1410,8 +1410,6 @@ mod tests {
         );
     }
 
-    /// The herdr bridge's socket is the one mount that must go out as
-    /// `-v`: 1.2.2's `--mount` parser accepts only a directory source,
     /// The scalar scaffolding every `run_argv` test needs and none of them
     /// is about: a name, an image, a workdir, host ids. Tests state only
     /// the fields they actually assert on (`..base_spec()`), the way
@@ -1434,6 +1432,8 @@ mod tests {
         }
     }
 
+    /// The herdr bridge's socket is the one mount that must go out as
+    /// `-v`: 1.2.2's `--mount` parser accepts only a directory source,
     /// while the runtime behind `-v` forwards a socket source into the
     /// guest as a live socket (verified on 1.2.2). Two colon-separated
     /// fields and no third — the unvalidated-options hazard ADR-0009

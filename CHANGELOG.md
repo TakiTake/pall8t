@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it is now told the request was ignored and how to ask legitimately.
 - **A run that forwards the agent says so on stderr.** Previously only
   the failure path spoke, so a working forward left nothing on screen.
+- **A misspelled key under `[container]` now fails the parse** rather than
+  being accepted and ignored (`deny_unknown_fields`, as `[herdr]` already
+  had). The direction that needed it is *narrowing*: a project may only
+  turn forwarding off, so `shh = false` against a global `ssh = true` is a
+  repository saying "do not hand my agent to this code" — silently
+  dropped, that run forwarded the agent anyway with nothing on screen. A
+  typo in the enabling direction was always safe (forwarding stays off);
+  this closes the other one.
 - **The `known_hosts` bake no longer fails open.** `curl … | jq …` in a
   `RUN` step runs under `/bin/sh` with no `pipefail`, so a failed fetch
   left `jq` to exit 0 on empty input and the image built with an empty

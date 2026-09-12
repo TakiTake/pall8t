@@ -256,7 +256,18 @@ struct RawHerdr {
     agent_name: Option<String>,
 }
 
+/// `deny_unknown_fields` for the same reason [`RawHerdr`] has it, and the
+/// case that needs it is `ssh`. A typo in the *enabling* direction fails
+/// safe — `sh = true` leaves forwarding off, and the user finds out when
+/// the push fails. The *disabling* direction is the dangerous one: a
+/// project's only permitted say over forwarding is turning it off
+/// ([`merge`]), so a project that writes `shh = false` against a global
+/// `ssh = true` states "this repository must not touch my agent" and,
+/// silently ignored, gets the agent forwarded anyway. The one setting
+/// whose whole job is to narrow a capability must not be typo-able into
+/// a no-op.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawContainer {
     cpus: Option<u32>,
     memory: Option<String>,
@@ -752,6 +763,40 @@ mod tests {
             toml::from_str::<Raw>("[herdr]\nauto_renam = true\n").is_err(),
             "a misspelled key fails the parse rather than silently renaming \
              nothing (deny_unknown_fields)"
+        );
+    }
+
+    /// The narrowing direction is the one a typo must not swallow. A
+    /// project's only permitted say over forwarding is turning it *off*,
+    /// so `shh = false` against a global `ssh = true` is a repository
+    /// stating it must not touch the user's agent. Accepted-and-ignored,
+    /// that run forwards the agent anyway with nothing on screen — the
+    /// exact shape of the `sandbo = "off"` hazard [`RawHerdr`] was given
+    /// `deny_unknown_fields` for.
+    #[test]
+    fn a_misspelled_container_key_fails_the_parse_rather_than_being_ignored() {
+        for (toml, what) in [
+            (
+                "[container]\nshh = false\n",
+                "a project trying to opt *out*",
+            ),
+            (
+                "[container]\nssh_agent = true\n",
+                "a plausible longer spelling",
+            ),
+            ("[container]\ncpu = 4\n", "an unrelated field, same rule"),
+        ] {
+            assert!(
+                toml::from_str::<Raw>(toml).is_err(),
+                "{what} must fail the parse, not be silently dropped — a \
+                 narrowing setting that typos into a no-op leaves the \
+                 permissive state in place: {toml:?}"
+            );
+        }
+        assert!(
+            toml::from_str::<Raw>("[container]\nssh = false\n").is_ok(),
+            "and the correctly spelled key still parses, or the guard above \
+             would be passing for the wrong reason"
         );
     }
 
