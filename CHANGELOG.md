@@ -17,9 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   anywhere your keys are trusted. `pall8t run --ssh` / `--ssh=false`
   overrides it for one run, and pall8t warns when forwarding is on but the
   host has no agent to forward — both an unset `SSH_AUTH_SOCK` and one
-  pointing at a socket that is no longer there, which is what a shell
-  resumed after a reboot exports. The runtime would otherwise forward
-  nothing silently while still setting `SSH_AUTH_SOCK` in the guest.
+  naming a socket no agent answers on. pall8t connects to it rather than
+  checking the path exists, because an agent killed without cleaning up
+  leaves its socket file behind: present to `Path::exists`, refusing every
+  connection. The runtime would otherwise forward nothing silently while
+  still setting `SSH_AUTH_SOCK` in the guest.
 
 ### Security
 

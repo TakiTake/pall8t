@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use pall8t::{config, container, herdr, image, mounts, naming, worktree};
 use std::io::IsTerminal;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 /// Run AI coding agents in apple/container sandboxes. Headless: pall8t is
@@ -303,9 +304,16 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
 
     let ssh = config::ssh_enabled(cfg.ssh, cli_ssh);
     // `var_os`, not `var`: SSH_AUTH_SOCK is a path, and a path is not
-    // required to be UTF-8. `Path::exists` goes in as the probe itself.
+    // required to be UTF-8.
     let host_auth_sock = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
-    if let Some(msg) = config::ssh_warning(ssh, host_auth_sock.as_deref(), Path::exists) {
+    // Connecting is the probe, not `Path::exists`: an agent that died
+    // without cleaning up leaves a socket node that exists and refuses
+    // every connection, which is the stale case the warning is for. The
+    // connection is dropped immediately — reaching accept() is the whole
+    // question, so nothing is written and no agent-protocol request is
+    // made.
+    let agent_reachable = |sock: &Path| UnixStream::connect(sock).is_ok();
+    if let Some(msg) = config::ssh_warning(ssh, host_auth_sock.as_deref(), agent_reachable) {
         eprintln!("{msg}");
     } else if ssh {
         // Say so on the *working* path too, not only when it is broken.

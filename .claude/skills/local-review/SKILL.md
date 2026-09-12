@@ -142,6 +142,21 @@ local review failed to catch first (source PRs noted).
   must fall on the keep side, the way an unreadable mtime already does.
 - The same rule scales down: any `unwrap_or(false)` on an IO probe is a
   policy decision about the failure case, so state which case it is.
+- **Probe the property you are claiming, not its cheapest proxy** (PR #63).
+  A probe answers the question it asks, and `exists()` asks about an inode,
+  not about a peer — so a socket whose agent was `SIGKILL`ed (or outlived by
+  the tmux session still exporting its path) passes an existence check and
+  refuses every connection. No reboot, no unlink, so the "stale" case the
+  warning was *written for* was the one it stayed silent on. Name the
+  property in the predicate — `agent_reachable`, not `sock_exists` — and the
+  gap gets hard to write down: `connect(2)` separates listening from dead
+  node from unlinked, where one `exists()` collapses all three. Applies to
+  any liveness claim built from a proxy: a pidfile is not a running process,
+  a port in a config is not a bound listener, a lockfile is not a held lock.
+- The tell in review is a doc/comment that claims more than the predicate
+  delivers. Read the two against each other: when the prose says "a socket
+  that died with its agent" and the code says `Path::exists`, the prose is
+  describing the intended probe and the code is the one that ships.
 
 **Interpolating into a delimited wire format** (PR #62)
 - Building `a:b`, `k=v`, `x,y` for another process? The delimiter must be

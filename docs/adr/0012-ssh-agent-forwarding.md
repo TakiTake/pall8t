@@ -104,8 +104,22 @@ so on stderr (`config::ssh_warning`). Two ways to have no agent, not
 one: `SSH_AUTH_SOCK` unset, and `SSH_AUTH_SOCK` *stale* — a shell
 resumed after a reboot, or a long-lived tmux session, still exports the
 path of a socket that died with the agent that made it. Testing only for
-unset would let the more confusing case through in silence. The
-existence probe is passed in rather than performed inside, per
+unset would let the more confusing case through in silence.
+
+The probe asks whether an agent **answers**, not whether a file exists,
+and the gap between those two is a failure mode of its own: an agent that
+dies without cleaning up — `SIGKILL`, OOM, or just outlived by the tmux
+session still exporting its path — leaves the socket inode on disk. No
+reboot, no unlink, so `Path::exists` answers "yes" and a presence-only
+check goes quiet on exactly the case it was written for. `connect(2)`
+separates the three states instead: listening is `Ok`, a dead node is
+`ECONNREFUSED`, an unlinked path is `ENOENT` — and only the first is an
+agent. The connection is dropped as soon as it is made; reaching
+`accept()` is the entire question, so no agent-protocol request is sent.
+(Caught by CodeRabbit on this PR, after local review shipped the weaker
+probe.)
+
+The probe is passed in rather than performed inside, per
 `docs/testing.md`; a probe that cannot answer counts as absent and warns,
 since a spurious warning costs a line of text and a spurious silence
 costs the failure this exists to prevent.

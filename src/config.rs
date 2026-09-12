@@ -178,18 +178,29 @@ pub fn ssh_enabled(config: bool, cli_override: Option<bool>) -> bool {
 /// commonly hit one is a **stale** `SSH_AUTH_SOCK` — a tmux session or a
 /// shell resumed after a reboot still exports the path of a socket that
 /// died with the agent that made it. Testing only for unset lets exactly
-/// the confusing case through silently, so existence is asked as well,
-/// via `sock_exists` rather than by touching the filesystem here (the
-/// caller hands over `Path::exists` itself; the tests hand over an
-/// answer). A probe that
-/// cannot tell — an unreadable parent directory — reads as absent and
-/// warns: the cost of a wrong warning is one line of text, the cost of a
-/// wrong silence is the unexplained publickey denial this exists to
-/// prevent.
+/// the confusing case through silently, so the socket is probed as well,
+/// via `agent_reachable` rather than by touching the filesystem here (the
+/// caller hands over the real probe; the tests hand over an answer).
+///
+/// The probe asks whether an agent *answers*, not whether a file exists,
+/// and the difference is a whole failure mode. A dead agent leaves its
+/// socket inode behind whenever it does not get to clean up — killed with
+/// `SIGKILL`, OOM-killed, or simply outlived by the tmux session that
+/// still exports its path, none of which involve the reboot that would
+/// clear the path away. `Path::exists` answers "yes" for that node and
+/// the warning never fires, which is precisely the case it was written
+/// for (caught in review on PR #63). `connect(2)` separates the three states the
+/// user can be in: listening (`Ok`), dead node (`ECONNREFUSED`), gone
+/// (`ENOENT`). Only the first is an agent.
+///
+/// A probe that cannot tell — an unreadable parent directory, a descriptor
+/// limit — reads as absent and warns: the cost of a wrong warning is one
+/// line of text, the cost of a wrong silence is the unexplained publickey
+/// denial this exists to prevent.
 pub fn ssh_warning(
     enabled: bool,
     host_auth_sock: Option<&Path>,
-    sock_exists: impl Fn(&Path) -> bool,
+    agent_reachable: impl Fn(&Path) -> bool,
 ) -> Option<String> {
     if !enabled {
         return None;
@@ -198,9 +209,14 @@ pub fn ssh_warning(
     // "no agent", and only one of them has a path worth printing.
     let cause = match host_auth_sock.filter(|s| !s.as_os_str().is_empty()) {
         None => "SSH_AUTH_SOCK is unset on the host".to_string(),
-        Some(sock) if sock_exists(sock) => return None,
+        Some(sock) if agent_reachable(sock) => return None,
+        // One phrasing for both shapes on purpose: the socket may be gone
+        // or may be a node no process is behind, and the user's next step
+        // is the same either way. Claiming "isn't there" about a path they
+        // can `ls` would just cost them the trust of the message.
         Some(sock) => format!(
-            "SSH_AUTH_SOCK on the host points at {}, which isn't there",
+            "SSH_AUTH_SOCK on the host points at {}, but no agent is \
+             listening there",
             sock.display()
         ),
     };

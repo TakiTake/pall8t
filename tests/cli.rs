@@ -1287,10 +1287,38 @@ fn the_run_says_whether_the_agent_is_being_forwarded_or_is_missing() {
         stderr(&stale)
     );
 
-    // And the working path: pall8t only stats the socket, so any existing
-    // file stands in for a live agent here.
+    // The case an *existence* check misses, and the one that named this
+    // pin (CodeRabbit, PR #63): an agent that died without cleaning up
+    // leaves a socket node behind. It is not the reboot case above — the
+    // path is right there on disk, `Path::exists` says yes, and a
+    // presence-only probe hands the run a socket that refuses every
+    // connection while saying nothing. Binding a listener and dropping it
+    // reproduces exactly that inode.
+    let dead_node = sb.root.join("dead-node.sock");
+    drop(std::os::unix::net::UnixListener::bind(&dead_node).unwrap());
+    assert!(
+        dead_node.exists(),
+        "the fixture is only meaningful while the socket node is still on \
+         disk — that is the whole difference from the unlinked case above"
+    );
+    let refused = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &dead_node)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&refused).contains(&format!("points at {}", dead_node.display())),
+        "a socket node nothing is listening on must warn exactly as a missing \
+         one does: it forwards no agent either, and the user is left with the \
+         same unexplained publickey denial: {}",
+        stderr(&refused)
+    );
+
+    // And the working path. It takes a *listening* socket now — a regular
+    // file used to stand in, back when pall8t only stat'd the path.
     let live = sb.root.join("live-agent.sock");
-    std::fs::write(&live, b"").unwrap();
+    let _listening = std::os::unix::net::UnixListener::bind(&live).unwrap();
     let on = sb
         .command()
         .args(["run", "--ssh"])
@@ -1301,6 +1329,12 @@ fn the_run_says_whether_the_agent_is_being_forwarded_or_is_missing() {
         stderr(&on).contains("ssh is on"),
         "forwarding that actually happens must announce itself, or a run can \
          carry the user's agent with nothing on screen saying so: {}",
+        stderr(&on)
+    );
+    assert!(
+        !stderr(&on).contains("no agent is listening"),
+        "and an agent that answers must not be warned about — a probe that \
+         cried wolf on every run would be ignored on the run that mattered: {}",
         stderr(&on)
     );
 }
