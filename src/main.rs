@@ -265,12 +265,56 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+/// Provenance for `pall8t ls --json` and anything else asking what a
+/// running sandbox is: what pall8t knows and the container does not say
+/// about itself. Values are sanitised in [`container::run_argv`] (a `=` in
+/// a project path would fail the run outright), so this only decides
+/// *which* facts are recorded.
+fn run_labels(cwd: &Path, image_tag: &str, main_git_dir: Option<&Path>) -> Vec<(String, String)> {
+    let mut labels = vec![
+        (
+            container::LABEL_VERSION.to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+        ("pall8t.project".to_string(), cwd.display().to_string()),
+        ("pall8t.image".to_string(), image_tag.to_string()),
+    ];
+    if let Some(git_dir) = main_git_dir {
+        labels.push((
+            "pall8t.worktree.git_dir".to_string(),
+            git_dir.display().to_string(),
+        ));
+    }
+    labels
+}
+
+/// The herdr half of the provenance, for a run that has a pane around it.
+/// Separate from [`run_labels`] because it is conditional on the herdr
+/// environment and independent of whether the *bridge* then succeeds — a
+/// bridge failure is best-effort and must not cost the run its labels.
+fn herdr_labels(env: &herdr::HerdrEnv, sandbox: config::HerdrSandbox) -> Vec<(String, String)> {
+    let mut labels = vec![("pall8t.herdr.pane".to_string(), env.pane_id.clone())];
+    if let Some(w) = &env.workspace_id {
+        labels.push(("pall8t.herdr.workspace".to_string(), w.clone()));
+    }
+    if let Some(t) = &env.tab_id {
+        labels.push(("pall8t.herdr.tab".to_string(), t.clone()));
+    }
+    labels.push((
+        "pall8t.herdr.sandbox".to_string(),
+        sandbox.as_str().to_string(),
+    ));
+    labels
+}
+
 fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<bool>) -> Result<()> {
     let (cwd, cfg, uid, gid, resolved) = workspace_image(image::BuildMode::IfMissing)?;
     let run_name = container::run_name(&cwd);
 
     let mut mounts = vec![container::Mount::identity(cwd.clone())];
-    if let Some(git_dir) = worktree::main_git_dir(&cwd) {
+    // One probe, two consumers: the mount below and the provenance label.
+    let main_git_dir = worktree::main_git_dir(&cwd);
+    if let Some(git_dir) = main_git_dir.clone() {
         eprintln!(
             "pall8t: git worktree detected — also mounting {}",
             git_dir.display()
@@ -301,6 +345,8 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
         .filter(|m| m.readonly)
         .map(|m| m.dest.clone())
         .collect();
+
+    let mut labels = run_labels(&cwd, &resolved.tag, main_git_dir.as_deref());
 
     let ssh = config::ssh_enabled(cfg.ssh, cli_ssh);
     // `var_os`, not `var`: SSH_AUTH_SOCK is a path, and a path is not
@@ -356,6 +402,7 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
     // bridge failure warns and the run proceeds without it.
     let mut env_vars = mounts::safe_directory_env(&readonly_paths);
     if let Some(env) = &herdr_env {
+        labels.extend(herdr_labels(env, cfg.herdr.sandbox));
         match herdr::prepare_bridge(env, cfg.herdr.sandbox, &run_name) {
             Ok(Some(bridge)) => {
                 eprintln!(
@@ -383,6 +430,7 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
         tty: stdin_is_tty(),
         env: env_vars,
         ssh,
+        labels,
         command,
     };
     exec_container(&container::run_argv(&spec), herdr_agent.as_deref())
@@ -403,9 +451,19 @@ fn cmd_ls(json: bool) -> Result<()> {
     ensure_container_system()?;
     let containers = container::list_pall8t()?;
     if json {
+        // Additive: `name`/`status` are the shape herdr and scripts already
+        // read, and `image`/`labels` join them rather than replacing
+        // anything. A container from an older pall8t simply has no labels.
         let items: Vec<serde_json::Value> = containers
             .iter()
-            .map(|c| serde_json::json!({ "name": c.name, "status": c.state.as_str() }))
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "status": c.state.as_str(),
+                    "image": c.image,
+                    "labels": c.labels,
+                })
+            })
             .collect();
         print_json(&items)?;
     } else {

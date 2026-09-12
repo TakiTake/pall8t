@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves its socket file behind: present to `Path::exists`, refusing every
   connection. The runtime would otherwise forward nothing silently while
   still setting `SSH_AUTH_SOCK` in the guest.
+- **Every `pall8t run` container carries provenance labels**
+  (`pall8t.version`, `pall8t.project`, `pall8t.image`, the herdr pane /
+  workspace / tab and sandbox mode when running under herdr, and a
+  worktree's main git dir), and `pall8t ls --json` reports them alongside
+  the image. `pall8t ls` now recognizes its containers by the
+  `pall8t.version` label rather than by the `pall8t-` name prefix. The
+  prefix stays as a fallback so containers started by an older pall8t
+  remain visible, which means a container someone else named `pall8t-…`
+  still matches for now — the prefix was never a sound test, and dropping
+  the fallback is what will fix that. Those sessions are `--rm` and in
+  the foreground, so one release is enough for the fallback to go.
 
 ### Security
 
