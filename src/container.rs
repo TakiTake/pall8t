@@ -802,8 +802,9 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
     }
     // An init process inside the container: forwards signals to the agent
     // and reaps orphans it leaves behind — worth having wherever the
-    // agent spawns children of its own (tmux, agent teams, background
-    // shells). Unconditional because it changes nothing else: verified on
+    // agent spawns children of its own (agent teams, background shells,
+    // or tmux where a custom image still has it — the default image
+    // dropped tmux). Unconditional because it changes nothing else: verified on
     // 1.2.2 that the agent's own exit code still comes back (`exit 42` →
     // 42, with and without), and that pid 1 becomes the init rather than
     // the agent.

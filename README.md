@@ -92,7 +92,7 @@ hardening = "strict"   # default: "default"
 
 Opt-in per project, because whether it holds depends on the project's toolchain — a build that writes outside the workspace, or a tool that needs a capability, works under `default` and fails under `strict`. Verified on apple/container 1.2.2: under `strict`, a write to `/var/tmp` fails with `EROFS` and `CapBnd` reads `0000000000000000`; under `default`, the same write succeeds and `CapBnd` carries the runtime's usual set.
 
-Independently of the profile, every run gets `--init`: an init process inside the container that forwards signals to the agent and reaps the orphans it leaves behind (a `tmux` session, a background shell, teammate agents). The agent's own exit code still comes back unchanged — `exit 42` gives 42, a signal-killed command gives 143.
+Independently of the profile, every run gets `--init`: an init process inside the container that forwards signals to the agent and reaps the orphans it leaves behind (a background shell, teammate agents, or a `tmux` session if you added tmux back to your own Containerfile — the default image dropped it). The agent's own exit code still comes back unchanged — `exit 42` gives 42, a signal-killed command gives 143.
 
 ### SSH agent forwarding
 
