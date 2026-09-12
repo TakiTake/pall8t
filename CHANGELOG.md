@@ -27,10 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace / tab and sandbox mode when running under herdr, and a
   worktree's main git dir), and `pall8t ls --json` reports them alongside
   the image. `pall8t ls` now recognizes its containers by the
-  `pall8t.version` label rather than by the `pall8t-` name prefix — the
-  prefix stays as a fallback for containers started by an older pall8t,
-  and a container someone else happened to name `pall8t-…` no longer
-  counts as one of ours.
+  `pall8t.version` label rather than by the `pall8t-` name prefix. The
+  prefix stays as a fallback so containers started by an older pall8t
+  remain visible, which means a container someone else named `pall8t-…`
+  still matches for now — the prefix was never a sound test, and dropping
+  the fallback is what will fix that. Those sessions are `--rm` and in
+  the foreground, so one release is enough for the fallback to go.
 
 ### Security
 

@@ -1177,19 +1177,37 @@ fn a_run_labels_the_container_with_its_own_provenance() {
         "the version label is the one `pall8t ls` matches on, so it is the \
          one that must never go missing: {line}"
     );
-    assert!(
-        line.contains("--label pall8t.image="),
-        "and the image the run resolved to, which the container itself \
-         reports only as a digest: {line}"
-    );
-    let project = line
+
+    // Each label is checked against the argv element it is *about*, not
+    // merely for being present. Presence is the weak form: a label built
+    // from the wrong variable, or from an empty string, still contains
+    // `pall8t.image=`. Tying each one to its source of truth in the same
+    // command line is what makes a wrong value fail.
+    let value_of = |key: &str| -> String {
+        line.split_whitespace()
+            .find_map(|a| a.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no `{key}...` in the run argv: {line}"))
+            .to_string()
+    };
+
+    let workdir = line
         .split_whitespace()
-        .find_map(|a| a.strip_prefix("pall8t.project="))
-        .expect("a run must record which project it was started for");
-    assert!(
-        project.ends_with("run-labels") || !project.is_empty(),
-        "the project label carries the workspace path, not a placeholder: \
-         {project}"
+        .skip_while(|a| *a != "-w")
+        .nth(1)
+        .expect("a run always sets -w");
+    assert_eq!(
+        value_of("pall8t.project="),
+        workdir,
+        "the project label must name the directory the run actually mounted \
+         as the workspace — the two coming apart is exactly the confusion \
+         `pall8t ls` exists to resolve: {line}"
+    );
+
+    assert_eq!(
+        value_of("pall8t.image="),
+        tag,
+        "and the image label must be the tag this run resolved to, since \
+         the container itself reports only a digest: {line}"
     );
 }
 
