@@ -320,10 +320,9 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
 
     let herdr_env = herdr::detect();
     // An explicit `-- <cmd>` override is user intent and bypasses the
-    // configured command entirely, so herdr's tmux-wrapper override only
-    // ever applies to the configured default.
+    // configured command entirely.
     let mut command = if cli_command.is_empty() {
-        herdr::maybe_override_for_herdr(cfg.command.clone(), herdr_env.is_some())
+        cfg.command.clone()
     } else {
         cli_command
     };
@@ -338,6 +337,7 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
             herdr_bin: env.herdr_bin(),
             pane_id: &env.pane_id,
             tab_id: env.tab_id.as_deref(),
+            socket_path: env.socket_path.as_deref(),
             workspace_dir: &cwd,
             cfg: &cfg.herdr,
             expect_agent: herdr_agent.is_some(),

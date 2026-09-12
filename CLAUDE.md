@@ -47,6 +47,9 @@ tests with reasoned assertions, regression pins).
   merge speculatively.
 - Before opening or updating a PR, run the `local-review` skill on the
   branch diff — the external reviewers should come back empty-handed.
+- CodeRabbit no longer reviews on its own: opening or pushing to a PR
+  triggers nothing. Asking it for a review (`@coderabbitai review` as a
+  PR comment) is the human's call — don't spend one unprompted.
 - PR review feedback (bot or human) is handled with the `review-loop`
   skill: verify each finding before acting, classify it (real / nitpick /
   false positive), and reply with evidence. Never blanket-apply bot
@@ -82,4 +85,6 @@ stop there.
   weekly plus on-demand via `gh workflow run <name>` — reports, never
   gates; Codex PR review (`codex-review.yml`) stays dormant until an
   `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
-  `.coderabbit.yaml` (free for this public repo once the app is installed).
+  `.coderabbit.yaml` — installed, but automatic review is off, so it runs
+  only when someone comments `@coderabbitai review` on the PR (the free
+  plan meters reviews).

@@ -1,4 +1,4 @@
-# ADR-0011: SSH agent forwarding, off by default
+# ADR-0012: SSH agent forwarding, off by default
 
 - Status: Accepted
 - Date: 2026-08-30

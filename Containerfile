@@ -11,7 +11,7 @@ ARG GID=501
 # verification failed" — with [container] ssh = true forwarding a perfectly
 # good agent that never gets consulted.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git sudo ripgrep less vim openssh-client jq tmux && \
+      ca-certificates curl git sudo ripgrep less vim openssh-client jq && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && npm i -g @anthropic-ai/claude-code && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -27,14 +27,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     (getent group ${GID} || groupadd -g ${GID} dev) && \
     useradd -m -u ${UID} -g ${GID} -s /bin/bash dev && \
     echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
-
-# tmux ships for Claude Code's agent-teams split-pane display (README:
-# "Claude Code agent teams (split panes)"); keep the chrome minimal by default.
-RUN printf '%s\n' \
-      '# pall8t: keep the tmux chrome minimal inside agent sessions.' \
-      '# Users can override in ~/.tmux.conf (persistent home).' \
-      'set -g status off' \
-      > /etc/tmux.conf
 
 USER dev
 WORKDIR /work

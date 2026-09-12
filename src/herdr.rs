@@ -175,21 +175,6 @@ fn agent_name_token(token: &str, allow_path: bool) -> Option<String> {
     KNOWN_AGENTS.contains(&name).then(|| name.to_string())
 }
 
-/// If the resolved run command is the opt-in Claude-Code agent-teams tmux
-/// wrapper (README: `command = ["tmux", "new", "-A", "-s", "claude",
-/// "claude"]`) and we're inside a herdr pane, skip it in favor of plain
-/// `claude` — herdr already supplies persistence/multiplexing, and the
-/// wrapper is redundant chrome herdr doesn't need. Any other configured
-/// command is left untouched: only this one documented shape is known to be
-/// a multiplexer wrapper.
-pub fn maybe_override_for_herdr(command: Vec<String>, herdr_active: bool) -> Vec<String> {
-    if herdr_active && command.first().map(String::as_str) == Some("tmux") {
-        vec!["claude".to_string()]
-    } else {
-        command
-    }
-}
-
 fn report_metadata_argv(pane_id: &str, agent: &str) -> Vec<String> {
     vec![
         "pane".into(),
@@ -768,41 +753,6 @@ mod tests {
         assert!(
             BOOTSTRAP.contains("/opt/pall8t/bin") && BOOTSTRAP.trim().ends_with("exec \"$@\""),
             "what remains is the PATH prepend and the exec into the real command"
-        );
-    }
-
-    #[test]
-    fn maybe_override_for_herdr_table() {
-        let tmux_cmd = vec![
-            "tmux".to_string(),
-            "new".to_string(),
-            "-A".to_string(),
-            "-s".to_string(),
-            "claude".to_string(),
-            "claude".to_string(),
-        ];
-        assert_eq!(
-            maybe_override_for_herdr(tmux_cmd.clone(), true),
-            vec!["claude".to_string()],
-            "tmux-wrapped + herdr active -> overridden to plain claude"
-        );
-        assert_eq!(
-            maybe_override_for_herdr(tmux_cmd.clone(), false),
-            tmux_cmd,
-            "tmux-wrapped + herdr inactive -> unchanged"
-        );
-
-        let plain = vec!["codex".to_string()];
-        assert_eq!(
-            maybe_override_for_herdr(plain.clone(), true),
-            plain,
-            "non-tmux command + herdr active -> unchanged"
-        );
-
-        assert_eq!(
-            maybe_override_for_herdr(Vec::new(), true),
-            Vec::<String>::new(),
-            "empty command + herdr active -> unchanged (no first element to check)"
         );
     }
 

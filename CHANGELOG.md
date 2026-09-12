@@ -10,15 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`[container] ssh`: forward the host's SSH agent into the sandbox**
-  (`container run --ssh`, ADR-0011), so an agent can push over SSH without a
-  private key ever entering the container home. Off by default —
-  while the run lasts, the sandbox can authenticate as you anywhere your
-  keys are trusted. `pall8t run --ssh` / `--ssh=false` overrides it for
-  one run, and pall8t warns when forwarding is on but the host has no
-  agent to forward — both an unset `SSH_AUTH_SOCK` and one pointing at a
-  socket that is no longer there, which is what a shell resumed after a
-  reboot exports. The runtime would otherwise forward nothing silently
-  while still setting `SSH_AUTH_SOCK` in the guest.
+  (`container run --ssh`,
+  [ADR-0012](docs/adr/0012-ssh-agent-forwarding.md)), so an agent can push
+  over SSH without a private key ever entering the container home. Off by
+  default — while the run lasts, the sandbox can authenticate as you
+  anywhere your keys are trusted. `pall8t run --ssh` / `--ssh=false`
+  overrides it for one run, and pall8t warns when forwarding is on but the
+  host has no agent to forward — both an unset `SSH_AUTH_SOCK` and one
+  pointing at a socket that is no longer there, which is what a shell
+  resumed after a reboot exports. The runtime would otherwise forward
+  nothing silently while still setting `SSH_AUTH_SOCK` in the guest.
 
 ### Security
 
@@ -46,6 +47,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on "Host key verification failed" without ever consulting the agent. A
   custom Containerfile needs the same line. `jq` joins the default image's
   tool list to do it.
+
+## [0.6.0] - 2026-09-05
+
+### Changed
+
+- **`[herdr] auto_rename`'s tab/agent number is now pall8t's own counter**,
+  reset when the herdr server restarts (issues #76 and its follow-up;
+  [ADR-0011](docs/adr/0011-tab-numbering-state.md)). It replaces two
+  schemes that both read a number out of herdr, and both got a tab's name
+  wrong: the tab id's counter never restarts with the server (herdr
+  persists it in `session.json`), so a fresh project opened at whatever
+  count the workspace had already reached — and it silently produced no
+  number at all past a workspace's ninth tab, since herdr encodes tab ids
+  in base-32 and `tA` does not parse as 10. The tab's *position* restarts
+  correctly but belongs to the list rather than the tab: closing one tab
+  renumbered every later one, so a name written yesterday stopped meaning
+  the tab it was written for, and a new tab landed on a name an older tab
+  was still wearing.
+
+  A number is now handed out once and never reused while one herdr server
+  run lasts, so a tab keeps its name for its whole life. pall8t records the
+  counters in `~/.pall8t/state/herdr-naming.json` — its first durable state
+  of its own — keyed to the server run by the API socket's identity, since
+  herdr exposes no session id, pid or start time. A tab herdr restored
+  keeps the number its own label carries rather than being renamed, and a
+  restarted counter starts past the labels still on screen, so a reset
+  lands on 1 only when nothing is left wearing one. Numbering no longer
+  depends on any herdr call succeeding.
+
+- **A name is checked against the labels the other tabs already wear**, not
+  only against the names live agents answer to. Two tabs could otherwise
+  end up reading the same thing — as two did, live — because herdr enforces
+  no uniqueness on labels and a tab whose agent has exited is invisible to
+  `agent.list`.
+
+- **Docs corrected against the code.** The README claimed a project
+  Containerfile builds with its own directory as the build context — ADR-0010
+  moved that to the project root, so `COPY` paths shown as unreachable were
+  in fact the supported ones. The `pall8t init` config skeletons still
+  described `auto_rename`'s suffix as "the tab's number", a scheme
+  [ADR-0011](docs/adr/0011-tab-numbering-state.md) replaced. Also: the herdr
+  section now leads with a sample `[herdr]` block, the four denied host-admin
+  namespaces are named rather than sampled, and the herdr skill points at the
+  relay audit log's real filename.
+
+- **CodeRabbit reviews on demand only.** With the trial over, the free plan
+  meters reviews, so `.coderabbit.yaml` turns off automatic review and chat
+  auto-reply: a review runs when someone comments `@coderabbitai review`
+  (or `full review`) on the PR, and CodeRabbit answers a comment that
+  addresses it directly. Nothing about how findings are handled changes —
+  the `review-loop` skill still verifies each one before acting.
+
+### Removed
+
+- **The tmux integration is gone**: the images no longer install tmux or
+  ship an `/etc/tmux.conf`, and pall8t no longer rewrites a configured
+  `tmux` command when it runs inside a herdr pane. The README section on
+  Claude Code's agent-teams split panes goes with them.
+
+  Nothing about `[run] command` changes shape — a tmux command still runs
+  if tmux is in the image, it is simply no longer provided or special-cased.
+  Two consequences worth knowing:
+
+  - **Breaking: the default image loses tmux**, so `command = ["tmux", …]`
+    against it now fails at launch. Add `tmux` back in your own Containerfile
+    (`~/.pall8t/Containerfile` for every project, `.pall8t/Containerfile`
+    for one) if you want it. An existing `~/.pall8t/Containerfile` is never
+    overwritten, so an already-initialized user keeps tmux until they take
+    it out themselves.
+  - **A configured `tmux` command now reaches the runtime verbatim in a
+    herdr pane**, where before it was replaced with plain `claude`. That
+    substitution also caught tmux commands wrapping a *different* agent,
+    which is one reason it went.
 
 ## [0.5.0] - 2026-08-29
 
@@ -374,7 +448,8 @@ container home.
   management (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in
   favor of the shared-home mode.
 
-[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.6.0
 [0.5.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.5.0
 [0.4.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.4.0
 [0.3.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.3.0

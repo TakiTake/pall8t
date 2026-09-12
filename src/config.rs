@@ -289,6 +289,21 @@ pub(crate) fn logs_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// `~/.pall8t/state`, created on demand — where the small JSON files
+/// pall8t writes for itself and reads back on a later run live. Sibling
+/// of [`logs_dir`], and named here for the same reason: two callers
+/// spelling the join out themselves is how they drift.
+///
+/// Deliberately neither of the two neighbours it could have joined.
+/// `logs/` is append-only human artifacts nobody parses; `config.toml`
+/// at the root is the *user's* file, and burying machine state beside it
+/// invites editing one while meaning the other.
+pub(crate) fn state_dir() -> Result<PathBuf> {
+    let dir = pall8t_root()?.join("state");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 pub fn global_path() -> Result<PathBuf> {
     Ok(pall8t_root()?.join("config.toml"))
 }
@@ -561,8 +576,10 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # Name the herdr tab and the agent this run launches in, with the same
 # string, so what you read off the tab is what `herdr agent prompt <name>`
 # takes. Off unless set: pall8t renames nothing by default. The name is
-# the workspace directory's basename plus the tab's number (~/src/foo in
-# tab 2 -> "foo-2"); a tab you renamed yourself keeps your label.
+# the workspace directory's basename plus a number pall8t counts itself,
+# per name and per herdr server run (~/src/foo -> "foo-1", then "foo-2");
+# a number is never reused while that server run lasts, so the name stays
+# a stable address. A tab you renamed yourself keeps your label.
 # auto_rename = true
 # Name to use instead of the directory basename. Inert on its own —
 # without auto_rename above, pall8t warns and renames nothing.
@@ -615,7 +632,7 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 
 [herdr]
 # sandbox = "full"   # or "readonly" / "off" — see ~/.pall8t/config.toml
-# auto_rename = true # name this run's herdr tab and agent "<dir>-<tab number>"
+# auto_rename = true # name this run's herdr tab and agent "<dir>-<n>"
 # agent_name = "api" # ... using this instead of the directory basename
 "#;
 
