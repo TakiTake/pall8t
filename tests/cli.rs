@@ -1150,6 +1150,49 @@ fn run_line(fake: &FakeRuntime) -> String {
         .to_string()
 }
 
+/// The provenance labels have to survive the same whole trip: `cmd_run`
+/// assembling them, `RunSpec`, `run_argv`. `container.rs` unit-tests the
+/// *emission* (one `--label` per entry, values sanitised) and the *reading*
+/// back out of `ls --json`, but neither notices if the run stops putting
+/// anything in the vector — `run_labels` returning `vec![]` passes every
+/// one of them. This is the test that would go red, and the reason the
+/// labels are worth anything: `pall8t ls` identifies its own containers by
+/// `pall8t.version` now, so a run that quietly stopped labelling would
+/// vanish from its own listing.
+#[test]
+fn a_run_labels_the_container_with_its_own_provenance() {
+    let sb = Sandbox::new("run-labels");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    sb.run(&["run"]);
+    let line = run_line(&fake);
+
+    assert!(
+        line.contains(&format!(
+            "--label pall8t.version={}",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "the version label is the one `pall8t ls` matches on, so it is the \
+         one that must never go missing: {line}"
+    );
+    assert!(
+        line.contains("--label pall8t.image="),
+        "and the image the run resolved to, which the container itself \
+         reports only as a digest: {line}"
+    );
+    let project = line
+        .split_whitespace()
+        .find_map(|a| a.strip_prefix("pall8t.project="))
+        .expect("a run must record which project it was started for");
+    assert!(
+        project.ends_with("run-labels") || !project.is_empty(),
+        "the project label carries the workspace path, not a placeholder: \
+         {project}"
+    );
+}
+
 /// `[container] ssh` has to survive the whole trip — config files, the
 /// `--ssh` override, the merge rule, `RunSpec`, `run_argv` — and the only
 /// place its effect is observable is the argv pall8t hands the runtime.
