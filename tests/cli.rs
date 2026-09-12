@@ -1141,6 +1141,204 @@ fn run_hands_the_runtime_the_workspace_mount_and_the_configured_command() {
     );
 }
 
+/// The `run` command line pall8t handed the fake runtime.
+fn run_line(fake: &FakeRuntime) -> String {
+    fake.argv_log()
+        .lines()
+        .find(|l| l.starts_with("run "))
+        .expect("pall8t must reach `container run`")
+        .to_string()
+}
+
+/// `[container] ssh` has to survive the whole trip — config files, the
+/// `--ssh` override, the merge rule, `RunSpec`, `run_argv` — and the only
+/// place its effect is observable is the argv pall8t hands the runtime.
+/// The unit tests cover each link; this one pins that they are actually
+/// joined, so a wiring slip (`let ssh = false;` in `cmd_run`) has
+/// somewhere to go red. It also pins the asymmetry that matters most: a
+/// *project* config cannot switch forwarding on, only off. The runtime is
+/// left in place rather than vanished: the fake logs the `run` line and
+/// exits, which is the launch this needs to read.
+#[test]
+fn only_the_human_can_forward_the_agent_never_a_projects_own_config() {
+    let sb = Sandbox::new("run-ssh-argv");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    // (global config, project config, argv, --ssh expected, why)
+    let cases: [(&str, &str, &[&str], bool, &str); 5] = [
+        (
+            "",
+            "",
+            &["run"],
+            false,
+            "forwarding is opt-in: a run that never asked for it must not be \
+             handed the user's agent",
+        ),
+        (
+            "",
+            "",
+            &["run", "--ssh"],
+            true,
+            "`pall8t run --ssh` is the human saying it out loud, per run",
+        ),
+        (
+            "[container]\nssh = true\n",
+            "",
+            &["run"],
+            true,
+            "and the user's own ~/.pall8t/config.toml is the standing way in",
+        ),
+        (
+            "",
+            "[container]\nssh = true\n",
+            &["run"],
+            false,
+            "but a project config must NOT be able to switch it on: it ships \
+             with the repository, so this is cloned code voting itself \
+             access to the user's keys",
+        ),
+        (
+            "[container]\nssh = true\n",
+            "[container]\nssh = false\n",
+            &["run"],
+            false,
+            "narrowing stays honored — a project may always decline what the \
+             global allowed",
+        ),
+    ];
+
+    for (global, project, args, expected, why) in cases {
+        sb.write_global_config(global);
+        sb.write_project_config(project);
+        fake.clear_log();
+        sb.run(args);
+        let line = run_line(&fake);
+        assert_eq!(line.contains("--ssh"), expected, "{why}. argv was: {line}");
+    }
+}
+
+/// Refusing a project's request is only half the job: dropping a stated
+/// intent in silence is this repo's definition of a bug, and here the
+/// silence would hide that a repository tried to reach the user's keys.
+#[test]
+fn a_project_config_that_asked_for_ssh_is_told_it_was_ignored() {
+    let sb = Sandbox::new("run-ssh-ignored");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    sb.write_project_config("[container]\nssh = true\n");
+    let out = sb.run(&["run"]);
+    let err = stderr(&out);
+    assert!(
+        err.contains("was ignored"),
+        "a project asking to enable forwarding must be told it did not \
+         happen: {err}"
+    );
+    assert!(
+        err.contains("--ssh"),
+        "and told how to ask legitimately, or the message is a refusal with \
+         no remedy: {err}"
+    );
+}
+
+/// The other half of the same wiring: what the run says about the host's
+/// agent. A capability this wide that announces itself only on failure is
+/// one a run can carry without anyone noticing, so the working path speaks
+/// too.
+#[test]
+fn the_run_says_whether_the_agent_is_being_forwarded_or_is_missing() {
+    let sb = Sandbox::new("run-ssh-warn");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    // The harness clears the environment, so this run genuinely has no
+    // SSH_AUTH_SOCK — no need to unset one.
+    let unset = sb.run(&["run", "--ssh"]);
+    assert!(
+        stderr(&unset).contains("SSH_AUTH_SOCK is unset on the host"),
+        "forwarding with no agent at all must say so on stderr: {}",
+        stderr(&unset)
+    );
+
+    let off = sb.run(&["run"]);
+    assert!(
+        !stderr(&off).contains("SSH_AUTH_SOCK") && !stderr(&off).contains("ssh is on"),
+        "and a run that never asked to forward has nothing to say: {}",
+        stderr(&off)
+    );
+
+    // The case a presence-only check misses: a path still exported for a
+    // socket that died with its agent.
+    let dead = sb.root.join("dead-agent.sock");
+    let stale = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &dead)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&stale).contains(&format!("points at {}", dead.display())),
+        "a socket path with nothing behind it must be named, not treated as \
+         a working agent: {}",
+        stderr(&stale)
+    );
+
+    // The case an *existence* check misses, and the one that named this
+    // pin (CodeRabbit, PR #63): an agent that died without cleaning up
+    // leaves a socket node behind. It is not the reboot case above — the
+    // path is right there on disk, `Path::exists` says yes, and a
+    // presence-only probe hands the run a socket that refuses every
+    // connection while saying nothing. Binding a listener and dropping it
+    // reproduces exactly that inode.
+    let dead_node = sb.root.join("dead-node.sock");
+    drop(std::os::unix::net::UnixListener::bind(&dead_node).unwrap());
+    assert!(
+        dead_node.exists(),
+        "the fixture is only meaningful while the socket node is still on \
+         disk — that is the whole difference from the unlinked case above"
+    );
+    let refused = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &dead_node)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&refused).contains(&format!("points at {}", dead_node.display())),
+        "a socket node nothing is listening on must warn exactly as a missing \
+         one does: it forwards no agent either, and the user is left with the \
+         same unexplained publickey denial: {}",
+        stderr(&refused)
+    );
+
+    // And the working path. It takes a *listening* socket now — a regular
+    // file used to stand in, back when pall8t only stat'd the path.
+    let live = sb.root.join("live-agent.sock");
+    let _listening = std::os::unix::net::UnixListener::bind(&live).unwrap();
+    let on = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &live)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&on).contains("ssh is on"),
+        "forwarding that actually happens must announce itself, or a run can \
+         carry the user's agent with nothing on screen saying so: {}",
+        stderr(&on)
+    );
+    assert!(
+        !stderr(&on).contains("no agent is listening"),
+        "and an agent that answers must not be warned about — a probe that \
+         cried wolf on every run would be ignored on the run that mattered: {}",
+        stderr(&on)
+    );
+}
+
 /// pall8t hands the runtime the command the config names, verbatim — in a
 /// herdr pane as anywhere else. Until the tmux integration was dropped, a
 /// configured command whose first token was `tmux` was silently replaced

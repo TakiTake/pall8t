@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`[container] ssh`: forward the host's SSH agent into the sandbox**
+  (`container run --ssh`,
+  [ADR-0012](docs/adr/0012-ssh-agent-forwarding.md)), so an agent can push
+  over SSH without a private key ever entering the container home. Off by
+  default — while the run lasts, the sandbox can authenticate as you
+  anywhere your keys are trusted. `pall8t run --ssh` / `--ssh=false`
+  overrides it for one run, and pall8t warns when forwarding is on but the
+  host has no agent to forward — both an unset `SSH_AUTH_SOCK` and one
+  naming a socket no agent answers on. pall8t connects to it rather than
+  checking the path exists, because an agent killed without cleaning up
+  leaves its socket file behind: present to `Path::exists`, refusing every
+  connection. The runtime would otherwise forward nothing silently while
+  still setting `SSH_AUTH_SOCK` in the guest.
+
+### Security
+
+- **A project's `.pall8t/config.toml` can no longer switch SSH forwarding
+  on** — only your own `~/.pall8t/config.toml` or `pall8t run --ssh` can.
+  A project config ships with the repository, so honoring `ssh = true`
+  there let cloned code vote itself the use of your SSH agent, silently.
+  A project may still turn forwarding *off*, and one that asks to enable
+  it is now told the request was ignored and how to ask legitimately.
+- **A run that forwards the agent says so on stderr.** Previously only
+  the failure path spoke, so a working forward left nothing on screen.
+- **A misspelled key under `[container]` now fails the parse** rather than
+  being accepted and ignored (`deny_unknown_fields`, as `[herdr]` already
+  had). The direction that needed it is *narrowing*: a project may only
+  turn forwarding off, so `shh = false` against a global `ssh = true` is a
+  repository saying "do not hand my agent to this code" — silently
+  dropped, that run forwarded the agent anyway with nothing on screen. A
+  typo in the enabling direction was always safe (forwarding stays off);
+  this closes the other one.
+- **The `known_hosts` bake no longer fails open.** `curl … | jq …` in a
+  `RUN` step runs under `/bin/sh` with no `pipefail`, so a failed fetch
+  left `jq` to exit 0 on empty input and the image built with an empty
+  `/etc/ssh/ssh_known_hosts`. The steps are now separate and each is
+  checked, including that the extracted key list is non-empty.
+
+### Changed
+
+- **The default image bakes GitHub's SSH host keys into
+  `/etc/ssh/ssh_known_hosts`** (from the authenticated `api.github.com/meta`,
+  as the repo's own dev image already did). Without them a forwarded agent
+  is unusable for its main purpose: the sandbox is non-interactive, so an
+  unknown host key is not a prompt anyone can answer — `git push` just dies
+  on "Host key verification failed" without ever consulting the agent. A
+  custom Containerfile needs the same line. `jq` joins the default image's
+  tool list to do it.
+
 ## [0.6.0] - 2026-09-05
 
 ### Changed
