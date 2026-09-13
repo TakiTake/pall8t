@@ -1326,10 +1326,13 @@ mod tests {
             .position(|a| a == "--ulimit")
             .map(|i| strict[i + 1].clone())
             .expect("strict sets a file-descriptor ceiling");
-        assert!(
-            nofile.starts_with("nofile="),
-            "the ulimit is the fd ceiling, in apple/container's \
-             <type>=<soft>[:<hard>] form: {nofile}"
+        assert_eq!(
+            nofile, "nofile=8192:16384",
+            "the exact ceiling is the contract, not merely the `nofile=` \
+             prefix: `nofile=` and `nofile=1` both satisfy a prefix check \
+             while leaving a sandbox that cannot open files, and the \
+             generous ceiling is deliberate — a hardening profile that \
+             breaks wide builds gets switched off rather than tightened"
         );
     }
 

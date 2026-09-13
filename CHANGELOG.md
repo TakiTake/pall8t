@@ -24,9 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still setting `SSH_AUTH_SOCK` in the guest.
 - **`[container] hardening = "strict"`**: drop every Linux capability,
   mount the container's root filesystem read-only, put `/tmp` on a tmpfs,
-  and cap file descriptors — leaving the workspace and the container home
-  as the only writable paths. Opt-in per project: whether it holds
-  depends on the project's toolchain. The default level is unchanged.
+  and cap file descriptors — leaving the workspace, the container home and
+  that `/tmp` as the only writable paths (the tmpfs is writable but lives
+  in memory and is gone when the run ends; everything else is `EROFS`).
+  Opt-in per project: whether it holds depends on the project's toolchain.
+  The default level is unchanged.
 - **Every run now gets an init process** (`container run --init`), which
   forwards signals to the agent and reaps the orphans it leaves behind
   (background shells, teammate agents, and a `tmux` session if you put
@@ -211,8 +213,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copy existed only because ADR-0007 believed read-only mounts were
   unavailable; a read-only mount is strictly stronger (the sandbox cannot
   corrupt even its own CLI) and drops a multi-megabyte copy from every
-  bridged launch. `~/.pall8t/tools/herdr-run/` is no longer used —
-  leftover directories there are inert and can be deleted by hand.
+  bridged launch. `~/.pall8t/tools/herdr-run/` is no longer used by this
+  version — leftover directories there can be deleted by hand once every
+  sandbox started by an older pall8t has exited, since such a run is still
+  executing out of one.
 - **The herdr sandbox bridge is now a mounted Unix socket, not a TCP
   relay.** The host-side relay listens on its own socket under
   `~/.pall8t/run/` and pall8t mounts that socket into the container at
