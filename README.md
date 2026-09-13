@@ -88,7 +88,7 @@ hardening = "strict"   # default: "default"
 ```
 
 - **`"default"`** — what every pall8t release has run: a writable root filesystem and the runtime's normal capability set.
-- **`"strict"`** — `--cap-drop ALL` (the capability *bounding* set is emptied, so nothing inside can regain one), a read-only root filesystem, `/tmp` on a tmpfs, and an 8192 file-descriptor ceiling. The only writable paths left are the ones pall8t mounted on purpose: your workspace and the container home.
+- **`"strict"`** — `--cap-drop ALL` (the capability *bounding* set is emptied, so nothing inside can regain one), a read-only root filesystem, `/tmp` on a tmpfs, and an 8192 file-descriptor ceiling. The only writable paths left are the ones pall8t mounted on purpose — your workspace and the container home — plus `/tmp` itself, which is that tmpfs: writable, but in memory and gone when the run ends. Everything else answers `EROFS`.
 
 Opt-in per project, because whether it holds depends on the project's toolchain — a build that writes outside the workspace, or a tool that needs a capability, works under `default` and fails under `strict`. Verified on apple/container 1.2.2: under `strict`, a write to `/var/tmp` fails with `EROFS` and `CapBnd` reads `0000000000000000`; under `default`, the same write succeeds and `CapBnd` carries the runtime's usual set.
 
