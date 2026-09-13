@@ -70,6 +70,126 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The layout `herdr worktree create` produces: the checkout lives
+    /// under herdr's own root (`~/.herdr/worktrees/<repo>/<branch-slug>`
+    /// by default), nowhere near the repository it belongs to. Built with
+    /// real git rather than hand-written pointer files, because what this
+    /// resolution can drift against is git's on-disk format, and the
+    /// hand-built fixture above would keep passing if it changed.
+    #[test]
+    fn resolves_a_herdr_style_worktree_created_by_real_git() {
+        let root = tmp("wt-herdr");
+        let repo = root.join("src").join("my-project");
+        fs::create_dir_all(&repo).unwrap();
+        match git(&repo, &["init", "-q", "-b", "main", "."]) {
+            // No git at all: nothing to test against, skip honestly.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: no git on PATH");
+                return;
+            }
+            // Anything else is git having an opinion, and the fixture
+            // failing to build is a red test, not a quiet skip.
+            r => assert!(
+                r.expect("git could not be run"),
+                "`git init` failed: the fixture this test resolves against \
+                 was never built, so skipping here would report success for \
+                 coverage that did not run"
+            ),
+        }
+        fs::write(repo.join("f"), "x").unwrap();
+        assert!(git(&repo, &["add", "f"]).expect("git could not be run"));
+        assert!(git(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "seed",
+            ]
+        )
+        .expect("git could not be run"));
+
+        // herdr's own command shape: `git -C <repo> worktree add -b
+        // <branch> <path> <base>`, with <path> under its worktrees root.
+        let checkout = root
+            .join(".herdr")
+            .join("worktrees")
+            .join("my-project")
+            .join("feature-x");
+        assert!(git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/x",
+                &checkout.display().to_string(),
+                "main",
+            ]
+        )
+        .expect("git could not be run"));
+
+        let got = main_git_dir(&checkout).expect(
+            "a herdr-created worktree must resolve to the main repository's .git, \
+             or git inside the sandbox sees a dangling pointer",
+        );
+        assert_eq!(
+            got,
+            repo.join(".git").canonicalize().unwrap(),
+            "the mount pall8t adds has to be the main repo's common .git — \
+             the worktree's own pointer file names it by absolute path"
+        );
+        assert!(
+            !got.starts_with(&checkout),
+            "the resolved .git is outside the workspace mount, which is the \
+             whole reason pall8t mounts it separately"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Runs git in `dir`. `Err` means git could not be *started*;
+    /// `Ok(false)` means git ran and failed. Keeping those apart is the
+    /// point: a machine with no git is a legitimate skip, while a git that
+    /// ran and rejected the command is a broken fixture, and collapsing
+    /// both into one `bool` let the second silently delete this test's
+    /// coverage while CI stayed green (review finding, PR #68).
+    ///
+    /// Runs with the host's git configuration switched off, which is not
+    /// tidiness but correctness: this test asserts what *pall8t* resolves
+    /// out of git's on-disk layout, so any host setting that can make
+    /// `git commit` fail turns a green build red for a reason the test is
+    /// not about. `commit.gpgsign = true` with an unusable signing program
+    /// is the one that was reported (review finding, PR #68), but it is an
+    /// instance rather than the problem — `core.hooksPath` pointing at a
+    /// rejecting pre-commit hook, a `commit.template` that is missing, or a
+    /// `gpg.format` the host cannot satisfy all break it the same way. So
+    /// the whole of the host's config is dropped rather than the single
+    /// setting overridden: `GIT_CONFIG_GLOBAL`/`SYSTEM` take out
+    /// `~/.gitconfig` and `/etc/gitconfig`, and clearing `GIT_CONFIG_COUNT`
+    /// (with git's internal `GIT_CONFIG_PARAMETERS`) takes out the
+    /// inline-config channel, which outranks both and would otherwise walk
+    /// straight back in from the environment the suite was launched with.
+    ///
+    /// The identity the commits need is passed per-invocation by the
+    /// caller, since there is no global config left to supply it.
+    fn git(dir: &Path, args: &[&str]) -> std::io::Result<bool> {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+    }
+
     #[test]
     fn none_when_commondir_missing() {
         let root = tmp("wt-broken");
