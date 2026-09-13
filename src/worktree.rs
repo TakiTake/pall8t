@@ -81,12 +81,23 @@ mod tests {
         let root = tmp("wt-herdr");
         let repo = root.join("src").join("my-project");
         fs::create_dir_all(&repo).unwrap();
-        if !git(&repo, &["init", "-q", "-b", "main", "."]) {
-            eprintln!("skipping: no usable git on PATH");
-            return;
+        match git(&repo, &["init", "-q", "-b", "main", "."]) {
+            // No git at all: nothing to test against, skip honestly.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: no git on PATH");
+                return;
+            }
+            // Anything else is git having an opinion, and the fixture
+            // failing to build is a red test, not a quiet skip.
+            r => assert!(
+                r.expect("git could not be run"),
+                "`git init` failed: the fixture this test resolves against \
+                 was never built, so skipping here would report success for \
+                 coverage that did not run"
+            ),
         }
         fs::write(repo.join("f"), "x").unwrap();
-        assert!(git(&repo, &["add", "f"]));
+        assert!(git(&repo, &["add", "f"]).expect("git could not be run"));
         assert!(git(
             &repo,
             &[
@@ -98,7 +109,8 @@ mod tests {
                 "-qm",
                 "seed",
             ]
-        ));
+        )
+        .expect("git could not be run"));
 
         // herdr's own command shape: `git -C <repo> worktree add -b
         // <branch> <path> <base>`, with <path> under its worktrees root.
@@ -117,7 +129,8 @@ mod tests {
                 &checkout.display().to_string(),
                 "main",
             ]
-        ));
+        )
+        .expect("git could not be run"));
 
         let got = main_git_dir(&checkout).expect(
             "a herdr-created worktree must resolve to the main repository's .git, \
@@ -137,9 +150,12 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Runs git in `dir`, reporting whether it succeeded. Returns false
-    /// when git is missing entirely, so the test can skip rather than
-    /// fail red on a machine without it.
+    /// Runs git in `dir`. `Err` means git could not be *started*;
+    /// `Ok(false)` means git ran and failed. Keeping those apart is the
+    /// point: a machine with no git is a legitimate skip, while a git that
+    /// ran and rejected the command is a broken fixture, and collapsing
+    /// both into one `bool` let the second silently delete this test's
+    /// coverage while CI stayed green (review finding, PR #68).
     ///
     /// Runs with the host's git configuration switched off, which is not
     /// tidiness but correctness: this test asserts what *pall8t* resolves
@@ -159,7 +175,7 @@ mod tests {
     ///
     /// The identity the commits need is passed per-invocation by the
     /// caller, since there is no global config left to supply it.
-    fn git(dir: &Path, args: &[&str]) -> bool {
+    fn git(dir: &Path, args: &[&str]) -> std::io::Result<bool> {
         std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -171,7 +187,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
+            .map(|s| s.success())
     }
 
     #[test]
