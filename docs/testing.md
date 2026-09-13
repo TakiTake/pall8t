@@ -100,20 +100,43 @@ It is still bound by the rule above — no live runtime, no live herdr:
 ## Coverage
 
 `cargo llvm-cov --summary-only` (install once with `cargo install
-cargo-llvm-cov` and `rustup component add llvm-tools-preview`). It is a
-guide, not a gate: the number is high because the seams above make the
-decisions reachable, and a line covered by a test that asserts nothing
-counts for nothing. Read it as "what has no test pointing at it at all".
+cargo-llvm-cov` and `rustup component add llvm-tools-preview`). Read it as
+"what has no test pointing at it at all" — a line covered by a test that
+asserts nothing counts for nothing, so the number is a floor to stay above
+rather than a score to raise.
+
+CI enforces that floor at 90% lines (`quality.yml`), well under where the
+tree actually sits. That is deliberate: the gap is headroom, not slack to
+be filled. Closing the last few points means writing tests for the IO
+boundaries the harness deliberately does not cross, and those tests can
+only assert nothing. If the floor ever blocks you, the question is which
+real decision lost its test, not how to get the number back up.
 
 ## Would the test go red?
 
-A test only counts if it fails when the code it names is broken. The
-mutation-testing workflow (`.github/workflows/mutants.yml`) automates
-this check — it flips conditions and deletes guards, then reports mutants
-the suite failed to catch. It runs weekly and on demand (Actions →
-"Mutation testing" → *Run workflow*, or
-`gh workflow run mutants.yml`); either way it is report-only and never
-blocks a build. For a quick local pass on one file:
+A test only counts if it fails when the code it names is broken. Mutation
+testing automates the check — it flips conditions and deletes guards, then
+reports the mutants the suite failed to catch. It runs at two scopes, and
+the difference between them is the point:
+
+- **Per PR, and it blocks** (`.github/workflows/quality.yml`):
+  `cargo mutants --in-diff` mutates only the lines the PR touched. A
+  missed mutant there is a test that would not have noticed this change
+  breaking, so it fails the build. It is affordable because it is
+  incremental — a handful of mutants in well under a minute for a normal
+  PR — and it scales with the diff, which is what makes it a real
+  constraint on bulk-generated tests: a thousand new lines get
+  proportionally more mutants to survive. A docs-only PR mutates nothing
+  and passes.
+- **Weekly over the whole tree, report-only** (`mutants.yml`): the trend,
+  including the standing misses nobody chose. Gating on that would be
+  gating on a backlog, which teaches reflexive ignoring. Run it on demand
+  with `gh workflow run mutants.yml`.
+
+Most of the standing whole-tree misses are IO-boundary functions the
+harness cannot reach (`host_ids`, `system_status`, `stdin_is_tty`). They
+are not a to-do list; driving that count to zero would mean exactly the
+assertion-free tests this document warns about. For a quick local pass on one file:
 `cargo mutants -f src/<file>.rs`. When you write a
 nontrivial test, do the manual version once: break the code, watch the
 test fail, restore it. If it stays green, the test is asserting the wrong

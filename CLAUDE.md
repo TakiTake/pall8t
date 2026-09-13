@@ -80,11 +80,17 @@ stop there.
 - Architecture decisions: [docs/adr/](docs/adr/)
 - Testing conventions (read before writing tests): [docs/testing.md](docs/testing.md)
 - Sandbox environment details: `.claude/skills/pall8t`
-- Review automation: report-only workflows for mutation testing
-  (`mutants.yml`) and duplication/unused-deps (`hygiene.yml`), each
-  weekly plus on-demand via `gh workflow run <name>` — reports, never
-  gates; Codex PR review (`codex-review.yml`) stays dormant until an
-  `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
+- Quality gates (`quality.yml`, per PR, **blocking**): incremental
+  mutation testing over the PR's own diff (`cargo mutants --in-diff` — a
+  missed mutant means a test that would not notice this change breaking)
+  and a 90% line-coverage floor. Suite size and wall time are recorded
+  there too, without gating. Whole-tree mutation (`mutants.yml`) and
+  duplication/unused-deps (`hygiene.yml`) stay **report-only** — weekly,
+  on each PR for hygiene, plus on-demand via `gh workflow run <name>`;
+  gating a whole-tree backlog teaches reflexive ignoring, while the
+  in-diff gate has no backlog to inherit.
+- Review automation: Codex PR review (`codex-review.yml`) stays dormant
+  until an `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
   `.coderabbit.yaml` — installed, but automatic review is off, so it runs
   only when someone comments `@coderabbitai review` on the PR (the free
   plan meters reviews).
