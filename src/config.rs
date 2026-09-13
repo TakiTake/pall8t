@@ -37,6 +37,9 @@ pub struct Config {
     /// Forward the host's SSH agent socket into the sandbox
     /// (`container run --ssh`). Off by default — see [`ssh_enabled`].
     pub ssh: bool,
+    /// How much the runtime confines the sandbox beyond the VM boundary
+    /// itself (see [`Hardening`]).
+    pub hardening: Hardening,
     pub mounts: Vec<MountEntry>,
     /// `[herdr]` — how much of the host herdr session a sandboxed agent
     /// may reach through the relay bridge (see [`crate::relay`]).
@@ -84,6 +87,42 @@ impl HerdrSandbox {
             HerdrSandbox::Full => "full",
             HerdrSandbox::Readonly => "readonly",
             HerdrSandbox::Off => "off",
+        }
+    }
+}
+
+/// How much the runtime confines the container, on top of the VM
+/// boundary that is always there.
+///
+/// `default` is what pall8t has always run: a writable root filesystem
+/// and the runtime's own capability set. `strict` drops every Linux
+/// capability, mounts the root filesystem read-only, and gives `/tmp` a
+/// tmpfs to write to — so the only writable paths left are the ones
+/// pall8t mounted on purpose (the workspace and the container home).
+///
+/// Opt-in rather than the default because it is the project's toolchain
+/// that decides whether it holds: a build that writes outside the
+/// workspace, or a tool that needs a capability, breaks under `strict`
+/// and works under `default`. Verified on apple/container 1.2.2 —
+/// `--read-only` yields `EROFS` outside the mounts, `--cap-drop ALL`
+/// leaves `CapEff: 0000000000000000`.
+/// The variant order **is** the confinement order — `Default < Strict` —
+/// and [`merge`] relies on it to take the stricter of two configs. A level
+/// added later belongs at the position matching how much it confines, not
+/// at the end of the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Hardening {
+    #[default]
+    Default,
+    Strict,
+}
+
+impl Hardening {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Hardening::Default => "default",
+            Hardening::Strict => "strict",
         }
     }
 }
@@ -138,6 +177,34 @@ fn project_ssh_ignored_warning(global: &Raw, project: &Raw, project_path: &Path)
              authenticate as you anywhere your keys are trusted. Enable it \
              in ~/.pall8t/config.toml, or per run with `pall8t run --ssh`.",
             project_path.display()
+        )
+    })
+}
+
+/// A project config that loosened hardening below what the human's global
+/// config set. Unlike `ssh`, this request *is* honored — the project knows
+/// its own toolchain — but it is the one config contradiction where a
+/// repository quietly gets less confinement than the user asked for, and
+/// that is worth a line on stderr. `None` when the project asked for
+/// nothing, asked to tighten, or agrees.
+fn project_hardening_loosened_notice(
+    global: &Raw,
+    project: &Raw,
+    project_path: &Path,
+) -> Option<String> {
+    let g = global.container.hardening.unwrap_or_default();
+    let p = project.container.hardening?;
+    (p < g).then(|| {
+        format!(
+            "[container] hardening = \"{}\" in {} lowers the \"{}\" your \
+             ~/.pall8t/config.toml asks for, and it wins — a project knows \
+             whether its toolchain runs under strict confinement. This run \
+             is therefore less confined than your global config alone would \
+             make it. Set hardening in that file if you would rather it did \
+             not.",
+            p.as_str(),
+            project_path.display(),
+            g.as_str()
         )
     })
 }
@@ -290,6 +357,7 @@ struct RawContainer {
     containerfile: Option<PathBuf>,
     watch: Option<Vec<PathBuf>>,
     ssh: Option<bool>,
+    hardening: Option<Hardening>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -457,6 +525,7 @@ pub fn load(project_dir: &Path) -> Result<Config> {
         .chain(deprecations_in(&project, &project_path))
         .collect();
     let ssh_ignored = project_ssh_ignored_warning(&global, &project, &project_path);
+    let hardening_notice = project_hardening_loosened_notice(&global, &project, &project_path);
     let merged = merge(global, project);
     // The inert-setting check reads the *merged* config, not each file:
     // a global `auto_rename = true` enables a project's `agent_name`, and
@@ -464,6 +533,7 @@ pub fn load(project_dir: &Path) -> Result<Config> {
     let warnings = per_file
         .into_iter()
         .chain(ssh_ignored)
+        .chain(hardening_notice)
         .chain(inert_agent_name_warning(&merged.herdr))
         .collect();
     Ok(Config { warnings, ..merged })
@@ -530,6 +600,20 @@ fn merge(global: Raw, project: Raw) -> Config {
             (_, Some(false)) => false,
             (g, _) => g.unwrap_or(false),
         },
+        // Per-field, project wins — deliberately *unlike* `ssh` above.
+        // Hardening governs capabilities and the rootfs *inside* the VM,
+        // not what the sandbox can reach outside it, and `default` is the
+        // confinement pall8t has always run at rather than extra power. A
+        // project whose toolchain breaks under `strict` has to be able to
+        // say so or the sandbox is simply broken for it. The contradiction
+        // a human would want to know about — their global `strict` quietly
+        // becoming `default` — is reported by
+        // [`project_hardening_loosened_notice`] rather than refused.
+        hardening: project
+            .container
+            .hardening
+            .or(global.container.hardening)
+            .unwrap_or_default(),
         mounts: project.mounts.or(global.mounts).unwrap_or_default(),
         // `[home]` is parsed and ignored; `load` turns its presence into a
         // deprecation message, which `merge` (path-less) can't produce.
@@ -571,6 +655,16 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # `pall8t run --ssh` / `--ssh=false`. Honored here and from the flag
 # only: a project's .pall8t/config.toml may turn it off, never on.
 # ssh = false
+#
+# How much the runtime confines the sandbox, on top of the VM boundary
+# that is always there:
+#   "default" (default) writable root filesystem, the runtime's own
+#             capability set — what every pall8t release has run
+#   "strict"  every Linux capability dropped, root filesystem read-only,
+#             /tmp on a tmpfs: the only writable paths left are the
+#             workspace and the container home. Opt in per project — a
+#             toolchain that writes outside those breaks under it.
+# hardening = "default"
 
 [run]
 # Command run by `pall8t run`. --dangerously-skip-permissions is NOT in
@@ -644,6 +738,11 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 # `ssh = true` in it is ignored (with a warning). Switching it on is the
 # human's call — ~/.pall8t/config.toml or `pall8t run --ssh`.
 # ssh = false
+#
+# "strict" drops every capability, mounts the root filesystem read-only,
+# and puts /tmp on a tmpfs — see ~/.pall8t/config.toml. Try it per
+# project: whether it holds depends on this project's toolchain.
+# hardening = "default"
 
 [run]
 # command = ["claude"]
@@ -814,6 +913,107 @@ mod tests {
             "and the correctly spelled key still parses, or the guard above \
              would be passing for the wrong reason"
         );
+    }
+
+    /// Hardening merges per field with the project winning, `ssh` does
+    /// not, and the difference is deliberate: hardening governs what the
+    /// sandbox may do *inside* the VM, where a project's toolchain is the
+    /// thing that decides whether `strict` holds at all. This pins the
+    /// asymmetry so neither rule drifts into the other — the ssh table
+    /// below is its counterpart.
+    #[test]
+    fn hardening_lets_the_project_decide_unlike_ssh() {
+        let strict = || parse("[container]\nhardening = \"strict\"\n");
+        let default = || parse("[container]\nhardening = \"default\"\n");
+        let quiet = Raw::default;
+
+        // (global, project, expected, why)
+        let cases: [(Raw, Raw, Hardening, &str); 5] = [
+            (
+                quiet(),
+                quiet(),
+                Hardening::Default,
+                "confinement that can break a toolchain must not arrive on \
+                 upgrade unasked",
+            ),
+            (
+                quiet(),
+                strict(),
+                Hardening::Strict,
+                "a project may tighten",
+            ),
+            (
+                strict(),
+                quiet(),
+                Hardening::Strict,
+                "and the human's global choice applies where a project is \
+                 silent",
+            ),
+            (
+                strict(),
+                strict(),
+                Hardening::Strict,
+                "agreement is not special",
+            ),
+            (
+                strict(),
+                default(),
+                Hardening::Default,
+                "a project may also opt back out: it knows whether its own \
+                 build survives a read-only rootfs, and a sandbox that \
+                 cannot build is no safer for it",
+            ),
+        ];
+        for (g, p, expected, why) in cases {
+            assert_eq!(merge(g, p).hardening, expected, "{why}");
+        }
+
+        assert!(
+            toml::from_str::<Raw>("[container]\nhardening = \"paranoid\"\n").is_err(),
+            "an unknown level must fail the parse rather than silently \
+             leaving the sandbox at default confinement"
+        );
+    }
+
+    /// The loosening is honored, but not in silence: it is the one config
+    /// contradiction where a repository ends up with less confinement than
+    /// the human's own file asked for.
+    #[test]
+    fn a_project_that_loosens_hardening_says_so() {
+        let notice = project_hardening_loosened_notice(
+            &parse("[container]\nhardening = \"strict\"\n"),
+            &parse("[container]\nhardening = \"default\"\n"),
+            Path::new("/repo/.pall8t/config.toml"),
+        )
+        .expect("a project lowering the human's confinement must say so");
+        assert!(
+            notice.contains("/repo/.pall8t/config.toml") && notice.contains("strict"),
+            "naming the file and the level it overrode is the whole value — \
+             both are facts the user cannot otherwise see: {notice}"
+        );
+
+        for (g, p, why) in [
+            (
+                "[container]\nhardening = \"default\"\n",
+                "[container]\nhardening = \"strict\"\n",
+                "tightening is not a contradiction worth a line",
+            ),
+            (
+                "[container]\nhardening = \"strict\"\n",
+                "[container]\nhardening = \"strict\"\n",
+                "agreeing is not either",
+            ),
+        ] {
+            assert!(
+                project_hardening_loosened_notice(
+                    &parse(g),
+                    &parse(p),
+                    Path::new("/repo/.pall8t/config.toml")
+                )
+                .is_none(),
+                "{why}"
+            );
+        }
     }
 
     #[test]
