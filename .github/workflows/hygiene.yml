@@ -11,6 +11,11 @@ on:
   schedule:
     # Weekly, Saturday 03:00 JST (Friday 18:00 UTC).
     - cron: '0 18 * * 5'
+  # Also per PR, still report-only: copy-paste is cheapest to notice in
+  # the change that introduces it, and bulk-generated code is where it
+  # shows up. The weekly run stays for whole-tree drift that no single PR
+  # is responsible for.
+  pull_request:
   workflow_dispatch:
 
 permissions:
