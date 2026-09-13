@@ -140,11 +140,34 @@ mod tests {
     /// Runs git in `dir`, reporting whether it succeeded. Returns false
     /// when git is missing entirely, so the test can skip rather than
     /// fail red on a machine without it.
+    ///
+    /// Runs with the host's git configuration switched off, which is not
+    /// tidiness but correctness: this test asserts what *pall8t* resolves
+    /// out of git's on-disk layout, so any host setting that can make
+    /// `git commit` fail turns a green build red for a reason the test is
+    /// not about. `commit.gpgsign = true` with an unusable signing program
+    /// is the one that was reported (review finding, PR #68), but it is an
+    /// instance rather than the problem — `core.hooksPath` pointing at a
+    /// rejecting pre-commit hook, a `commit.template` that is missing, or a
+    /// `gpg.format` the host cannot satisfy all break it the same way. So
+    /// the whole of the host's config is dropped rather than the single
+    /// setting overridden: `GIT_CONFIG_GLOBAL`/`SYSTEM` take out
+    /// `~/.gitconfig` and `/etc/gitconfig`, and clearing `GIT_CONFIG_COUNT`
+    /// (with git's internal `GIT_CONFIG_PARAMETERS`) takes out the
+    /// inline-config channel, which outranks both and would otherwise walk
+    /// straight back in from the environment the suite was launched with.
+    ///
+    /// The identity the commits need is passed per-invocation by the
+    /// caller, since there is no global config left to supply it.
     fn git(dir: &Path, args: &[&str]) -> bool {
         std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
