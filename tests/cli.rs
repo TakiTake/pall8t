@@ -1432,6 +1432,55 @@ fn a_configured_command_reaches_the_runtime_verbatim_inside_a_herdr_pane() {
     );
 }
 
+/// What replaced the per-run copy, and the one assertion that tells the two
+/// apart. ADR-0007 copied the verified herdr binary into a private
+/// directory per run and mounted *that* read-write, because nothing could
+/// be mounted read-only at the time; ADR-0009 made read-only mounts real,
+/// so the cache itself goes in with `ro` and no copy is made. Swapping
+/// `Mount::ro` back to `Mount::rw` here would leave the shared cache
+/// mounted writable — every sandbox able to corrupt the binary every other
+/// sandbox executes, which is strictly worse than either design. The `ro`
+/// in this argv is the whole safety property, so it is asserted literally.
+#[test]
+fn the_herdr_cli_is_mounted_from_the_verified_cache_read_only() {
+    let sb = Sandbox::new("run-herdr-ro");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
+    seed_verified_linux_herdr(&sb, "0.8.2");
+    let herdr_sock = sb.root.join("herdr.sock");
+    let host_herdr = std::os::unix::net::UnixListener::bind(&herdr_sock).unwrap();
+
+    sb.command()
+        .args(["run", "--", "claude"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "pane_42")
+        .env("HERDR_SOCKET_PATH", &herdr_sock)
+        .env("HERDR_BIN_PATH", &herdr_bin)
+        .output()
+        .unwrap();
+
+    let cache = sb.pall8t_root().join("tools").join("herdr").join("0.8.2");
+    let mount = run_line(&fake)
+        .split_whitespace()
+        .find(|a| a.contains("target=/opt/pall8t/bin"))
+        .expect("the herdr CLI has to reach the sandbox as a mount")
+        .to_string();
+    assert_eq!(
+        mount,
+        format!(
+            "type=virtiofs,source={},target=/opt/pall8t/bin,ro",
+            cache.display()
+        ),
+        "the source is the verified cache itself and the mount carries \
+         `ro`; without the flag this is the shared cache mounted writable, \
+         which is the one arrangement both designs existed to prevent"
+    );
+    drop(host_herdr);
+}
+
 /// The whole bridge, assembled: a herdr pane's environment, a host herdr
 /// CLI, a verified cached Linux build, and a real socket to forward to.
 /// `pall8t run` must announce the pane's agent to herdr, spawn the relay,
@@ -1482,39 +1531,17 @@ fn a_run_inside_a_herdr_pane_builds_the_socket_bridge() {
          is told to mount it, and it is the bridge's whole transport: {relay_sockets:?}"
     );
 
-    let staged: Vec<PathBuf> = sb
-        .pall8t_root()
-        .join("tools")
-        .join("herdr-run")
-        .read_dir()
-        .expect("the per-run copy directory exists")
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    assert_eq!(
-        staged.len(),
-        1,
-        "one private directory for this run: the shared cache is never the \
-         mount source, so one concurrent sandbox cannot overwrite the binary \
-         another is executing: {staged:?}"
-    );
-    let staged_bin = staged[0].join("herdr");
+    // The per-run copy is gone: ADR-0007 staged the binary into
+    // `tools/herdr-run/<container>/` so one sandbox could not overwrite the
+    // binary a concurrently running sandbox executes. A read-only mount of
+    // the verified cache removes the write outright instead — what replaces
+    // it is asserted in `the_herdr_cli_is_mounted_from_the_verified_cache_read_only`,
+    // which can see the argv this pre-exec test cannot.
     assert!(
-        staged_bin.is_file(),
-        "and it holds the binary itself — an empty directory would mount \
-         nothing and leave the sandbox without a herdr CLI: {staged:?}"
-    );
-    assert_eq!(
-        std::fs::read(&staged_bin).unwrap(),
-        std::fs::read(
-            sb.pall8t_root()
-                .join("tools")
-                .join("herdr")
-                .join("0.8.2")
-                .join("herdr")
-        )
-        .unwrap(),
-        "the copy must be of the *verified* cached build, byte for byte"
+        !sb.pall8t_root().join("tools").join("herdr-run").exists(),
+        "no per-run copy directory is created at all: leaving the staging \
+         behind would mean every launch still pays a multi-megabyte copy \
+         that nothing mounts"
     );
 
     let herdr_calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();

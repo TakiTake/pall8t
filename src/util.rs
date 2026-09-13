@@ -237,10 +237,12 @@ pub(crate) fn epoch_secs() -> u64 {
 
 /// How long ago `entry` was last modified, or `None` when that can't be
 /// read — an absent or unreadable mtime, or one in the future (a clock
-/// step, a filesystem with coarse timestamps). Both reapers in this crate
-/// (`herdr::prune_stale_run_bins`, `relay::reap_stale_sockets`) delete
-/// things based on this, and both must read `None` as *don't reap*, so
-/// the "unknown age" case is decided here once rather than in each walk.
+/// step, a filesystem with coarse timestamps). `relay::reap_stale_sockets`
+/// deletes things based on this and must read `None` as *don't reap*, so
+/// the "unknown age" case is decided here once rather than in the walk.
+/// (It had a sibling in `herdr`, reaping per-run copies of the herdr CLI,
+/// until the verified cache started being mounted read-only instead —
+/// ADR-0007's copy, and its reaper, are gone.)
 pub(crate) fn entry_age(entry: &std::fs::DirEntry) -> Option<std::time::Duration> {
     entry
         .metadata()

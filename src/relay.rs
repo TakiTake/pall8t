@@ -268,7 +268,7 @@ const SOCKET_REAP_GRACE: std::time::Duration = std::time::Duration::from_mins(5)
 /// succeed?" — the caller passes the real connect ([`socket_is_live`]),
 /// tests pass their own. A live run's socket is never reaped, so a
 /// concurrent sandbox keeps working; an unknown age never reaps, erring
-/// toward keeping (same rule as `should_reap_run_bin`).
+/// toward keeping.
 fn stale_sockets(
     candidates: Vec<(PathBuf, Option<std::time::Duration>)>,
     grace: std::time::Duration,
