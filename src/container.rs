@@ -629,17 +629,22 @@ pub struct Mount {
     pub dest: PathBuf,
     /// Mount it read-only. Enforced by the guest kernel — a write inside
     /// the container fails with `EROFS` — verified on apple/container
-    /// 1.2.2 and pinned by ADR-0009. Meaningless for [`Kind::Socket`],
+    /// 1.2.2 and pinned by ADR-0009. Meaningless for a socket mount,
     /// which forwards connections rather than mounting a filesystem.
     pub readonly: bool,
-    pub kind: Kind,
+    /// Private on purpose: it is what decides between `--mount` and the
+    /// unvalidated-options `-v` form, and only [`Mount::socket`] — which
+    /// rejects the `:` that form splits on — may select the latter. A
+    /// `pub` field would let a struct literal pick `Kind::Socket` past
+    /// that guard (see [`Mount::spec`]).
+    kind: Kind,
 }
 
 /// What the runtime does with a mount source. Directories become
 /// filesystems; a Unix socket becomes a forwarded socket the guest can
 /// connect to — the herdr bridge's transport (ADR-0007 amendment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
+pub(crate) enum Kind {
     Directory,
     Socket,
 }
@@ -691,33 +696,18 @@ impl Mount {
     /// references stay valid on both sides (ADR-0004's insight, retained
     /// by ADR-0006).
     pub fn identity(path: PathBuf) -> Self {
-        Mount {
-            host: path.clone(),
-            dest: path,
-            readonly: false,
-            kind: Kind::Directory,
-        }
+        Mount::new(path.clone(), path, false)
     }
 
     /// Writable mount of `host` at `dest`.
     pub fn rw(host: PathBuf, dest: PathBuf) -> Self {
-        Mount {
-            host,
-            dest,
-            readonly: false,
-            kind: Kind::Directory,
-        }
+        Mount::new(host, dest, false)
     }
 
     /// Read-only mount of `host` at `dest` — the sandbox can read it and
     /// cannot change it (ADR-0009).
     pub fn ro(host: PathBuf, dest: PathBuf) -> Self {
-        Mount {
-            host,
-            dest,
-            readonly: true,
-            kind: Kind::Directory,
-        }
+        Mount::new(host, dest, true)
     }
 
     /// The flag and value this mount goes out as.
@@ -737,7 +727,9 @@ impl Mount {
     /// guest. `-v` is the one form that reaches it. The ADR-0009 hazard
     /// doesn't ride along, because this form has no third field to
     /// mistype — `readonly` is meaningless for a forwarded socket, and
-    /// [`Mount::socket`] is the only constructor that produces one.
+    /// [`Mount::socket`], which rejects a `:` in either path, is the only
+    /// way to produce a [`Kind::Socket`] at all (the field is private, so
+    /// no struct literal can route around it).
     /// (Tracked upstream in TakiTake/pall8t#52; if apple/container lifts
     /// the parser restriction, this collapses back to `--mount`.)
     fn spec(&self) -> (&'static str, String) {
@@ -810,8 +802,9 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
     }
     // An init process inside the container: forwards signals to the agent
     // and reaps orphans it leaves behind — worth having wherever the
-    // agent spawns children of its own (tmux, agent teams, background
-    // shells). Unconditional because it changes nothing else: verified on
+    // agent spawns children of its own (agent teams, background shells,
+    // or tmux where a custom image still has it — the default image
+    // dropped tmux). Unconditional because it changes nothing else: verified on
     // 1.2.2 that the agent's own exit code still comes back (`exit 42` →
     // 42, with and without), and that pid 1 becomes the init rather than
     // the agent.
@@ -1333,10 +1326,13 @@ mod tests {
             .position(|a| a == "--ulimit")
             .map(|i| strict[i + 1].clone())
             .expect("strict sets a file-descriptor ceiling");
-        assert!(
-            nofile.starts_with("nofile="),
-            "the ulimit is the fd ceiling, in apple/container's \
-             <type>=<soft>[:<hard>] form: {nofile}"
+        assert_eq!(
+            nofile, "nofile=8192:16384",
+            "the exact ceiling is the contract, not merely the `nofile=` \
+             prefix: `nofile=` and `nofile=1` both satisfy a prefix check \
+             while leaving a sandbox that cannot open files, and the \
+             generous ceiling is deliberate — a hardening profile that \
+             breaks wide builds gets switched off rather than tightened"
         );
     }
 
@@ -1695,26 +1691,17 @@ mod tests {
         );
     }
 
-    /// The herdr bridge's socket is the one mount that must go out as
-    /// `-v`: 1.2.2's `--mount` parser accepts only a directory source,
-    /// while the runtime behind `-v` forwards a socket source into the
-    /// guest as a live socket (verified on 1.2.2). Two colon-separated
-    /// fields and no third — the unvalidated-options hazard ADR-0009
-    /// names has nothing to ride on here.
-    #[test]
-    fn socket_mount_goes_out_as_two_field_v() {
-        let spec = RunSpec {
+    /// The scalar scaffolding every `run_argv` test needs and none of them
+    /// is about: a name, an image, a workdir, host ids. Tests state only
+    /// the fields they actually assert on (`..base_spec()`), the way
+    /// `run_argv_shape` already reads its no-TTY variant. Three hand-copied
+    /// literals is what made adding one field a three-site edit.
+    fn base_spec() -> RunSpec {
+        RunSpec {
             name: "pall8t-x-abc12345-99".into(),
             image: "img".into(),
             workdir: PathBuf::from("/Users/me/src/x"),
-            mounts: vec![
-                Mount::identity(PathBuf::from("/Users/me/src/x")),
-                Mount::socket(
-                    PathBuf::from("/Users/me/.pall8t/run/pall8t-x-abc12345-99.sock"),
-                    PathBuf::from("/tmp/pall8t/herdr.sock"),
-                )
-                .unwrap(),
-            ],
+            mounts: vec![],
             cpus: 4,
             memory: "8g".into(),
             uid: 501,
@@ -1725,6 +1712,27 @@ mod tests {
             labels: vec![],
             hardening: crate::config::Hardening::Default,
             command: vec!["claude".into()],
+        }
+    }
+
+    /// The herdr bridge's socket is the one mount that must go out as
+    /// `-v`: 1.2.2's `--mount` parser accepts only a directory source,
+    /// while the runtime behind `-v` forwards a socket source into the
+    /// guest as a live socket (verified on 1.2.2). Two colon-separated
+    /// fields and no third — the unvalidated-options hazard ADR-0009
+    /// names has nothing to ride on here.
+    #[test]
+    fn socket_mount_goes_out_as_two_field_v() {
+        let spec = RunSpec {
+            mounts: vec![
+                Mount::identity(PathBuf::from("/Users/me/src/x")),
+                Mount::socket(
+                    PathBuf::from("/Users/me/.pall8t/run/pall8t-x-abc12345-99.sock"),
+                    PathBuf::from("/tmp/pall8t/herdr.sock"),
+                )
+                .unwrap(),
+            ],
+            ..base_spec()
         };
         let argv = run_argv(&spec);
         let v = argv
@@ -1793,20 +1801,8 @@ mod tests {
     #[test]
     fn ssh_forwarding_emits_the_flag() {
         let spec = RunSpec {
-            name: "pall8t-x-abc12345-99".into(),
-            image: "img".into(),
-            workdir: PathBuf::from("/Users/me/src/x"),
-            mounts: vec![],
-            cpus: 4,
-            memory: "8g".into(),
-            uid: 501,
-            gid: 20,
-            tty: false,
-            env: vec![],
             ssh: true,
-            labels: vec![],
-            hardening: crate::config::Hardening::Default,
-            command: vec!["claude".into()],
+            ..base_spec()
         };
         let argv = run_argv(&spec);
         assert!(
@@ -1825,9 +1821,7 @@ mod tests {
     #[test]
     fn run_argv_shape() {
         let spec = RunSpec {
-            name: "pall8t-x-abc12345-99".into(),
             image: "pall8t-x:501-20-abc123456789".into(),
-            workdir: PathBuf::from("/Users/me/src/x"),
             mounts: vec![
                 Mount::identity(PathBuf::from("/Users/me/src/x")),
                 Mount::rw(
@@ -1839,16 +1833,9 @@ mod tests {
                     PathBuf::from("/Users/me/src/lib"),
                 ),
             ],
-            cpus: 4,
-            memory: "8g".into(),
-            uid: 501,
-            gid: 20,
             tty: true,
             env: vec![("HERDR_ENV".into(), "1".into())],
-            ssh: false,
-            labels: vec![],
-            hardening: crate::config::Hardening::Default,
-            command: vec!["claude".into()],
+            ..base_spec()
         };
         let argv = run_argv(&spec);
         assert!(

@@ -1,10 +1,17 @@
-# CodeRabbit — free automated PR review for open-source/public repos.
+# CodeRabbit — automated PR review, on demand only.
 # Activation is a one-time human action: install the CodeRabbit GitHub App
 # (https://github.com/apps/coderabbitai) and grant it this repository;
 # this file then configures every review. It complements the Codex
 # workflow (.github/workflows/codex-review.yml): different model, second
 # pair of eyes — expect (and adjudicate) disagreements via the
 # review-loop skill rather than applying both blindly.
+#
+# Automatic review is off: the free plan meters reviews, so they are spent
+# deliberately rather than on every push. A review runs only when a human
+# asks for one in a PR comment — `@coderabbitai review` for the current
+# diff, `@coderabbitai full review` to re-review from scratch. Chat
+# auto-reply is off for the same reason; CodeRabbit answers when a comment
+# addresses `@coderabbitai` directly.
 language: "en-US"
 
 reviews:
@@ -13,7 +20,8 @@ reviews:
   high_level_summary: true
   poem: false
   auto_review:
-    enabled: true
+    enabled: false
+    auto_incremental_review: false
     drafts: false
   path_instructions:
     - path: "src/**/*.rs"
@@ -31,4 +39,4 @@ reviews:
         docs/requirements.md, not prose style.
 
 chat:
-  auto_reply: true
+  auto_reply: false

@@ -554,7 +554,7 @@ mod tests {
             ssh: false,
             hardening: crate::config::Hardening::default(),
             mounts: vec![],
-            deprecations: vec![],
+            warnings: vec![],
             herdr: crate::config::HerdrConfig::default(),
         }
     }

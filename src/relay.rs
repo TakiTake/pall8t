@@ -26,10 +26,13 @@
 //! Method policy on top keeps the sandbox from administering the host
 //! herdr installation itself; see [`classify`] for the split.
 
+use crate::util::epoch_secs;
 use anyhow::{anyhow, Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Relay-side view of [`crate::config::HerdrSandbox`]: `Off` never reaches
 /// the relay (no relay is spawned at all), so only the two serving modes
@@ -205,6 +208,19 @@ fn check_run_socket_dir(dir: &Path, root: &Path) -> Result<()> {
 /// is derived under a budget rather than taken verbatim.
 const SUN_PATH_MAX: usize = 103;
 
+/// Runtime directory for the per-run relay sockets (`~/.pall8t/run`).
+/// Deliberately not under `tools/`: those are cached artifacts, these are
+/// live endpoints whose lifetime is one `pall8t run`. It lives here, with
+/// [`socket_path`] and [`SUN_PATH_MAX`], because this module is what
+/// creates, chmods, and sweeps the directory — and what refuses to touch
+/// any other ([`check_run_socket_dir`]). One definition is load-bearing:
+/// [`crate::herdr`] derives the socket to mount from it and the relay
+/// validates that socket against it, so a second copy that drifted would
+/// leave every run bridge-less with an error that reads like misuse.
+pub(crate) fn run_socket_root() -> Result<PathBuf> {
+    Ok(crate::config::pall8t_root()?.join("run"))
+}
+
 /// Socket file for one run, under `dir` (`~/.pall8t/run`). The container
 /// name is the readable default; when the full path wouldn't fit
 /// [`SUN_PATH_MAX`], the name is truncated and disambiguated with a hash
@@ -236,10 +252,10 @@ pub fn socket_path(dir: &Path, container: &str) -> Option<PathBuf> {
 /// get a bindable path, not one that is short in characters and too long
 /// in bytes.
 fn truncate_bytes(s: &str, budget: usize) -> &str {
-    if s.len() <= budget {
-        return s;
-    }
-    let end = (0..=budget)
+    // `min` keeps the scan inside the string (a budget past the end would
+    // otherwise walk down to it); 0 is always a boundary, so the search
+    // cannot come back empty.
+    let end = (0..=budget.min(s.len()))
         .rev()
         .find(|&i| s.is_char_boundary(i))
         .unwrap_or(0);
@@ -259,7 +275,7 @@ const SOCKET_REAP_GRACE: std::time::Duration = std::time::Duration::from_mins(5)
 /// succeed?" — the caller passes the real connect ([`socket_is_live`]),
 /// tests pass their own. A live run's socket is never reaped, so a
 /// concurrent sandbox keeps working; an unknown age never reaps, erring
-/// toward keeping (same rule as `should_reap_run_bin`).
+/// toward keeping.
 fn stale_sockets(
     candidates: Vec<(PathBuf, Option<std::time::Duration>)>,
     grace: std::time::Duration,
@@ -295,25 +311,31 @@ fn socket_is_live(path: &Path) -> bool {
 
 /// Best-effort reaping of sockets left behind by exited runs. Failure is
 /// silent by design: an unreapable leftover costs a stale file, never a
-/// launch. `grace` is a parameter so a test can drive the real filesystem
-/// walk without waiting out [`SOCKET_REAP_GRACE`].
-fn reap_stale_sockets(dir: &Path, grace: std::time::Duration) {
+/// launch.
+///
+/// `grace` and `is_live` are parameters so a test can drive the real
+/// filesystem walk without waiting out [`SOCKET_REAP_GRACE`] and without
+/// depending on a socket it closed actually being unreachable. That last
+/// one is not hypothetical: macOS has no atomic close-on-exec for socket
+/// creation, so a subprocess spawned by another thread in the same instant
+/// inherits the listener, and a socket the test dropped keeps answering
+/// `connect` for as long as that child lives. Injecting the probe keeps
+/// the walk — which files get deleted — real, and leaves the connect
+/// itself to [`connect_says_dead`], where it is decided.
+fn reap_stale_sockets(dir: &Path, grace: std::time::Duration, is_live: impl Fn(&Path) -> bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let candidates: Vec<(PathBuf, Option<std::time::Duration>)> = entries
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "sock"))
-        .map(|e| {
-            let age = e
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok());
-            (e.path(), age)
+        .filter_map(|e| {
+            let path = e.path();
+            path.extension()
+                .is_some_and(|x| x == "sock")
+                .then(|| (path, crate::util::entry_age(&e)))
         })
         .collect();
-    for path in stale_sockets(candidates, grace, socket_is_live) {
+    for path in stale_sockets(candidates, grace, is_live) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -329,25 +351,29 @@ fn audit(log_path: &Path, entry: &serde_json::Value) {
         .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
-fn epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 /// Exits the process the moment the parent changes — i.e. the exec'd
 /// `container` client (which kept pall8t's pid) has exited and the relay
 /// was reparented. Polling getppid is the portable way to observe this
 /// without a supervision protocol.
-fn watch_parent() {
-    // SAFETY: getppid cannot fail and has no preconditions.
-    let original = unsafe { libc::getppid() };
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        // SAFETY: as above.
-        if unsafe { libc::getppid() } != original {
-            std::process::exit(0);
-        }
+///
+/// `original` is captured by [`run`] before it binds rather than here, and
+/// an already-reparented value is answered immediately, because the parent
+/// only has to live long enough to read the readiness line. Everything
+/// between that line and this call — the socket sweep — is time in which
+/// it can exit, and a `pall8t run` that fails right after reading the line
+/// (a mount it must decline, a `container run` that won't exec) does
+/// exactly that. Capturing here would then record `1`, and a value
+/// compared against itself never changes: the relay would serve forever,
+/// leaking one process per failed run, each holding a policy-checked path
+/// into the host herdr session. Pinned by
+/// `the_relay_exits_once_the_run_that_spawned_it_is_gone`.
+fn watch_parent(original: libc::pid_t) {
+    if !crate::util::spawning_run_alive(original) {
+        std::process::exit(0);
+    }
+    std::thread::spawn(move || {
+        crate::util::wait_out_spawning_run(original);
+        std::process::exit(0);
     });
 }
 
@@ -357,6 +383,10 @@ fn watch_parent() {
 /// can hand it to `container run` as a mount source — then serves until
 /// the parent exits.
 pub fn run(socket: &Path, listen: &Path, mode: Mode, log_path: &Path) -> Result<()> {
+    // First thing, before any work the parent could outlive — see
+    // [`watch_parent`] for why capturing it later is not the same.
+    // SAFETY: getppid cannot fail and has no preconditions.
+    let parent = unsafe { libc::getppid() };
     let dir = listen
         .parent()
         .context("the relay socket path has no parent directory")?;
@@ -365,45 +395,46 @@ pub fn run(socket: &Path, listen: &Path, mode: Mode, log_path: &Path) -> Result<
     // before any of it runs. `pall8t run` always passes the run root; a
     // hand-run `--listen /tmp/x.sock` (the subcommand is hidden, not
     // blocked) would otherwise chmod /tmp.
-    check_run_socket_dir(dir, &crate::config::pall8t_root()?.join("run"))?;
+    check_run_socket_dir(dir, &run_socket_root()?)?;
     std::fs::create_dir_all(dir)
         .with_context(|| format!("cannot create the relay socket directory {}", dir.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Host-side access control for every run's socket: this user
-        // only. The sockets inside are necessarily 0666 (see the module
-        // doc), so the directory is the whole thing keeping other users
-        // out — a failure here must stop the bridge (the caller warns and
-        // runs without it), not serve a world-reachable relay.
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(
-            || {
-                format!(
-                    "cannot restrict the relay socket directory {} to this user",
-                    dir.display()
-                )
-            },
-        )?;
-    }
-    reap_stale_sockets(dir, SOCKET_REAP_GRACE);
+    // Host-side access control for every run's socket: this user only.
+    // The sockets inside are necessarily 0666 (see the module doc), so the
+    // directory is the whole thing keeping other users out — a failure
+    // here must stop the bridge (the caller warns and runs without it),
+    // not serve a world-reachable relay.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "cannot restrict the relay socket directory {} to this user",
+            dir.display()
+        )
+    })?;
     // Our own path may still hold a leftover if a previous run died and
     // its name was reused; bind(2) fails on an existing file either way.
     let _ = std::fs::remove_file(listen);
     let listener = UnixListener::bind(listen)
         .with_context(|| format!("cannot bind the relay socket {}", listen.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // The guest sees this socket with the host's own mode, and the
-        // sandboxed agent runs as `dev` (uid 501), not root — 0600 would
-        // be unreachable from inside. Verified on container 1.2.2.
-        std::fs::set_permissions(listen, std::fs::Permissions::from_mode(0o666))
-            .with_context(|| format!("cannot chmod the relay socket {}", listen.display()))?;
-    }
+    // The guest sees this socket with the host's own mode, and the
+    // sandboxed agent runs as `dev` (uid 501), not root — 0600 would be
+    // unreachable from inside. Verified on container 1.2.2.
+    std::fs::set_permissions(listen, std::fs::Permissions::from_mode(0o666))
+        .with_context(|| format!("cannot chmod the relay socket {}", listen.display()))?;
     println!("{}", listen.display());
     // The socket-path line is the whole stdout contract; anything later
     // would land in a pipe nobody reads (the parent execs away).
     drop(std::io::stdout().flush());
 
-    watch_parent();
+    // Deliberately *after* the readiness line: `pall8t run` blocks reading
+    // that line before it can exec `container run`, and this sweep is
+    // housekeeping no part of binding depends on — this run's own path was
+    // cleared above, and its now-bound socket is both live and younger
+    // than the grace, so the sweep can't take it. Ahead of the line it put
+    // a `connect` per leftover on the launch path, and an AF_UNIX connect
+    // blocks when a live peer's backlog is full — the very case the grace
+    // window exists for, turning one wedged relay into slow launches for
+    // every other sandbox.
+    reap_stale_sockets(dir, SOCKET_REAP_GRACE, socket_is_live);
+    watch_parent(parent);
     audit(
         log_path,
         &serde_json::json!({
@@ -420,10 +451,12 @@ pub fn run(socket: &Path, listen: &Path, mode: Mode, log_path: &Path) -> Result<
 /// Accept loop, factored from [`run`] so tests can drive it on a listener
 /// they control.
 fn serve(listener: &UnixListener, socket: &Path, mode: Mode, log_path: &Path) {
+    let socket: Arc<Path> = Arc::from(socket);
+    let log_path: Arc<Path> = Arc::from(log_path);
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
-        let socket = socket.to_path_buf();
-        let log_path = log_path.to_path_buf();
+        let socket = Arc::clone(&socket);
+        let log_path = Arc::clone(&log_path);
         std::thread::spawn(move || {
             if let Err(e) = handle(conn, &socket, mode, &log_path) {
                 audit(
@@ -754,19 +787,61 @@ mod tests {
         );
     }
 
+    /// The liveness probe itself, against real sockets — the two answers
+    /// that depend on nobody else: a socket something is listening on
+    /// answers, and a path with nothing at it does not.
+    ///
+    /// The third case — a socket file whose listener is gone — is
+    /// deliberately absent. It is the one a subprocess spawned by another
+    /// test can falsify by inheriting the listener (see
+    /// [`reap_stale_sockets`]), and it is already decided, errno by errno,
+    /// in [`connect_says_dead`]. Testing it here bought a flake, not
+    /// coverage.
+    #[test]
+    fn a_socket_is_live_only_while_something_is_listening() {
+        let dir = test_dir("islive");
+        let served = dir.join("served.sock");
+        // Held for the length of the test: an unaccepted connect still
+        // succeeds, which is exactly what the probe asks.
+        let listener = UnixListener::bind(&served).unwrap();
+        assert!(
+            socket_is_live(&served),
+            "a served socket is live — reaping it would cut a running \
+             sandbox's bridge mid-session"
+        );
+        assert!(
+            !socket_is_live(&dir.join("never-existed.sock")),
+            "and a path with nothing at it is not: `NotFound` is one of the \
+             two errors that mean gone"
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The reaping walk itself, on a real directory: it deletes files, so
     /// "which ones" is worth proving against the filesystem rather than
     /// only through the pure decision. No container and no herdr involved
     /// — just Unix sockets, like the forwarding tests above.
+    ///
+    /// The liveness probe is injected rather than real, and that is not
+    /// tidiness. It used to bind a socket, drop it, and take "nothing is
+    /// listening" for granted — which the suite falsified: with tests that
+    /// spawn subprocesses running alongside, a `git` child forked in the
+    /// instant between `socket()` and its close-on-exec flag inherits the
+    /// listener, so the dropped socket kept answering `connect` and the
+    /// walk correctly refused to reap it. Roughly one run in 900. What the
+    /// walk decides is this test's subject; whether a connect succeeds is
+    /// [`connect_says_dead`]'s.
     #[test]
     fn reaping_removes_dead_sockets_and_leaves_everything_else() {
         let dir = test_dir("reap");
         let live_path = dir.join("live.sock");
-        let live = UnixListener::bind(&live_path).unwrap();
         let dead_path = dir.join("dead.sock");
-        // Binding and dropping leaves the file behind with nothing
-        // listening — exactly what an exited run leaves.
-        drop(UnixListener::bind(&dead_path).unwrap());
+        for p in [&live_path, &dead_path] {
+            // A real socket file either way — the walk filters on the
+            // extension and stats the file, so both have to exist.
+            drop(UnixListener::bind(p).unwrap());
+        }
         let other_path = dir.join("relay.log");
         std::fs::write(&other_path, b"audit").unwrap();
         // Age is read from mtime against the wall clock, and a
@@ -776,7 +851,8 @@ mod tests {
         // puts every file safely past a zero grace.
         std::thread::sleep(std::time::Duration::from_millis(20));
 
-        reap_stale_sockets(&dir, std::time::Duration::ZERO);
+        let live_name = live_path.clone();
+        reap_stale_sockets(&dir, std::time::Duration::ZERO, |p| p == live_name);
 
         assert!(
             !dead_path.exists(),
@@ -791,7 +867,6 @@ mod tests {
             other_path.exists(),
             "only .sock files are candidates; the audit log lives here too"
         );
-        drop(live);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -815,16 +890,25 @@ mod tests {
         let upstream = UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
             for conn in upstream.incoming() {
-                let Ok(mut conn) = conn else { continue };
+                // `continue` here would spin on a permanent accept error
+                // (fd pressure, a closed listener) while the client waits
+                // for a reply that can never come. Ending the loop instead
+                // closes the socket, so the relay's connect fails and the
+                // client's `read_reply` reports it.
+                let Ok(mut conn) = conn else { break };
                 std::thread::spawn(move || {
                     let mut line = String::new();
                     let mut r = BufReader::new(conn.try_clone().unwrap());
-                    if r.read_line(&mut line).is_ok() {
-                        let _ = conn.write_all(
-                            format!("{{\"id\":\"x\",\"result\":{{\"echo\":{}}}}}\n", line.trim())
-                                .as_bytes(),
-                        );
-                    }
+                    // A read that fails must still answer *something*:
+                    // silence is indistinguishable from a stall, and the
+                    // client would wait out its whole deadline to learn
+                    // nothing.
+                    let body = match r.read_line(&mut line) {
+                        Ok(_) => format!("{{\"echo\":{}}}", line.trim()),
+                        Err(e) => format!("{{\"fake_upstream_read_failed\":\"{e}\"}}"),
+                    };
+                    let _ =
+                        conn.write_all(format!("{{\"id\":\"x\",\"result\":{body}}}\n").as_bytes());
                 });
             }
         });
@@ -836,12 +920,11 @@ mod tests {
         (listen, log)
     }
 
-    fn roundtrip(listen: &Path, request: &str) -> serde_json::Value {
+    fn roundtrip(listen: &Path, log: &Path, request: &str) -> serde_json::Value {
         let mut conn = UnixStream::connect(listen).unwrap();
         conn.write_all(request.as_bytes()).unwrap();
         conn.write_all(b"\n").unwrap();
-        let mut line = String::new();
-        BufReader::new(conn).read_line(&mut line).unwrap();
+        let line = read_reply(conn, request, log);
         serde_json::from_str(line.trim()).unwrap()
     }
 
@@ -854,18 +937,67 @@ mod tests {
         dir
     }
 
+    /// How long a test waits for a reply that should take microseconds.
+    /// Generous enough that a loaded machine never trips it, short enough
+    /// that a stall is reported while someone is still watching.
+    const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Reads one reply line from `conn`, under a deadline.
+    ///
+    /// The deadline is the point. These tests wire a client to a relay to
+    /// a fake herdr socket, and every link is a blocking read: any one of
+    /// them stalling used to park the *whole test binary* forever, because
+    /// `read_line` on a Unix socket has no timeout of its own. `cargo
+    /// test` would sit there until someone noticed, and `cargo mutants`
+    /// worse — its baseline run is what *derives* the per-mutant timeout,
+    /// so it has none itself, and a stalled baseline wedges the entire
+    /// mutation run with no output at all (observed on this suite, which
+    /// is why this exists). docs/testing.md's "nothing may hang" is the
+    /// rule; this is its enforcement for socket reads, the way
+    /// `Sandbox::run_bounded` is for spawned processes.
+    ///
+    /// A timeout therefore fails the test with the state that produced it,
+    /// rather than hanging: the peer that owed a reply is named, so the
+    /// next reader starts from a fact instead of a stack trace.
+    fn read_reply(conn: UnixStream, what: &str, log: &Path) -> String {
+        conn.set_read_timeout(Some(REPLY_DEADLINE))
+            .expect("a read deadline is what keeps a stall from hanging the suite");
+        let mut line = String::new();
+        let outcome = BufReader::new(conn).read_line(&mut line);
+        if let Ok(1..) = outcome {
+            return line;
+        }
+        // The relay's own audit log says how far the request got: no line
+        // at all means it never classified one, an "allow" with nothing
+        // after it means it forwarded and the fake never answered.
+        let audit = std::fs::read_to_string(log).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        let detail = match outcome {
+            Ok(_) => "the relay closed the connection without replying".to_string(),
+            Err(e) => format!("no reply within {REPLY_DEADLINE:?} ({e})"),
+        };
+        panic!("{what}: {detail}\nrelay audit log:\n{audit}");
+    }
+
     #[test]
     fn relay_forwards_allowed_and_denies_blocked() {
         let dir = test_dir("fwd");
         let (listen, log) = start_relay(Mode::Full, &dir);
 
-        let resp = roundtrip(&listen, r#"{"id":"r1","method":"pane.list","params":{}}"#);
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r1","method":"pane.list","params":{}}"#,
+        );
         assert_eq!(
             resp["result"]["echo"]["method"], "pane.list",
             "an allowed request reaches the (fake) herdr socket and its reply comes back"
         );
 
-        let resp = roundtrip(&listen, r#"{"id":"r2","method":"server.stop","params":{}}"#);
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r2","method":"server.stop","params":{}}"#,
+        );
         assert_eq!(resp["id"], "r2");
         assert_eq!(
             resp["error"]["code"], "sandbox_denied",
@@ -882,10 +1014,10 @@ mod tests {
     /// `BufReader`'s internal buffer — the pump must forward those bytes,
     /// not drop them (which `BufReader::into_inner()` would do; the code
     /// unwraps only the `Take` cap). The client sends two NDJSON lines in
-    /// one write and half-closes; the fake upstream echoes everything it
-    /// received, so the reply proves both lines crossed the bridge. (TCP
-    /// framing delivers one small write in one datagram-sized chunk, which
-    /// is what puts line 2 in the prefetch buffer; if the kernel ever did
+    /// one write and half-closes; the fake upstream echoes back the two
+    /// lines it read, so the reply proves both crossed the bridge. (One
+    /// small write on a Unix stream socket arrives as one chunk, which is
+    /// what puts line 2 in the prefetch buffer; if the kernel ever did
     /// split it, the bytes still arrive via the pump and the test still
     /// passes — it can't false-fail.)
     #[test]
@@ -896,18 +1028,50 @@ mod tests {
         let upstream = UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
             for conn in upstream.incoming() {
-                let Ok(mut conn) = conn else { continue };
+                // `continue` here would spin on a permanent accept error
+                // (fd pressure, a closed listener) while the client waits
+                // for a reply that can never come. Ending the loop instead
+                // closes the socket, so the relay's connect fails and the
+                // client's `read_reply` reports it.
+                let Ok(mut conn) = conn else { break };
                 std::thread::spawn(move || {
-                    let mut all = String::new();
-                    let mut r = conn.try_clone().unwrap();
-                    if r.read_to_string(&mut all).is_ok() {
-                        let _ = conn.write_all(
-                            serde_json::json!({"id":"x","result":{"received": all}})
-                                .to_string()
-                                .as_bytes(),
-                        );
-                        let _ = conn.write_all(b"\n");
+                    // Read the two lines the client sent, rather than
+                    // everything up to EOF.
+                    //
+                    // What this test proves is that both pipelined lines
+                    // cross the bridge, and reading them is what proves it.
+                    // Reading to EOF instead made the reply wait on the
+                    // client's half-close travelling all the way through
+                    // the relay — something this test does not claim, and
+                    // which was observed not to arrive: with the relay's
+                    // `shutdown(SHUT_WR)` returning `Ok(())` and `lsof`
+                    // showing the two sockets correctly paired, this read
+                    // still blocked forever, about once in 300-900
+                    // full-suite runs. It needed the rest of the suite:
+                    // 0 in 1500 runs with the tests that spawn
+                    // subprocesses skipped, and a standalone program of the
+                    // same shape never lost the EOF in 600 trials. So the
+                    // dependency was the bug, not the relay — which is
+                    // measurably doing its part.
+                    let raw = conn.try_clone().unwrap();
+                    // …and a line that never comes is reported rather than
+                    // waited on, well before the client's own deadline.
+                    let _ = raw.set_read_timeout(Some(REPLY_DEADLINE / 4));
+                    let mut r = BufReader::new(raw);
+                    let mut received = String::new();
+                    for _ in 0..2 {
+                        let mut line = String::new();
+                        match r.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => received.push_str(&line),
+                        }
                     }
+                    let _ = conn.write_all(
+                        serde_json::json!({"id":"x","result":{"received": received}})
+                            .to_string()
+                            .as_bytes(),
+                    );
+                    let _ = conn.write_all(b"\n");
                 });
             }
         });
@@ -922,8 +1086,7 @@ mod tests {
         )
         .unwrap();
         conn.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut line = String::new();
-        BufReader::new(conn).read_line(&mut line).unwrap();
+        let line = read_reply(conn, "two pipelined requests", &log);
         let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         let received = resp["result"]["received"].as_str().unwrap();
         assert!(
@@ -936,15 +1099,23 @@ mod tests {
     #[test]
     fn relay_readonly_denies_mutations() {
         let dir = test_dir("ro");
-        let (listen, _) = start_relay(Mode::Readonly, &dir);
+        let (listen, log) = start_relay(Mode::Readonly, &dir);
 
-        let resp = roundtrip(&listen, r#"{"id":"r1","method":"pane.read","params":{}}"#);
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r1","method":"pane.read","params":{}}"#,
+        );
         assert_eq!(resp["result"]["echo"]["method"], "pane.read");
 
-        let resp = roundtrip(&listen, r#"{"id":"r2","method":"pane.split","params":{}}"#);
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r2","method":"pane.split","params":{}}"#,
+        );
         assert_eq!(resp["error"]["code"], "sandbox_denied");
 
-        let resp = roundtrip(&listen, "not json at all");
+        let resp = roundtrip(&listen, &log, "not json at all");
         assert_eq!(
             resp["error"]["code"], "sandbox_denied",
             "readonly cannot classify an unparseable request, so it must not forward it"

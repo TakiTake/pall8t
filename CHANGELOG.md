@@ -10,12 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`[container] ssh`: forward the host's SSH agent into the sandbox**
-  (`container run --ssh`), so an agent can push over SSH without a
-  private key ever entering the container home. Off by default —
-  while the run lasts, the sandbox can authenticate as you anywhere your
-  keys are trusted. `pall8t run --ssh` / `--ssh=false` overrides it for
-  one run, and pall8t warns when forwarding is on but the host has no
-  `SSH_AUTH_SOCK` (the runtime would otherwise forward nothing silently).
+  (`container run --ssh`,
+  [ADR-0012](docs/adr/0012-ssh-agent-forwarding.md)), so an agent can push
+  over SSH without a private key ever entering the container home. Off by
+  default — while the run lasts, the sandbox can authenticate as you
+  anywhere your keys are trusted. `pall8t run --ssh` / `--ssh=false`
+  overrides it for one run, and pall8t warns when forwarding is on but the
+  host has no agent to forward — both an unset `SSH_AUTH_SOCK` and one
+  naming a socket no agent answers on. pall8t connects to it rather than
+  checking the path exists, because an agent killed without cleaning up
+  leaves its socket file behind: present to `Path::exists`, refusing every
+  connection. The runtime would otherwise forward nothing silently while
+  still setting `SSH_AUTH_SOCK` in the guest.
 - **A herdr plugin in `contrib/herdr-plugin/`**: sandbox status, a second
   shell inside the pane's container, an image rebuild, and a stop —
   driven from herdr, linked with `herdr plugin link contrib/herdr-plugin`.
@@ -32,27 +38,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like `pane.graphics.stream`, are absent from it).
 - **`[container] hardening = "strict"`**: drop every Linux capability,
   mount the container's root filesystem read-only, put `/tmp` on a tmpfs,
-  and cap file descriptors — leaving the workspace and the container home
-  as the only writable paths. Opt-in per project: whether it holds
-  depends on the project's toolchain. The default level is unchanged.
+  and cap file descriptors — leaving the workspace, the container home and
+  that `/tmp` as the only writable paths (the tmpfs is writable but lives
+  in memory and is gone when the run ends; everything else is `EROFS`).
+  Opt-in per project: whether it holds depends on the project's toolchain.
+  The default level is unchanged.
 - **Every run now gets an init process** (`container run --init`), which
   forwards signals to the agent and reaps the orphans it leaves behind
-  (tmux, background shells, teammate agents). Exit-code propagation is
+  (background shells, teammate agents, and a `tmux` session if you put
+  tmux back in your own image). Exit-code propagation is
   unchanged — verified on 1.2.2 for both a plain exit and a signal.
 - **Every `pall8t run` container carries provenance labels**
   (`pall8t.version`, `pall8t.project`, `pall8t.image`, the herdr pane /
   workspace / tab and sandbox mode when running under herdr, and a
   worktree's main git dir), and `pall8t ls --json` reports them alongside
   the image. `pall8t ls` now recognizes its containers by the
-  `pall8t.version` label rather than by the `pall8t-` name prefix — the
-  prefix stays as a fallback for containers started by an older pall8t,
-  and a container someone else happened to name `pall8t-…` no longer
-  counts as one of ours.
-- `pall8t build --no-cache`: bypass the builder's layer cache and re-run
-  every `RUN` step. `pall8t build` alone already rebuilds unconditionally,
-  but a step whose instruction text didn't change — e.g. the claude CLI's
-  `npm install -g` in the dev image — was still served from the layer
-  cache, so "latest" fetches never actually refreshed.
+  `pall8t.version` label rather than by the `pall8t-` name prefix. The
+  prefix stays as a fallback so containers started by an older pall8t
+  remain visible, which means a container someone else named `pall8t-…`
+  still matches for now — the prefix was never a sound test, and dropping
+  the fallback is what will fix that. Those sessions are `--rm` and in
+  the foreground, so one release is enough for the fallback to go.
+
+### Security
+
+- **A project's `.pall8t/config.toml` can no longer switch SSH forwarding
+  on** — only your own `~/.pall8t/config.toml` or `pall8t run --ssh` can.
+  A project config ships with the repository, so honoring `ssh = true`
+  there let cloned code vote itself the use of your SSH agent, silently.
+  A project may still turn forwarding *off*, and one that asks to enable
+  it is now told the request was ignored and how to ask legitimately.
+- **A run that forwards the agent says so on stderr.** Previously only
+  the failure path spoke, so a working forward left nothing on screen.
+- **A misspelled key under `[container]` now fails the parse** rather than
+  being accepted and ignored (`deny_unknown_fields`, as `[herdr]` already
+  had). The direction that needed it is *narrowing*: a project may only
+  turn forwarding off, so `shh = false` against a global `ssh = true` is a
+  repository saying "do not hand my agent to this code" — silently
+  dropped, that run forwarded the agent anyway with nothing on screen. A
+  typo in the enabling direction was always safe (forwarding stays off);
+  this closes the other one.
+- **The `known_hosts` bake no longer fails open.** `curl … | jq …` in a
+  `RUN` step runs under `/bin/sh` with no `pipefail`, so a failed fetch
+  left `jq` to exit 0 on empty input and the image built with an empty
+  `/etc/ssh/ssh_known_hosts`. The steps are now separate and each is
+  checked, including that the extracted key list is non-empty.
 
 ### Fixed
 
@@ -69,13 +99,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The default image bakes GitHub's SSH host keys into
+  `/etc/ssh/ssh_known_hosts`** (from the authenticated `api.github.com/meta`,
+  as the repo's own dev image already did). Without them a forwarded agent
+  is unusable for its main purpose: the sandbox is non-interactive, so an
+  unknown host key is not a prompt anyone can answer — `git push` just dies
+  on "Host key verification failed" without ever consulting the agent. A
+  custom Containerfile needs the same line. `jq` joins the default image's
+  tool list to do it.
+
+## [0.6.0] - 2026-09-05
+
+### Changed
+
+- **`[herdr] auto_rename`'s tab/agent number is now pall8t's own counter**,
+  reset when the herdr server restarts (issues #76 and its follow-up;
+  [ADR-0011](docs/adr/0011-tab-numbering-state.md)). It replaces two
+  schemes that both read a number out of herdr, and both got a tab's name
+  wrong: the tab id's counter never restarts with the server (herdr
+  persists it in `session.json`), so a fresh project opened at whatever
+  count the workspace had already reached — and it silently produced no
+  number at all past a workspace's ninth tab, since herdr encodes tab ids
+  in base-32 and `tA` does not parse as 10. The tab's *position* restarts
+  correctly but belongs to the list rather than the tab: closing one tab
+  renumbered every later one, so a name written yesterday stopped meaning
+  the tab it was written for, and a new tab landed on a name an older tab
+  was still wearing.
+
+  A number is now handed out once and never reused while one herdr server
+  run lasts, so a tab keeps its name for its whole life. pall8t records the
+  counters in `~/.pall8t/state/herdr-naming.json` — its first durable state
+  of its own — keyed to the server run by the API socket's identity, since
+  herdr exposes no session id, pid or start time. A tab herdr restored
+  keeps the number its own label carries rather than being renamed, and a
+  restarted counter starts past the labels still on screen, so a reset
+  lands on 1 only when nothing is left wearing one. Numbering no longer
+  depends on any herdr call succeeding.
+
+- **A name is checked against the labels the other tabs already wear**, not
+  only against the names live agents answer to. Two tabs could otherwise
+  end up reading the same thing — as two did, live — because herdr enforces
+  no uniqueness on labels and a tab whose agent has exited is invisible to
+  `agent.list`.
+
+- **Docs corrected against the code.** The README claimed a project
+  Containerfile builds with its own directory as the build context — ADR-0010
+  moved that to the project root, so `COPY` paths shown as unreachable were
+  in fact the supported ones. The `pall8t init` config skeletons still
+  described `auto_rename`'s suffix as "the tab's number", a scheme
+  [ADR-0011](docs/adr/0011-tab-numbering-state.md) replaced. Also: the herdr
+  section now leads with a sample `[herdr]` block, the four denied host-admin
+  namespaces are named rather than sampled, and the herdr skill points at the
+  relay audit log's real filename.
+
+- **CodeRabbit reviews on demand only.** With the trial over, the free plan
+  meters reviews, so `.coderabbit.yaml` turns off automatic review and chat
+  auto-reply: a review runs when someone comments `@coderabbitai review`
+  (or `full review`) on the PR, and CodeRabbit answers a comment that
+  addresses it directly. Nothing about how findings are handled changes —
+  the `review-loop` skill still verifies each one before acting.
+
+### Removed
+
+- **The tmux integration is gone**: the images no longer install tmux or
+  ship an `/etc/tmux.conf`, and pall8t no longer rewrites a configured
+  `tmux` command when it runs inside a herdr pane. The README section on
+  Claude Code's agent-teams split panes goes with them.
+
+  Nothing about `[run] command` changes shape — a tmux command still runs
+  if tmux is in the image, it is simply no longer provided or special-cased.
+  Two consequences worth knowing:
+
+  - **Breaking: the default image loses tmux**, so `command = ["tmux", …]`
+    against it now fails at launch. Add `tmux` back in your own Containerfile
+    (`~/.pall8t/Containerfile` for every project, `.pall8t/Containerfile`
+    for one) if you want it. An existing `~/.pall8t/Containerfile` is never
+    overwritten, so an already-initialized user keeps tmux until they take
+    it out themselves.
+  - **A configured `tmux` command now reaches the runtime verbatim in a
+    herdr pane**, where before it was replaced with plain `claude`. That
+    substitution also caught tmux commands wrapping a *different* agent,
+    which is one reason it went.
+
+## [0.5.0] - 2026-08-29
+
+### Added
+
+- **`pall8t run` can name the herdr tab and agent it launches in** (issue
+  #71), opt-in via `auto_rename = true` under `[herdr]`. A herdr agent's
+  name is what makes `herdr agent prompt <target> …` usable across
+  sandboxes; without one the only working target is the pane id, which
+  changes every run. pall8t now names both the tab and the agent with the
+  same string — the workspace directory's basename plus the tab's number
+  (`~/src/foo` in tab 2 → `foo-2`), or `[herdr] agent_name` in place of
+  the basename — so the name on the tab is the name you type. A name a
+  live agent already holds gets a further counter (`foo-2-2`). A tab you
+  labeled yourself is left alone; one still on herdr's own label — or
+  carrying a label pall8t wrote there on an earlier run — is taken over,
+  so a second run in the same tab can't leave the label pointing at some
+  other run's agent. When a label really is someone else's, the run says
+  which name reaches the agent and which one the tab keeps. Undefined
+  means off, and `agent_name` on its own does not switch it on — that
+  combination warns instead of silently doing nothing. Naming happens in
+  every `[herdr] sandbox` mode, `off` included.
+- **`skills/pall8t-herdr/SKILL.md`** — a published skill for delegating to a
+  sibling agent from inside a sandbox over the herdr bridge. herdr's own skill
+  documents the CLI; this one documents the pall8t-specific half, led by the
+  settled-state trap: `herdr agent prompt … --wait --until idle` can never match
+  a pane the human isn't watching (it settles into `done`, not `idle`), so it
+  runs to its timeout long after the target answered — which reads as a stalled
+  bridge. Focusing the tab is the only thing that clears `done`, which is why
+  `--until idle` survives attended testing and fails unattended. Measured on a
+  live pair: plain `--wait` returned in 2.2 s, the same call with `--until idle`
+  ran its full timeout; in the original report the target settled 3.3 s in and
+  the caller stayed blocked a further 121 s. The bridge itself adds no latency
+  (4.4 s host-direct vs 4.0 s via the relay socket vs 2.0 s from inside the
+  container).
+- `pall8t build --no-cache`: bypass the builder's layer cache and re-run
+  every `RUN` step. `pall8t build` alone already rebuilds unconditionally,
+  but a step whose instruction text didn't change — e.g. the claude CLI's
+  `npm install -g` in the dev image — was still served from the layer
+  cache, so "latest" fetches never actually refreshed.
+
+### Fixed
+
+- **The herdr relay no longer leaks a process when the run that spawned it
+  exits immediately.** It watches for reparenting to decide when its run is
+  over, but sampled its parent *after* binding and announcing its socket —
+  by which point a `pall8t run` that failed right after reading that
+  announcement was already gone, leaving the relay comparing the reparent
+  target against itself, a condition that can never become true. Such a
+  relay served until the machine was rebooted. The parent is now sampled
+  before any of that, and a relay that finds itself already orphaned exits
+  instead of serving.
+
+### Changed
+
 - **The sandbox's Linux `herdr` CLI is now the verified cache itself,
   mounted read-only**, instead of a per-run copy mounted read-write. The
   copy existed only because ADR-0007 believed read-only mounts were
   unavailable; a read-only mount is strictly stronger (the sandbox cannot
   corrupt even its own CLI) and drops a multi-megabyte copy from every
-  bridged launch. `~/.pall8t/tools/herdr-run/` is no longer used —
-  leftover directories there are inert and can be deleted by hand.
+  bridged launch. `~/.pall8t/tools/herdr-run/` is no longer used by this
+  version — leftover directories there can be deleted by hand once every
+  sandbox started by an older pall8t has exited, since such a run is still
+  executing out of one.
 - **The herdr sandbox bridge is now a mounted Unix socket, not a TCP
   relay.** The host-side relay listens on its own socket under
   `~/.pall8t/run/` and pall8t mounts that socket into the container at
@@ -102,8 +270,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`flake.nix` + `flake.lock`) instead of `mise.toml`: `nix develop` on the
   host and the dev-container image (`.pall8t/Containerfile`) both provision
   Rust from the same lock file.
-- The dev image's userland tools (git, ripgrep, jq, less, vim, tmux, socat,
-  gh, node) also come from the flake now (`#sandbox-tools`), pinned by
+- The dev image's userland tools (git, ripgrep, jq, less, vim, tmux, gh,
+  node) also come from the flake now (`#sandbox-tools`), pinned by
   `flake.lock` instead of floating apt/NodeSource/GitHub-CLI repository
   state; the NodeSource and GitHub-CLI apt repositories are gone from the
   image. apt keeps only what nix can't cover: the bootstrap pair
@@ -349,7 +517,9 @@ container home.
   management (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in
   favor of the shared-home mode.
 
-[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.6.0
+[0.5.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.5.0
 [0.4.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.4.0
 [0.3.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.3.0
 [0.2.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.2.0

@@ -10,8 +10,15 @@ and denied in readonly mode, and nobody finds out.
 
 This is a REPORT, not a gate (issue #59, same posture as the mutation and
 hygiene workflows). Classification stays a human decision: the script
-says what changed, never edits the list. It always exits 0 — including
-when herdr isn't installed, which is a skip, not a failure.
+says what changed, never edits the list. Every *finding* exits 0, and so
+does a missing herdr — that is a skip, not a failure.
+
+What does exit non-zero is this script being unable to do its job at
+all: schema output that is not JSON, a schema with no methods in it, or
+a `relay.rs` whose `READ`/`ADMIN_NAMESPACES` it cannot parse. None of
+those are drift — they are the report checking nothing, and a drift
+report that silently checks nothing is worse than a red weekly job,
+because it reads exactly like a clean one.
 
 Inventory source: `herdr api schema --json`, whose `schemas.request.oneOf`
 carries one entry per method. Pass --schema to read a saved copy instead.
@@ -69,8 +76,14 @@ def classify(method: str, read: set[str], admin: list[str]) -> str:
 
 
 def load_schema(args) -> dict | None:
+    """The schema, or `None` for the one case that is a legitimate skip:
+    no herdr to ask. Unparseable output is not that case — it is the
+    thing this script is here to notice, so it stops loudly."""
     if args.schema:
-        return json.loads(Path(args.schema).read_text())
+        try:
+            return _parse(Path(args.schema).read_text(), args.schema)
+        except OSError as e:
+            raise SystemExit(f"cannot read {args.schema}: {e}") from e
     try:
         out = subprocess.run(
             [args.herdr, "api", "schema", "--json"],
@@ -79,7 +92,22 @@ def load_schema(args) -> dict | None:
     except (FileNotFoundError, subprocess.CalledProcessError) as e:
         print(f"skipped: cannot read herdr's schema via `{args.herdr} api schema --json` ({e})")
         return None
-    return json.loads(out)
+    return _parse(out, f"`{args.herdr} api schema --json`")
+
+
+def _parse(text: str, source: str) -> dict:
+    """JSON, or a one-line failure rather than a traceback. A herdr that
+    prints anything alongside its JSON — a deprecation notice, a progress
+    line — lands here, and that is a herdr change worth a human look,
+    which is this script's whole subject."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SystemExit(
+            f"cannot parse the schema from {source}: {e}. "
+            "Not drift — the inventory could not be read at all, so this "
+            "report would have checked nothing."
+        ) from e
 
 
 def main() -> int:
@@ -94,8 +122,14 @@ def main() -> int:
 
     methods = herdr_methods(schema)
     if not methods:
-        print("skipped: no request methods in the schema — its shape may have changed")
-        return 0
+        # Same class as unparseable output, so the same treatment: a
+        # schema that parsed but yielded no methods means the walk below
+        # compares the READ list against nothing and reports clean.
+        raise SystemExit(
+            "no request methods found under `schemas.request.oneOf` — the "
+            "schema parsed but its shape has changed, so there was nothing "
+            "to compare the relay's list against."
+        )
 
     read, admin = relay_classification(RELAY.read_text())
     protocol = schema.get("protocol", "?")

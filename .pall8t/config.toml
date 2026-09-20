@@ -25,3 +25,12 @@ readonly = true
 [[mounts]]
 source = "~/ghq/github.com/herdrdev/herdr"
 readonly = true
+
+# Dogfooding issue #71: this repo's own sandboxes name their herdr tab and
+# agent together, so the label on the tab is the target you can type at
+# `herdr agent prompt`. `agent_name` shortens the basename pall8t would
+# otherwise use — `p-2` reads better on a tab than `pall8t-2`, and several
+# of these run side by side while working on pall8t itself.
+[herdr]
+auto_rename = true
+agent_name = "p"

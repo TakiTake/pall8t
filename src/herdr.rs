@@ -24,7 +24,7 @@ pub struct HerdrEnv {
 }
 
 impl HerdrEnv {
-    fn herdr_bin(&self) -> &str {
+    pub fn herdr_bin(&self) -> &str {
         self.bin_path.as_deref().unwrap_or("herdr")
     }
 }
@@ -71,14 +71,20 @@ pub fn agent_hint(env: &HerdrEnv, command: &[String]) -> Option<String> {
 
 /// The one herdr-pane identity entry point for `pall8t run`: derives the
 /// agent hint, explains a shadowed `HERDR_AGENT`, reports the sidebar
-/// display name, and returns the hint for the exec's argv0. Everything
-/// here is best-effort chrome — failures warn and the run continues — and
-/// with no derivable name it does nothing at all: better to leave the
-/// pane's herdr-side identity alone than to assert a guess.
+/// display name, names the tab and agent when the user opted into that
+/// and returns the hint for the exec's argv0. Best-effort chrome — a
+/// failure warns and the run continues.
+///
+/// Does nothing at all with no derivable name: better to leave the pane's
+/// herdr-side identity alone than to assert a guess. Naming the tab and
+/// the agent is a separate step ([`crate::naming::name_pane`]), called
+/// alongside this one from `cmd_run` — it runs under different conditions
+/// (a tab whose pane hosts no recognized agent is still a tab a human has
+/// to find) and belongs to the top-level sequence, not inside this.
 pub fn announce_pane_identity(env: &HerdrEnv, command: &[String]) -> Option<String> {
     let agent = agent_hint(env, command)?;
-    // The command wins over HERDR_AGENT (see agent_hint); say so when they
-    // disagree, or the shadowed env var is undebuggable.
+    // The command wins over HERDR_AGENT (see agent_hint); say so when
+    // they disagree, or the shadowed env var is undebuggable.
     if let Some(env_agent) = env.agent.as_deref().filter(|a| *a != agent) {
         eprintln!(
             "pall8t: note: herdr pane agent is {agent:?} (from the run \
@@ -167,21 +173,6 @@ fn agent_name_token(token: &str, allow_path: bool) -> Option<String> {
     };
     let name = name.split_once('@').map_or(name, |(base, _)| base);
     KNOWN_AGENTS.contains(&name).then(|| name.to_string())
-}
-
-/// If the resolved run command is the opt-in Claude-Code agent-teams tmux
-/// wrapper (README: `command = ["tmux", "new", "-A", "-s", "claude",
-/// "claude"]`) and we're inside a herdr pane, skip it in favor of plain
-/// `claude` — herdr already supplies persistence/multiplexing, and the
-/// wrapper is redundant chrome herdr doesn't need. Any other configured
-/// command is left untouched: only this one documented shape is known to be
-/// a multiplexer wrapper.
-pub fn maybe_override_for_herdr(command: Vec<String>, herdr_active: bool) -> Vec<String> {
-    if herdr_active && command.first().map(String::as_str) == Some("tmux") {
-        vec!["claude".to_string()]
-    } else {
-        command
-    }
 }
 
 fn report_metadata_argv(pane_id: &str, agent: &str) -> Vec<String> {
@@ -330,13 +321,6 @@ pub fn wrap_command_for_bridge(command: Vec<String>) -> Vec<String> {
     argv
 }
 
-/// Runtime directory for the per-run relay sockets (`~/.pall8t/run`).
-/// Deliberately not under `tools/`: those are cached artifacts, these are
-/// live endpoints whose lifetime is one `pall8t run`.
-fn run_socket_root() -> Result<std::path::PathBuf> {
-    Ok(crate::config::pall8t_root()?.join("run"))
-}
-
 /// Spawns `pall8t herdr relay …` (the hidden serving loop) and returns
 /// the socket it listens on, once bound: the relay prints the path as its
 /// readiness line, and `container run` needs the socket to exist before
@@ -352,7 +336,7 @@ fn spawn_relay(
     let log_dir = crate::config::pall8t_root()?.join("logs");
     std::fs::create_dir_all(&log_dir)?;
     let log = log_dir.join(format!("herdr-relay-{container_name}.log"));
-    let root = run_socket_root()?;
+    let root = crate::relay::run_socket_root()?;
     let listen = crate::relay::socket_path(&root, container_name)
         .with_context(|| format!("no relay socket path fits under {}", root.display()))?;
     let mut child = std::process::Command::new(exe)
@@ -387,8 +371,7 @@ fn spawn_relay(
         let _ = child.wait();
         anyhow::bail!("the herdr relay exited before binding {}", listen.display());
     }
-    let bound = std::path::PathBuf::from(line.trim());
-    if bound != listen {
+    if std::path::Path::new(line.trim()) != listen {
         // It bound *something* — a path this process won't mount — so it
         // would sit there serving a policy-checked socket for the whole
         // session with no reader. Stop it.
@@ -396,7 +379,7 @@ fn spawn_relay(
         let _ = child.wait();
         anyhow::bail!("unexpected relay readiness line {line:?}");
     }
-    Ok(bound)
+    Ok(listen)
 }
 
 /// `herdr --version` → `"0.7.5"`. The version pin matters: herdr's CLI
@@ -693,41 +676,6 @@ mod tests {
         assert!(
             BOOTSTRAP.contains("/opt/pall8t/bin") && BOOTSTRAP.trim().ends_with("exec \"$@\""),
             "what remains is the PATH prepend and the exec into the real command"
-        );
-    }
-
-    #[test]
-    fn maybe_override_for_herdr_table() {
-        let tmux_cmd = vec![
-            "tmux".to_string(),
-            "new".to_string(),
-            "-A".to_string(),
-            "-s".to_string(),
-            "claude".to_string(),
-            "claude".to_string(),
-        ];
-        assert_eq!(
-            maybe_override_for_herdr(tmux_cmd.clone(), true),
-            vec!["claude".to_string()],
-            "tmux-wrapped + herdr active -> overridden to plain claude"
-        );
-        assert_eq!(
-            maybe_override_for_herdr(tmux_cmd.clone(), false),
-            tmux_cmd,
-            "tmux-wrapped + herdr inactive -> unchanged"
-        );
-
-        let plain = vec!["codex".to_string()];
-        assert_eq!(
-            maybe_override_for_herdr(plain.clone(), true),
-            plain,
-            "non-tmux command + herdr active -> unchanged"
-        );
-
-        assert_eq!(
-            maybe_override_for_herdr(Vec::new(), true),
-            Vec::<String>::new(),
-            "empty command + herdr active -> unchanged (no first element to check)"
         );
     }
 

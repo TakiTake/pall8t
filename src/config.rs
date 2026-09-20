@@ -44,16 +44,26 @@ pub struct Config {
     /// `[herdr]` — how much of the host herdr session a sandboxed agent
     /// may reach through the relay bridge (see [`crate::relay`]).
     pub herdr: HerdrConfig,
-    /// One message per config file that still carries a setting pall8t no
-    /// longer honors, for the caller to print once per invocation (see
-    /// [`load`]). Empty in the common case.
-    pub deprecations: Vec<String>,
+    /// One message per setting the loaded config declares but pall8t does
+    /// not act on — a section it no longer honors ([`deprecations_in`]) or
+    /// one that is inert without the flag that enables it
+    /// ([`inert_agent_name_warning`]) — for the caller to print once per
+    /// invocation (see [`load`]). Empty in the common case.
+    pub warnings: Vec<String>,
 }
 
 /// Merged `[herdr]` configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HerdrConfig {
     pub sandbox: HerdrSandbox,
+    /// Opt-in: name the herdr tab and agent this run launches in, so the
+    /// name a human reads off the tab is the name they can address
+    /// (issue #71, see [`crate::naming`]). Undefined means pall8t renames
+    /// nothing, exactly as before the feature existed.
+    pub auto_rename: bool,
+    /// Name to use instead of the workspace directory's basename. Inert
+    /// on its own — see [`inert_agent_name_warning`].
+    pub agent_name: Option<String>,
 }
 
 /// What the sandboxed agent may do to the host herdr session over the
@@ -96,7 +106,11 @@ impl HerdrSandbox {
 /// and works under `default`. Verified on apple/container 1.2.2 —
 /// `--read-only` yields `EROFS` outside the mounts, `--cap-drop ALL`
 /// leaves `CapEff: 0000000000000000`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+/// The variant order **is** the confinement order — `Default < Strict` —
+/// and [`merge`] relies on it to take the stricter of two configs. A level
+/// added later belongs at the position matching how much it confines, not
+/// at the end of the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Hardening {
     #[default]
@@ -147,6 +161,54 @@ pub fn mount_readonly(entry: &MountEntry, cli_override: Option<bool>) -> bool {
     cli_override.or(entry.readonly).unwrap_or(false)
 }
 
+/// A project config that asked to *enable* SSH forwarding, on a host
+/// whose global config did not. [`merge`] ignores it by design — but
+/// ignoring a stated intent in silence is the failure mode this repo
+/// treats as a bug, and here the silence would hide the more alarming
+/// half: that a repository tried to switch on access to the user's keys.
+/// `None` when the project asked for nothing, asked to disable, or agrees
+/// with a global that already allows it.
+fn project_ssh_ignored_warning(global: &Raw, project: &Raw, project_path: &Path) -> Option<String> {
+    (project.container.ssh == Some(true) && global.container.ssh != Some(true)).then(|| {
+        format!(
+            "[container] ssh = true in {} was ignored: a project config can \
+             turn SSH agent forwarding off, never on. It ships with the \
+             repository, and forwarding lets whatever runs in the sandbox \
+             authenticate as you anywhere your keys are trusted. Enable it \
+             in ~/.pall8t/config.toml, or per run with `pall8t run --ssh`.",
+            project_path.display()
+        )
+    })
+}
+
+/// A project config that loosened hardening below what the human's global
+/// config set. Unlike `ssh`, this request *is* honored — the project knows
+/// its own toolchain — but it is the one config contradiction where a
+/// repository quietly gets less confinement than the user asked for, and
+/// that is worth a line on stderr. `None` when the project asked for
+/// nothing, asked to tighten, or agrees.
+fn project_hardening_loosened_notice(
+    global: &Raw,
+    project: &Raw,
+    project_path: &Path,
+) -> Option<String> {
+    let g = global.container.hardening.unwrap_or_default();
+    let p = project.container.hardening?;
+    (p < g).then(|| {
+        format!(
+            "[container] hardening = \"{}\" in {} lowers the \"{}\" your \
+             ~/.pall8t/config.toml asks for, and it wins — a project knows \
+             whether its toolchain runs under strict confinement. This run \
+             is therefore less confined than your global config alone would \
+             make it. Set hardening in that file if you would rather it did \
+             not.",
+            p.as_str(),
+            project_path.display(),
+            g.as_str()
+        )
+    })
+}
+
 /// Whether this run forwards the host SSH agent, given the merged config
 /// and the `--ssh` override from the command line.
 ///
@@ -161,25 +223,83 @@ pub fn ssh_enabled(config: bool, cli_override: Option<bool>) -> bool {
     cli_override.unwrap_or(config)
 }
 
-/// Warning for a run that asked for SSH forwarding on a host with no
-/// agent. Verified on container 1.2.2: the runtime logs "ssh forwarding
+/// Warning for a run that asked for SSH forwarding the host cannot
+/// deliver. Verified on container 1.2.2: the runtime logs "ssh forwarding
 /// requested but no `SSH_AUTH_SOCK` found" to its *own* log, forwards
 /// nothing — and still sets `SSH_AUTH_SOCK` inside the container, so the
-/// sandbox sees a path with no socket behind it. Without this warning the
-/// user gets only a connect failure from `ssh` and no cause. `None` when
-/// there is nothing to say.
-pub fn ssh_warning(enabled: bool, host_auth_sock: Option<&str>) -> Option<String> {
-    let missing = host_auth_sock.is_none_or(str::is_empty);
-    (enabled && missing).then(|| {
-        concat!(
-            "pall8t: warning: [container] ssh is on, but SSH_AUTH_SOCK is unset ",
-            "on the host — there is no agent to forward. SSH_AUTH_SOCK is still set ",
-            "inside the sandbox, pointing at a socket that isn't there, so ",
-            "git-over-SSH will fail on connect. Start an agent (ssh-add) or set ",
-            "ssh = false."
-        )
-        .to_string()
-    })
+/// sandbox sees a path with no agent behind it. `None` when there is
+/// nothing to say.
+///
+/// What the sandbox is left holding was measured on 1.2.2, both shapes:
+/// an unset host `SSH_AUTH_SOCK` leaves `/var/host-services` absent
+/// entirely, a stale one leaves a mode-`000` socket node there that no
+/// process is behind. Neither reaches the user as an error about the
+/// agent — `ssh` ignores an agent it cannot reach instead of reporting
+/// it, and falls through to the identities in the container home, which
+/// is normally none — so the whole symptom is `git@github.com: Permission
+/// denied (publickey).`, naming a key problem the user does not have.
+/// Hence the warning quotes that line: it is the string they will be
+/// searching for.
+///
+/// Two ways to have no agent, not one. Unset is the obvious one; the
+/// commonly hit one is a **stale** `SSH_AUTH_SOCK` — a tmux session or a
+/// shell resumed after a reboot still exports the path of a socket that
+/// died with the agent that made it. Testing only for unset lets exactly
+/// the confusing case through silently, so the socket is probed as well,
+/// via `agent_reachable` rather than by touching the filesystem here (the
+/// caller hands over the real probe; the tests hand over an answer).
+///
+/// The probe asks whether an agent *answers*, not whether a file exists,
+/// and the difference is a whole failure mode. A dead agent leaves its
+/// socket inode behind whenever it does not get to clean up — killed with
+/// `SIGKILL`, OOM-killed, or simply outlived by the tmux session that
+/// still exports its path, none of which involve the reboot that would
+/// clear the path away. `Path::exists` answers "yes" for that node and
+/// the warning never fires, which is precisely the case it was written
+/// for (caught in review on PR #63). `connect(2)` separates the three states the
+/// user can be in: listening (`Ok`), dead node (`ECONNREFUSED`), gone
+/// (`ENOENT`). Only the first is an agent.
+///
+/// A probe that cannot tell — an unreadable parent directory, a descriptor
+/// limit — reads as absent and warns: the cost of a wrong warning is one
+/// line of text, the cost of a wrong silence is the unexplained publickey
+/// denial this exists to prevent.
+pub fn ssh_warning(
+    enabled: bool,
+    host_auth_sock: Option<&Path>,
+    agent_reachable: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    // `filter` folds an empty SSH_AUTH_SOCK in with an unset one: both mean
+    // "no agent", and only one of them has a path worth printing.
+    let cause = match host_auth_sock.filter(|s| !s.as_os_str().is_empty()) {
+        None => "SSH_AUTH_SOCK is unset on the host".to_string(),
+        Some(sock) if agent_reachable(sock) => return None,
+        // One phrasing for both shapes on purpose: the socket may be gone
+        // or may be a node no process is behind, and the user's next step
+        // is the same either way. Claiming "isn't there" about a path they
+        // can `ls` would just cost them the trust of the message.
+        Some(sock) => format!(
+            "SSH_AUTH_SOCK on the host points at {}, but no agent is \
+             listening there",
+            sock.display()
+        ),
+    };
+    // `ssh-add` alone is not the remedy: with no agent to talk to it just
+    // fails with "Could not open a connection to your authentication
+    // agent", which is a second dead end for anyone following the advice
+    // literally. Starting one is what the situation calls for.
+    Some(format!(
+        "pall8t: warning: [container] ssh is on, but {cause} — there is no \
+         agent to forward. SSH_AUTH_SOCK is still set inside the sandbox with \
+         no agent behind it, and ssh ignores an agent it cannot reach rather \
+         than reporting it, so unless a key is sitting in the container home, \
+         git-over-SSH fails with `Permission denied (publickey)` and names no \
+         cause. Start an agent (eval \"$(ssh-agent -s)\" && ssh-add) or set \
+         ssh = false."
+    ))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -215,9 +335,22 @@ struct Raw {
 #[serde(deny_unknown_fields)]
 struct RawHerdr {
     sandbox: Option<HerdrSandbox>,
+    auto_rename: Option<bool>,
+    agent_name: Option<String>,
 }
 
+/// `deny_unknown_fields` for the same reason [`RawHerdr`] has it, and the
+/// case that needs it is `ssh`. A typo in the *enabling* direction fails
+/// safe — `sh = true` leaves forwarding off, and the user finds out when
+/// the push fails. The *disabling* direction is the dangerous one: a
+/// project's only permitted say over forwarding is turning it off
+/// ([`merge`]), so a project that writes `shh = false` against a global
+/// `ssh = true` states "this repository must not touch my agent" and,
+/// silently ignored, gets the agent forwarded anyway. The one setting
+/// whose whole job is to narrow a capability must not be typo-able into
+/// a no-op.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawContainer {
     cpus: Option<u32>,
     memory: Option<String>,
@@ -239,6 +372,31 @@ pub(crate) fn pall8t_root() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("cannot determine home directory")?
         .join(".pall8t"))
+}
+
+/// `~/.pall8t/logs`, created on demand — where both append-only logs in
+/// this crate live (the relay's audit log, the agent namer's). A named
+/// root per directory is this module's convention; two callers spelling
+/// the join out themselves is how they drift.
+pub(crate) fn logs_dir() -> Result<PathBuf> {
+    let dir = pall8t_root()?.join("logs");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// `~/.pall8t/state`, created on demand — where the small JSON files
+/// pall8t writes for itself and reads back on a later run live. Sibling
+/// of [`logs_dir`], and named here for the same reason: two callers
+/// spelling the join out themselves is how they drift.
+///
+/// Deliberately neither of the two neighbours it could have joined.
+/// `logs/` is append-only human artifacts nobody parses; `config.toml`
+/// at the root is the *user's* file, and burying machine state beside it
+/// invites editing one while meaning the other.
+pub(crate) fn state_dir() -> Result<PathBuf> {
+    let dir = pall8t_root()?.join("state");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 pub fn global_path() -> Result<PathBuf> {
@@ -362,13 +520,39 @@ pub fn load(project_dir: &Path) -> Result<Config> {
     ]) {
         return Err(anyhow!(msg));
     }
-    let deprecations = deprecations_in(&global, &global_path)
+    let per_file: Vec<String> = deprecations_in(&global, &global_path)
         .into_iter()
         .chain(deprecations_in(&project, &project_path))
         .collect();
-    Ok(Config {
-        deprecations,
-        ..merge(global, project)
+    let ssh_ignored = project_ssh_ignored_warning(&global, &project, &project_path);
+    let hardening_notice = project_hardening_loosened_notice(&global, &project, &project_path);
+    let merged = merge(global, project);
+    // The inert-setting check reads the *merged* config, not each file:
+    // a global `auto_rename = true` enables a project's `agent_name`, and
+    // warning per file would call that combination inert.
+    let warnings = per_file
+        .into_iter()
+        .chain(ssh_ignored)
+        .chain(hardening_notice)
+        .chain(inert_agent_name_warning(&merged.herdr))
+        .collect();
+    Ok(Config { warnings, ..merged })
+}
+
+/// The warning for a config that names the herdr agent but never turns
+/// naming on. `agent_name` alone is a setting that silently does nothing,
+/// which is exactly what the `[home]` warning above exists to prevent.
+///
+/// The alternative — letting `agent_name` imply `auto_rename = true` —
+/// was rejected in issue #71: it would make "undefined means off" untrue
+/// for half the feature, so a user who set a name to have it *ready*
+/// would find pall8t renaming their tabs.
+fn inert_agent_name_warning(herdr: &HerdrConfig) -> Option<String> {
+    (!herdr.auto_rename && herdr.agent_name.is_some()).then(|| {
+        "[herdr] agent_name is set but auto_rename is not — pall8t renames \
+         neither the tab nor the agent. Add `auto_rename = true` under \
+         [herdr] to turn naming on, or delete agent_name."
+            .to_string()
     })
 }
 
@@ -402,11 +586,29 @@ fn merge(global: Raw, project: Raw) -> Config {
             .command
             .or(global.run.command)
             .unwrap_or_else(|| vec!["claude".to_string()]),
-        ssh: project
-            .container
-            .ssh
-            .or(global.container.ssh)
-            .unwrap_or(false),
+        // NOT `project.or(global)` like every other field here, and the
+        // asymmetry is the point. A project's `.pall8t/config.toml` ships
+        // with the repository, so it is authored by whoever wrote the
+        // repository — which is exactly the code the sandbox exists to
+        // contain. Project config may shape what runs *inside* the box
+        // (command, image, mounts); it must not be able to widen what the
+        // box can reach *outside* it. Forwarding the agent is the sharpest
+        // outward capability pall8t has, so it takes the human's own
+        // global config or an explicit `--ssh`. A project may still turn
+        // it *off* — narrowing is always safe.
+        ssh: match (global.container.ssh, project.container.ssh) {
+            (_, Some(false)) => false,
+            (g, _) => g.unwrap_or(false),
+        },
+        // Per-field, project wins — deliberately *unlike* `ssh` above.
+        // Hardening governs capabilities and the rootfs *inside* the VM,
+        // not what the sandbox can reach outside it, and `default` is the
+        // confinement pall8t has always run at rather than extra power. A
+        // project whose toolchain breaks under `strict` has to be able to
+        // say so or the sandbox is simply broken for it. The contradiction
+        // a human would want to know about — their global `strict` quietly
+        // becoming `default` — is reported by
+        // [`project_hardening_loosened_notice`] rather than refused.
         hardening: project
             .container
             .hardening
@@ -415,20 +617,31 @@ fn merge(global: Raw, project: Raw) -> Config {
         mounts: project.mounts.or(global.mounts).unwrap_or_default(),
         // `[home]` is parsed and ignored; `load` turns its presence into a
         // deprecation message, which `merge` (path-less) can't produce.
-        deprecations: Vec::new(),
+        warnings: Vec::new(),
         herdr: HerdrConfig {
             sandbox: project
                 .herdr
                 .sandbox
                 .or(global.herdr.sandbox)
                 .unwrap_or_default(),
+            // Per-field, like everything else here: a global
+            // `auto_rename = true` stays on for a project that only sets
+            // `agent_name`, and the pair is judged after merging (see
+            // [`inert_agent_name_warning`]) rather than file by file.
+            auto_rename: project
+                .herdr
+                .auto_rename
+                .or(global.herdr.auto_rename)
+                .unwrap_or(false),
+            agent_name: project.herdr.agent_name.or(global.herdr.agent_name),
         },
     }
 }
 
 /// Skeleton written by `pall8t init` as `~/.pall8t/config.toml`.
 pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project .pall8t/config.toml overrides
-# these values field by field.
+# these values field by field — except `ssh`, which a project may only
+# turn off (see below).
 
 [container]
 # cpus = 4
@@ -439,7 +652,8 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 # over SSH without a private key ever entering the container home. Off by
 # default: while it is running, code in the sandbox can authenticate as
 # you anywhere your keys are trusted. Override for one run with
-# `pall8t run --ssh` / `--ssh=false`.
+# `pall8t run --ssh` / `--ssh=false`. Honored here and from the flag
+# only: a project's .pall8t/config.toml may turn it off, never on.
 # ssh = false
 #
 # How much the runtime confines the sandbox, on top of the VM boundary
@@ -479,11 +693,24 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 #              or input from inside the sandbox
 #   "off"      the sandbox can't see herdr at all
 # sandbox = "full"
+#
+# Name the herdr tab and the agent this run launches in, with the same
+# string, so what you read off the tab is what `herdr agent prompt <name>`
+# takes. Off unless set: pall8t renames nothing by default. The name is
+# the workspace directory's basename plus a number pall8t counts itself,
+# per name and per herdr server run (~/src/foo -> "foo-1", then "foo-2");
+# a number is never reused while that server run lasts, so the name stays
+# a stable address. A tab you renamed yourself keeps your label.
+# auto_rename = true
+# Name to use instead of the directory basename. Inert on its own —
+# without auto_rename above, pall8t warns and renames nothing.
+# agent_name = "api"
 "#;
 
 /// Skeleton written by `pall8t init` as `.pall8t/config.toml`.
 pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set here override
-# ~/.pall8t/config.toml.
+# ~/.pall8t/config.toml — except `ssh`, which this file may only turn off
+# (see below).
 
 [container]
 # cpus = 4
@@ -506,7 +733,10 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 # watch = ["flake.nix", "flake.lock"]
 #
 # Forward the host's SSH agent into this project's sandbox — see
-# ~/.pall8t/config.toml for what that grants. Off by default.
+# ~/.pall8t/config.toml for what that grants. Off by default, and here
+# it can only be turned *off*: this file ships with the repository, so
+# `ssh = true` in it is ignored (with a warning). Switching it on is the
+# human's call — ~/.pall8t/config.toml or `pall8t run --ssh`.
 # ssh = false
 #
 # "strict" drops every capability, mounts the root filesystem read-only,
@@ -528,6 +758,8 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 
 [herdr]
 # sandbox = "full"   # or "readonly" / "off" — see ~/.pall8t/config.toml
+# auto_rename = true # name this run's herdr tab and agent "<dir>-<n>"
+# agent_name = "api" # ... using this instead of the directory basename
 "#;
 
 #[cfg(test)]
@@ -598,58 +830,274 @@ mod tests {
         assert!(cfg.watch.is_empty());
         assert_eq!(cfg.command, vec!["claude".to_string()]);
         assert!(cfg.mounts.is_empty());
-        assert!(cfg.deprecations.is_empty());
+        assert!(cfg.warnings.is_empty());
         assert_eq!(
             cfg.herdr.sandbox,
             HerdrSandbox::Full,
             "full herdr passthrough is the default"
         );
-    }
-
-    #[test]
-    fn ssh_is_off_until_asked_for_and_merges_per_field() {
         assert!(
-            !merge(Raw::default(), Raw::default()).ssh,
-            "forwarding the host agent is a capability the sandbox otherwise \
-             lacks — it must never arrive by default"
-        );
-        let global = parse("[container]\nssh = true\n");
-        assert!(
-            merge(global.clone(), Raw::default()).ssh,
-            "the global file opts in"
-        );
-        let project_off = parse("[container]\nssh = false\n");
-        assert!(
-            !merge(global, project_off).ssh,
-            "a project can turn off what the global file switched on — merging \
-             is per field, and the project is the more specific intent"
+            !cfg.herdr.auto_rename && cfg.herdr.agent_name.is_none(),
+            "naming is opt-in: undefined means pall8t renames neither the \
+             tab nor the agent (issue #71)"
         );
     }
 
     #[test]
-    fn hardening_defaults_to_off_and_merges_per_field() {
-        assert_eq!(
-            merge(Raw::default(), Raw::default()).hardening,
-            Hardening::Default,
-            "confinement beyond what pall8t has always run is opt-in: a \
-             toolchain that breaks under it must not break on upgrade"
+    fn herdr_naming_merges_per_field_and_only_agent_name_is_inert() {
+        let global = parse("[herdr]\nauto_rename = true\nagent_name = \"api\"\n");
+        let cfg = merge(global.clone(), Raw::default());
+        assert!(cfg.herdr.auto_rename);
+        assert_eq!(cfg.herdr.agent_name.as_deref(), Some("api"));
+        assert!(
+            inert_agent_name_warning(&cfg.herdr).is_none(),
+            "a name with naming switched on is doing its job"
         );
-        let global = parse("[container]\nhardening = \"strict\"\n");
-        assert_eq!(
-            merge(global.clone(), Raw::default()).hardening,
-            Hardening::Strict
+
+        let cfg = merge(global, parse("[herdr]\nagent_name = \"web\"\n"));
+        assert_eq!(cfg.herdr.agent_name.as_deref(), Some("web"), "project wins");
+        assert!(
+            cfg.herdr.auto_rename && inert_agent_name_warning(&cfg.herdr).is_none(),
+            "and the global auto_rename still enables it — the pair is judged \
+             after merging, so a project that only names itself isn't called inert"
         );
-        let project = parse("[container]\nhardening = \"default\"\n");
-        assert_eq!(
-            merge(global, project).hardening,
-            Hardening::Default,
-            "a project can opt back out of a global strict setting — the \
-             project knows its own toolchain"
+
+        let cfg = merge(Raw::default(), parse("[herdr]\nagent_name = \"api\"\n"));
+        assert!(
+            !cfg.herdr.auto_rename,
+            "a name must not imply auto_rename: that would make \"undefined \
+             means off\" untrue for half the feature (issue #71)"
         );
+        let warning = inert_agent_name_warning(&cfg.herdr).expect("a setting that does nothing");
+        assert!(
+            warning.contains("auto_rename"),
+            "and the warning has to name the flag that would turn it on: {warning}"
+        );
+
+        assert!(
+            toml::from_str::<Raw>("[herdr]\nauto_renam = true\n").is_err(),
+            "a misspelled key fails the parse rather than silently renaming \
+             nothing (deny_unknown_fields)"
+        );
+    }
+
+    /// The narrowing direction is the one a typo must not swallow. A
+    /// project's only permitted say over forwarding is turning it *off*,
+    /// so `shh = false` against a global `ssh = true` is a repository
+    /// stating it must not touch the user's agent. Accepted-and-ignored,
+    /// that run forwards the agent anyway with nothing on screen — the
+    /// exact shape of the `sandbo = "off"` hazard [`RawHerdr`] was given
+    /// `deny_unknown_fields` for.
+    #[test]
+    fn a_misspelled_container_key_fails_the_parse_rather_than_being_ignored() {
+        for (toml, what) in [
+            (
+                "[container]\nshh = false\n",
+                "a project trying to opt *out*",
+            ),
+            (
+                "[container]\nssh_agent = true\n",
+                "a plausible longer spelling",
+            ),
+            ("[container]\ncpu = 4\n", "an unrelated field, same rule"),
+        ] {
+            assert!(
+                toml::from_str::<Raw>(toml).is_err(),
+                "{what} must fail the parse, not be silently dropped — a \
+                 narrowing setting that typos into a no-op leaves the \
+                 permissive state in place: {toml:?}"
+            );
+        }
+        assert!(
+            toml::from_str::<Raw>("[container]\nssh = false\n").is_ok(),
+            "and the correctly spelled key still parses, or the guard above \
+             would be passing for the wrong reason"
+        );
+    }
+
+    /// Hardening merges per field with the project winning, `ssh` does
+    /// not, and the difference is deliberate: hardening governs what the
+    /// sandbox may do *inside* the VM, where a project's toolchain is the
+    /// thing that decides whether `strict` holds at all. This pins the
+    /// asymmetry so neither rule drifts into the other — the ssh table
+    /// below is its counterpart.
+    #[test]
+    fn hardening_lets_the_project_decide_unlike_ssh() {
+        let strict = || parse("[container]\nhardening = \"strict\"\n");
+        let default = || parse("[container]\nhardening = \"default\"\n");
+        let quiet = Raw::default;
+
+        // (global, project, expected, why)
+        let cases: [(Raw, Raw, Hardening, &str); 5] = [
+            (
+                quiet(),
+                quiet(),
+                Hardening::Default,
+                "confinement that can break a toolchain must not arrive on \
+                 upgrade unasked",
+            ),
+            (
+                quiet(),
+                strict(),
+                Hardening::Strict,
+                "a project may tighten",
+            ),
+            (
+                strict(),
+                quiet(),
+                Hardening::Strict,
+                "and the human's global choice applies where a project is \
+                 silent",
+            ),
+            (
+                strict(),
+                strict(),
+                Hardening::Strict,
+                "agreement is not special",
+            ),
+            (
+                strict(),
+                default(),
+                Hardening::Default,
+                "a project may also opt back out: it knows whether its own \
+                 build survives a read-only rootfs, and a sandbox that \
+                 cannot build is no safer for it",
+            ),
+        ];
+        for (g, p, expected, why) in cases {
+            assert_eq!(merge(g, p).hardening, expected, "{why}");
+        }
+
         assert!(
             toml::from_str::<Raw>("[container]\nhardening = \"paranoid\"\n").is_err(),
             "an unknown level must fail the parse rather than silently \
              leaving the sandbox at default confinement"
+        );
+    }
+
+    /// The loosening is honored, but not in silence: it is the one config
+    /// contradiction where a repository ends up with less confinement than
+    /// the human's own file asked for.
+    #[test]
+    fn a_project_that_loosens_hardening_says_so() {
+        let notice = project_hardening_loosened_notice(
+            &parse("[container]\nhardening = \"strict\"\n"),
+            &parse("[container]\nhardening = \"default\"\n"),
+            Path::new("/repo/.pall8t/config.toml"),
+        )
+        .expect("a project lowering the human's confinement must say so");
+        assert!(
+            notice.contains("/repo/.pall8t/config.toml") && notice.contains("strict"),
+            "naming the file and the level it overrode is the whole value — \
+             both are facts the user cannot otherwise see: {notice}"
+        );
+
+        for (g, p, why) in [
+            (
+                "[container]\nhardening = \"default\"\n",
+                "[container]\nhardening = \"strict\"\n",
+                "tightening is not a contradiction worth a line",
+            ),
+            (
+                "[container]\nhardening = \"strict\"\n",
+                "[container]\nhardening = \"strict\"\n",
+                "agreeing is not either",
+            ),
+        ] {
+            assert!(
+                project_hardening_loosened_notice(
+                    &parse(g),
+                    &parse(p),
+                    Path::new("/repo/.pall8t/config.toml")
+                )
+                .is_none(),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_is_off_until_asked_for_and_only_the_human_may_switch_it_on() {
+        let on = || parse("[container]\nssh = true\n");
+        let off = || parse("[container]\nssh = false\n");
+        let quiet = Raw::default;
+
+        // (global, project, expected, why)
+        let cases: [(Raw, Raw, bool, &str); 6] = [
+            (
+                quiet(),
+                quiet(),
+                false,
+                "forwarding the host agent is a capability the sandbox \
+                 otherwise lacks — it must never arrive by default",
+            ),
+            (on(), quiet(), true, "the human's own global file opts in"),
+            (
+                on(),
+                off(),
+                false,
+                "a project may narrow: turning off what the global switched \
+                 on is always safe, so it is honored",
+            ),
+            (
+                quiet(),
+                on(),
+                false,
+                "but a project may NOT widen. `.pall8t/config.toml` ships \
+                 with the repository, so honoring this would let cloned code \
+                 vote itself access to the user's keys",
+            ),
+            (
+                off(),
+                on(),
+                false,
+                "and an explicit global `false` is not something a repository \
+                 gets to overrule either",
+            ),
+            (
+                on(),
+                on(),
+                true,
+                "a project agreeing with a global that already allows it \
+                 changes nothing",
+            ),
+        ];
+
+        for (global, project, expected, why) in cases {
+            assert_eq!(merge(global, project).ssh, expected, "{why}");
+        }
+    }
+
+    #[test]
+    fn a_project_asking_to_enable_ssh_is_told_it_was_ignored() {
+        let path = Path::new("/x/.pall8t/config.toml");
+        let on = parse("[container]\nssh = true\n");
+        let off = parse("[container]\nssh = false\n");
+
+        let warning = project_ssh_ignored_warning(&Raw::default(), &on, path)
+            .expect("a dropped intent must never be silent — least of all this one");
+        assert!(
+            warning.contains("/x/.pall8t/config.toml"),
+            "the warning must name the file that tried, or the user cannot \
+             tell which repository asked: {warning}"
+        );
+        assert!(
+            warning.contains("--ssh") && warning.contains("~/.pall8t/config.toml"),
+            "and must name both legitimate ways in, or it reads as a refusal \
+             with no remedy: {warning}"
+        );
+
+        assert!(
+            project_ssh_ignored_warning(&on, &on, path).is_none(),
+            "nothing was ignored when the global already allows it"
+        );
+        assert!(
+            project_ssh_ignored_warning(&Raw::default(), &off, path).is_none(),
+            "a project turning it off is honored, so there is nothing to say"
+        );
+        assert!(
+            project_ssh_ignored_warning(&Raw::default(), &Raw::default(), path).is_none(),
+            "and a project that said nothing asked for nothing"
         );
     }
 
@@ -670,23 +1118,64 @@ mod tests {
 
     #[test]
     fn ssh_warning_only_when_it_would_forward_nothing() {
+        let live = |_: &Path| true;
+        let gone = |_: &Path| false;
         assert!(
-            ssh_warning(true, None).is_some(),
-            "asking for forwarding with no agent on the host gets a warning: \
-             the runtime logs it to its own log and silently forwards nothing"
+            ssh_warning(true, None, live).is_some(),
+            "forwarding asked for with no SSH_AUTH_SOCK at all: the runtime \
+             forwards nothing and says so only in its own log"
         );
         assert!(
-            ssh_warning(true, Some("")).is_some(),
-            "an empty SSH_AUTH_SOCK is as agent-less as an unset one"
+            ssh_warning(true, Some(Path::new("")), live).is_some(),
+            "an empty SSH_AUTH_SOCK is unset with extra steps"
         );
         assert!(
-            ssh_warning(true, Some("/private/tmp/agent.sock")).is_none(),
-            "an agent is present: nothing to say"
+            ssh_warning(true, Some(Path::new("/private/tmp/agent.sock")), live).is_none(),
+            "a live agent is the whole point; saying nothing is correct"
         );
         assert!(
-            ssh_warning(false, None).is_none(),
-            "a run that never asked for forwarding must not be nagged about an \
-             agent it doesn't want"
+            ssh_warning(false, None, live).is_none(),
+            "nothing to warn about when the run never asked to forward"
+        );
+
+        // The case a presence-only check misses: a tmux session or a shell
+        // resumed after a reboot still exports the path of a socket that
+        // died with its agent. `container` forwards nothing, sets
+        // SSH_AUTH_SOCK in the guest anyway, and the user sees only a
+        // publickey denial — the exact silence this function exists to break.
+        let stale = ssh_warning(true, Some(Path::new("/private/tmp/dead-agent.sock")), gone)
+            .expect("a stale SSH_AUTH_SOCK has no agent behind it either");
+        assert!(
+            stale.contains("/private/tmp/dead-agent.sock"),
+            "and it must name the dead path, since that is the one clue the \
+             user cannot get anywhere else: {stale}"
+        );
+        // An empty path is "unset", not a path to complain about.
+        assert!(
+            ssh_warning(true, Some(Path::new("")), gone)
+                .unwrap()
+                .contains("is unset on the host"),
+            "an empty SSH_AUTH_SOCK must read as unset, not as a nameless \
+             missing socket"
+        );
+
+        // The remedy has to be one that works. `ssh-add` on its own fails
+        // with "Could not open a connection to your authentication agent"
+        // in precisely the situation this warning is printed in.
+        let unset = ssh_warning(true, None, gone).unwrap();
+        assert!(
+            unset.contains("ssh-agent -s"),
+            "the fix for 'no agent' is starting one, not ssh-add: {unset}"
+        );
+        // Measured on container 1.2.2 for both no-agent shapes: `ssh` never
+        // complains about the agent it could not reach, so the line the user
+        // actually gets — and searches for — is the publickey denial. A
+        // warning that predicted a connect failure would send them looking
+        // for a string that is never printed.
+        assert!(
+            unset.contains("publickey"),
+            "the warning must name the symptom the run will actually show: \
+             {unset}"
         );
     }
 
@@ -732,7 +1221,7 @@ mod tests {
         let cfg = merge(stale.clone(), Raw::default());
         assert_eq!(cfg.cpus, 2, "the rest of the file is honored as usual");
         assert!(
-            cfg.deprecations.is_empty(),
+            cfg.warnings.is_empty(),
             "`merge` knows no paths; `load` is what attaches the warning"
         );
 

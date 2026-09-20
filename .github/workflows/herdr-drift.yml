@@ -7,8 +7,14 @@
 # REPORT-ONLY by design (issue #59), like the mutation and hygiene
 # workflows: classification is a human decision, and the schema is not a
 # complete inventory (see the script's caveat), so this can only ever
-# suggest. It never fails the build, and a run without herdr installed is
-# a skip, not a failure.
+# suggest. No amount of drift fails this job, and a run without herdr
+# installed is a skip rather than a failure.
+#
+# It does go red for one thing, which is not drift: the script being
+# unable to check at all — schema output that is not JSON, a schema with
+# no methods in it, or a `relay.rs` whose `READ` list it cannot parse.
+# A drift report that silently checked nothing would read exactly like a
+# clean one, which is the failure a weekly report can least afford.
 name: herdr method drift
 
 on:
@@ -31,8 +37,16 @@ jobs:
 
       - name: Fetch the latest herdr release
         # The release binary, not the install script: nothing here needs a
-        # herdr installation, only its bundled schema, and a pinned asset
+        # herdr installation, only its bundled schema, and a named asset
         # download is easier to reason about than piping curl to sh.
+        #
+        # Deliberately unpinned and unverified, which is the one place
+        # this repo accepts that: the question being asked is "what does
+        # the *latest* herdr serve", so a pin would answer a different
+        # one, and herdrdev/herdr publishes no checksums to verify
+        # against. What bounds it is the blast radius — a scheduled job on
+        # `main`, `contents: read`, no secrets in reach, and nothing built
+        # here is ever consumed by a release.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -42,6 +56,15 @@ jobs:
           ./herdr --version
 
       - name: Report drift
+        # Run twice on purpose, and the difference is the point. The first
+        # is the report: its output goes to the run summary whatever
+        # happens, `|| true` included, because a script that stopped early
+        # still explains why there. The second decides the job's colour —
+        # unguarded, so the "could not check at all" exits above turn this
+        # red while every drift finding stays green. Piping the first into
+        # the summary would have made tee's exit status the job's answer
+        # (`bash -e` here has no pipefail), which is the trap quality.yml
+        # documents.
         run: |
           {
             echo '## herdr method drift'

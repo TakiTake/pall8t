@@ -47,6 +47,9 @@ tests with reasoned assertions, regression pins).
   merge speculatively.
 - Before opening or updating a PR, run the `local-review` skill on the
   branch diff — the external reviewers should come back empty-handed.
+- CodeRabbit no longer reviews on its own: opening or pushing to a PR
+  triggers nothing. Asking it for a review (`@coderabbitai review` as a
+  PR comment) is the human's call — don't spend one unprompted.
 - PR review feedback (bot or human) is handled with the `review-loop`
   skill: verify each finding before acting, classify it (real / nitpick /
   false positive), and reply with evidence. Never blanket-apply bot
@@ -77,14 +80,24 @@ stop there.
 - Architecture decisions: [docs/adr/](docs/adr/)
 - Testing conventions (read before writing tests): [docs/testing.md](docs/testing.md)
 - Sandbox environment details: `.claude/skills/pall8t`
-- Review automation: report-only workflows for mutation testing
-  (`mutants.yml`), duplication/unused-deps (`hygiene.yml`), and herdr
-  API-method drift (`herdr-drift.yml`, which runs
-  `scripts/herdr-method-drift.py` against the latest herdr release),
-  each weekly plus on-demand via `gh workflow run <name>` — reports,
-  never gates; Codex PR review (`codex-review.yml`) stays dormant until an
-  `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
-  `.coderabbit.yaml` (free for this public repo once the app is installed).
+- Quality gates (`quality.yml`, per PR, **blocking**): incremental
+  mutation testing over the PR's own diff (`cargo mutants --in-diff` — a
+  missed mutant means a test that would not notice this change breaking)
+  and a 90% line-coverage floor. Suite size and wall time are recorded
+  there too, without gating. Whole-tree mutation (`mutants.yml`) and
+  duplication/unused-deps (`hygiene.yml`) stay **report-only** — weekly,
+  on each PR for hygiene, plus on-demand via `gh workflow run <name>`;
+  gating a whole-tree backlog teaches reflexive ignoring, while the
+  in-diff gate has no backlog to inherit. herdr API-method drift
+  (`herdr-drift.yml`, running `scripts/herdr-method-drift.py` against the
+  latest herdr release) is report-only for a different reason: what the
+  relay classifies as a read is a human decision, and herdr's schema is
+  not a complete inventory of what it serves.
+- Review automation: Codex PR review (`codex-review.yml`) stays dormant
+  until an `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
+  `.coderabbit.yaml` — installed, but automatic review is off, so it runs
+  only when someone comments `@coderabbitai review` on the PR (the free
+  plan meters reviews).
 - herdr plugin (contrib): `contrib/herdr-plugin/` — sandbox status/shell/
   rebuild/stop from a herdr pane. A thin shell over the pall8t CLI whose
   only contract is `pall8t ls --json`; when that output shape changes, it
