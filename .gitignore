@@ -12,3 +12,8 @@
 # cargo-mutants run output (reports, not sources).
 /mutants.out
 /mutants.out.old
+
+# Python bytecode from running scripts/ and contrib/ by hand. Committed
+# twice by `git add -A` after a `py_compile` before this line existed.
+__pycache__/
+*.pyc

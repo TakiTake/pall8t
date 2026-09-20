@@ -86,6 +86,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two `__pycache__/*.pyc` files were committed** (in 0.6.0's drift
+  script and herdr plugin), by a `git add -A` that followed a
+  `py_compile`. Untracked, and `__pycache__/`/`*.pyc` added to
+  `.gitignore`. They carry no paths or identifiers from the machine that
+  built them — checked before removal, since that is the usual reason a
+  stray artifact matters.
+
+- **Four pure-inspection herdr methods were denied under
+  `[herdr] sandbox = "readonly"`.** The relay's `READ` allowlist was last
+  reconciled against herdr 0.8, and 0.9.1 (protocol 22) is what a user
+  installs today, so `pane.selection.read`, `pane.copy_search`,
+  `pane.copy_motion` and `pane.link.resolve` were classified as mutations
+  and refused — a readonly agent could read a neighbouring pane's screen
+  but not the selection on it, nor resolve the link under a cell. Each was
+  checked against its handler in herdr's source rather than its name:
+  `pane.selection.read` extracts text through `&self` and stores nothing,
+  while `pane.edit_scrollback` looks just as passive and spawns an editor
+  on the host, so it stays denied. The reconciliation is what
+  `scripts/herdr-method-drift.py` (0.6.0) exists to prompt; this is its
+  first run put into effect.
+
 - **`git status`, `git log`, and `git rev-parse` failed inside the sandbox
   with "detected dubious ownership"** — in the workspace itself, not only
   in read-only reference mounts. A mount's own directory inode arrives

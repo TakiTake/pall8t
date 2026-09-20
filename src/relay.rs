@@ -95,13 +95,32 @@ const ADMIN_NAMESPACES: &[&str] = &["server.", "integration.", "plugin.", "sessi
 /// then treated as [`Class::Mutate`], which only ever errs toward denying,
 /// never toward leaking a mutation into `readonly`.
 ///
-/// Last reconciled against herdr 0.8 (protocol 19). `scripts/herdr-method-drift.py`
-/// reports what a newer herdr serves that this list doesn't classify as a
-/// read — run it by hand, or read the weekly job's summary. Note that
-/// `pane.graphics.stream` stays here deliberately: herdr serves and
-/// documents it, but it hijacks the connection instead of answering in
-/// the request/response shape, so it is absent from herdr's own schema
-/// and the drift report flags it every time.
+/// **Last reconciled against herdr 0.9.1 (protocol 22)**, which is what
+/// `brew install herdr` gives you. Reconciling means reading the handler
+/// in herdr's source for every method this list does *not* cover, not
+/// reasoning from its name: `scripts/herdr-method-drift.py` produces that
+/// worklist (weekly job, or run it by hand), and the four copy-mode
+/// entries below came out of doing it for 0.9.1 — they had been denied in
+/// `readonly` since the list was last written against 0.8, which is the
+/// exact failure the drift report exists to surface.
+///
+/// Two things about herdr's graphics streaming, which is the one family
+/// that does not fit the request/response shape this relay proxies:
+///
+/// - `pane.graphics.stream` is kept here, but nothing can currently reach
+///   it through the bridge — herdr answers it with `stream_transport_required`
+///   on this path, because it needs the streaming socket transport
+///   (verified in 0.9.1 `src/app/api.rs`). Allowing it means the agent
+///   gets that explanation from herdr rather than a deny from us.
+/// - `pane.graphics.stream.{set,direct,open,close}` stay [`Class::Mutate`]
+///   deliberately. They carry pane content, so they look read-shaped, but
+///   each one opens, retargets, or tears down a stream — state on the
+///   host side of the bridge — and none is in herdr's published schema,
+///   so there is nothing stable to have reconciled against.
+///
+/// All five are absent from `herdr api schema --json`, so the drift
+/// report flags `pane.graphics.stream` as "in READ, absent from the
+/// schema" on every run. That is the report working, not a stale entry.
 const READ: &[&str] = &[
     "ping",
     "agent.explain",
@@ -112,16 +131,20 @@ const READ: &[&str] = &[
     "events.subscribe",
     "events.wait",
     "layout.export",
+    "pane.copy_motion",
+    "pane.copy_search",
     "pane.current",
     "pane.edges",
     "pane.get",
     "pane.graphics.info",
     "pane.graphics.stream",
     "pane.layout",
+    "pane.link.resolve",
     "pane.list",
     "pane.neighbor",
     "pane.process_info",
     "pane.read",
+    "pane.selection.read",
     "pane.wait_for_output",
     "plugin.action.list",
     "plugin.list",
@@ -585,6 +608,93 @@ mod tests {
             Class::Mutate,
             "a new workspace-surface method stays usable in full mode"
         );
+    }
+
+    /// The copy-mode reads, pinned to the herdr handler each one was
+    /// read against, because "it has read in the name" is not why any of
+    /// them is here — `pane.selection.read` earns it by calling
+    /// `pane_selection_text(&self)`, which extracts text and stores
+    /// nothing, while `pane.edit_scrollback` would not have, despite
+    /// looking just as passive: it reaches
+    /// `open_focused_scrollback_in_editor()` and spawns an editor on the
+    /// host.
+    ///
+    /// Read in `readonly`, which is the mode where being wrong costs
+    /// something: in `full` every one of these would be allowed as a
+    /// mutation anyway, so a test that only asserted `full` would pass
+    /// with the list empty.
+    #[test]
+    fn the_copy_mode_reads_survive_readonly() {
+        for (method, evidence) in [
+            (
+                "pane.selection.read",
+                "`pane_selection_text(&self)` extracts the selected text and \
+                 writes nothing back (herdr 0.9.1 src/app/api/panes.rs)",
+            ),
+            (
+                "pane.copy_search",
+                "searches the scrollback and returns match positions; the \
+                 copy cursor it searches from arrives as a parameter and \
+                 stays the caller's (herdr 0.9.1 src/app/api/panes.rs)",
+            ),
+            (
+                "pane.copy_motion",
+                "computes where a motion lands and returns the point — \
+                 herdr holds no copy-mode cursor to move (herdr 0.9.1 \
+                 src/app/api/panes.rs)",
+            ),
+            (
+                "pane.link.resolve",
+                "`read_checked_pane_link` + `link_regions_at` report the \
+                 links under a cell; opening one is `pane.link.activate`, \
+                 which stays a mutation (herdr 0.9.1 \
+                 src/app/api/plugins/mod.rs)",
+            ),
+        ] {
+            assert!(
+                allowed(Mode::Readonly, method),
+                "{method} is pure inspection and a readonly agent must be \
+                 able to call it — {evidence}"
+            );
+        }
+    }
+
+    /// The other half of the same reconciliation: these read *like*
+    /// inspection and are not. Without this, widening READ for the four
+    /// above could quietly take a neighbour with it.
+    #[test]
+    fn the_lookalikes_stay_denied_in_readonly() {
+        for (method, why) in [
+            (
+                "pane.edit_scrollback",
+                "opens the scrollback in an editor process on the host",
+            ),
+            (
+                "pane.link.activate",
+                "follows the link — the resolve sibling is the read",
+            ),
+            ("pane.scroll", "moves what the human is looking at"),
+            (
+                "pane.focus_direction",
+                "focuses another pane and switches the tab to reach it",
+            ),
+            (
+                "pane.graphics.stream.open",
+                "opens a graphics stream on the host side of the bridge, \
+                 and is not in herdr's published schema to reconcile against",
+            ),
+        ] {
+            assert!(
+                !allowed(Mode::Readonly, method),
+                "{method} must stay denied in readonly: it {why}"
+            );
+            assert!(
+                allowed(Mode::Full, method),
+                "{method} is a mutation, not host admin, so `full` still \
+                 carries it — a denial here would mean it had drifted into \
+                 the admin namespaces"
+            );
+        }
     }
 
     #[test]
