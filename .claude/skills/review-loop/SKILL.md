@@ -72,11 +72,12 @@ with the verdict and the evidence: for a fix, name the commit and the
 pinning test; for a refutation, show the trace ("this `into_inner` unwraps
 the `Take`, not the `BufReader`") — enough that the thread can be resolved
 without re-deriving your work. Then request re-review from whoever raised
-it — each reviewer has its own trigger: CodeRabbit reviews pushed commits
-automatically (or on `@coderabbitai review`), the Codex workflow runs on
-`synchronize` (every push) when its API key is configured, and humans get
-a normal re-review request. Confirm the re-review actually started; a
-reply nobody re-reads closes nothing.
+it — each reviewer has its own trigger: CodeRabbit reviews only when it is
+asked to (comment `@coderabbitai review`; automatic review is off, so a
+push alone gets you nothing), the Codex workflow runs on `synchronize`
+(every push) when its API key is configured, and humans get a normal
+re-review request. Confirm the re-review actually started; a reply nobody
+re-reads closes nothing.
 
 ## 6. Loop, bounded
 

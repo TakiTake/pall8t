@@ -16,8 +16,21 @@ The test strategy starts in the production code, not the test file:
 - **Dependencies are arguments.** Probes with real IO (a socket connect, a
   `--version` spawn) are computed by the caller and passed in, so the
   logic under test stays pure and parallel-test-safe
-  (`herdr::doctor_checks(&snap, socket_reachable, bin_resolvable)`).
+  (`herdr::doctor_checks(&snap, socket_reachable, bin_resolvable)`,
+  `stale_sockets(candidates, grace, is_live)`,
+  `reap_stale_sockets(dir, grace, is_live)`).
   Never mutate `std::env` in a test — the suite runs in parallel.
+- **A socket this process closed is not necessarily dead, and a half-close
+  it performed is not necessarily seen.** macOS has no atomic
+  close-on-exec for socket creation, so a subprocess another test spawns
+  in that instant inherits the socket and holds it open for its own
+  lifetime. Two tests here assumed otherwise and failed roughly once in
+  every 300-900 full-suite runs — a bound-then-dropped socket that kept
+  answering `connect`, and an upstream half-close that never reached its
+  peer. Assert what the code under test decides, and inject the probe;
+  the connect itself belongs in the one place that interprets it
+  (`connect_says_dead`). The same goes for any resource the suite assumes
+  is private while `Command::spawn` runs in parallel.
 - **External CLI output is parsed by a pure `parse_*` function**, tested
   against *literal captured output* of the real tool, including a comment
   saying which version it was captured from (`parse_list_all`,
@@ -44,19 +57,126 @@ The test strategy starts in the production code, not the test file:
   name + pid, cleaned at the end; `/tmp`-short paths when `sun_path`
   limits apply.
 
+## Two layers: in-crate tests and `tests/cli.rs`
+
+Most of the suite lives next to the code it covers, in `#[cfg(test)] mod
+tests`. One integration target, `tests/cli.rs`, drives the built `pall8t`
+binary instead. It exists for the things a unit test structurally cannot
+see: `main`'s exit codes, clap's shape, which stream each message goes to,
+and the command lines pall8t hands `container` and `herdr`.
+
+It is still bound by the rule above — no live runtime, no live herdr:
+
+- **An isolated `$HOME` per test.** `dirs::home_dir()` reads `$HOME` first
+  and only falls back to `getpwuid` when it is unset or empty (verified in
+  dirs-sys 0.4.1), so every child gets an explicit `HOME` under `/tmp` and
+  `~/.pall8t` becomes a throwaway tree. Never `env_clear()` without setting
+  it — that sends `~/.pall8t` back to the developer's real home.
+- **An empty `PATH`**, so "the `container` CLI is missing" is a fact of the
+  test rather than a property of the developer's machine.
+- **A stand-in `container` on that `PATH` when a test needs one.** It
+  replays literal captured output for the three read-only queries pall8t
+  parses and records every argv it is handed. It does not emulate
+  apple/container; it is there so the *command lines* — the real contract
+  — can be asserted without a VM.
+- **`execve` ends coverage.** `pall8t run` and `pall8t exec` replace the
+  process, and no atexit handler runs, so a profile written at exit is
+  lost. The launch tests therefore make the stand-in runtime remove itself
+  at the last call before the exec, which turns the process replacement
+  into an ordinary error return. That is also a real behaviour worth
+  pinning: a runtime that disappears mid-launch must fail loudly.
+- **Nothing may hang.** `herdr relay` serves until its parent exits, so the
+  test for its refusal-to-run guard waits with a deadline
+  (`Sandbox::run_bounded`) — if the guard ever stopped firing, the suite
+  must fail, not block. The same applies to every blocking read: a
+  `read_line` on a Unix socket waits forever by default, so the relay's
+  own unit tests read replies through `read_reply`, which sets a socket
+  deadline and prints the relay's audit log when it fires. The cost of
+  getting this wrong is not one slow test: `cargo mutants` derives its
+  per-mutant timeout from a baseline run that has *no* timeout itself, so
+  a single stalled read there wedges the whole mutation run — no report,
+  no output, until someone notices.
+
+## Coverage
+
+`cargo llvm-cov --summary-only` (install once with `cargo install
+cargo-llvm-cov` and `rustup component add llvm-tools-preview`). Read it as
+"what has no test pointing at it at all" — a line covered by a test that
+asserts nothing counts for nothing, so the number is a floor to stay above
+rather than a score to raise.
+
+CI enforces that floor at 90% lines (`quality.yml`), well under where the
+tree actually sits. That is deliberate: the gap is headroom, not slack to
+be filled. Closing the last few points means writing tests for the IO
+boundaries the harness deliberately does not cross, and those tests can
+only assert nothing. If the floor ever blocks you, the question is which
+real decision lost its test, not how to get the number back up.
+
 ## Would the test go red?
 
-A test only counts if it fails when the code it names is broken. The
-mutation-testing workflow (`.github/workflows/mutants.yml`) automates
-this check — it flips conditions and deletes guards, then reports mutants
-the suite failed to catch. It runs weekly and on demand (Actions →
-"Mutation testing" → *Run workflow*, or
-`gh workflow run mutants.yml`); either way it is report-only and never
-blocks a build. For a quick local pass on one file:
-`cargo mutants -f src/<file>.rs`. When you write a
-nontrivial test, do the manual version once: break the code, watch the
-test fail, restore it. If it stays green, the test is asserting the wrong
-thing.
+A test only counts if it fails when the code it names is broken. Mutation
+testing automates the check — it flips conditions and deletes guards, then
+reports the mutants the suite failed to catch. It runs at two scopes, and
+the difference between them is the point:
+
+- **Per PR, and it blocks** (`.github/workflows/quality.yml`):
+  `cargo mutants --in-diff` mutates only the lines the PR touched. A
+  missed mutant there is a test that would not have noticed this change
+  breaking, so it fails the build. It is affordable because it is
+  incremental — a handful of mutants in well under a minute for a normal
+  PR — and it scales with the diff: a PR adding a thousand lines of
+  source gets proportionally more mutants to survive.
+
+  Be exact about which lines those are. cargo-mutants mutates product
+  code and never `#[cfg(test)]` code, so the count follows the *source*
+  a PR adds, not the tests. A PR that only adds tests produces zero
+  mutants and passes, the same as a docs-only PR. What the gate
+  enforces is the other direction — new code must arrive with tests
+  that would notice it breaking — and that is what would have caught
+  the `nofile` assertion this document opens with. A pile of tests
+  defending nothing new is not something this gate can see; the
+  suite-cost numbers in the same workflow are where it shows up.
+- **Weekly over the whole tree, report-only** (`mutants.yml`): the trend,
+  including the standing misses nobody chose. Gating on that would be
+  gating on a backlog, which teaches reflexive ignoring. Run it on demand
+  with `gh workflow run mutants.yml`.
+
+Most of the standing whole-tree misses are IO-boundary functions the
+harness cannot reach (`host_ids`, `system_status`, `stdin_is_tty`). They
+are not a to-do list; driving that count to zero would mean exactly the
+assertion-free tests this document warns about.
+
+### When the per-PR gate is red
+
+Read the counts in the step summary before assuming a test is missing.
+The job fails on any non-zero exit from `cargo mutants`, which covers
+three different situations:
+
+- `missed` non-zero — the real one. A change to your code that the suite
+  did not notice. Fix the test, not the gate.
+- `timeout` non-zero — a mutant made some test hang, usually a loop whose
+  exit condition was what got mutated. Worth a look: a mutant that hangs
+  the suite is still a mutant nothing asserts against. If it is instead a
+  genuinely slow test, `--timeout-multiplier` on the step is the honest
+  fix.
+- The run never finished. The job is capped at 45 minutes. The weekly
+  whole-tree run is the yardstick: 645 mutants in 48m35s on 2026-09-18,
+  so the cap is worth about 500-600 mutants and a refactor touching a
+  third of the tree can pass it. Split the PR — which is the right move
+  anyway, since nobody reviews a diff that size well — or, if it truly
+  cannot be split, say so in the PR and let the human run
+  `cargo mutants --in-diff` locally to produce the same evidence the job
+  would have.
+
+For a quick local pass on one file: `cargo mutants -f src/<file>.rs`. To
+see what the PR gate will see, without waiting for CI:
+`git diff origin/main...HEAD > /tmp/pr.diff && cargo mutants --in-diff /tmp/pr.diff`
+(`--list` added to that prints the mutants without running them, which is
+the cheap way to find out whether a diff mutates anything at all).
+
+When you write a nontrivial test, do the manual version once: break the
+code, watch the test fail, restore it. If it stays green, the test is
+asserting the wrong thing.
 
 ## What not to test
 

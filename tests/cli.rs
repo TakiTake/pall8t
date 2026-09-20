@@ -1,0 +1,2419 @@
+//! End-to-end tests of the `pall8t` binary itself.
+//!
+//! `docs/testing.md` rules out tests that need a live `container` runtime
+//! or herdr session, and none of these have one: every case here is either
+//! pure argument handling, work confined to a throwaway `$HOME`, or the
+//! *absence* of the `container` CLI, which the sandbox guarantees by
+//! handing the child an empty `PATH`. What they buy over the in-crate unit
+//! tests is the wiring — `main`'s exit codes, clap's shape, which stream
+//! each message goes to, and the fact that `~/.pall8t` is derived from the
+//! environment rather than hardcoded.
+//!
+//! Isolation rests on one verified fact: `dirs::home_dir()` reads `$HOME`
+//! first and only falls back to `getpwuid` when it is unset or empty
+//! (dirs-sys 0.4.1). Every child therefore gets an explicit `HOME` — never
+//! `env_clear()` alone, which would send `~/.pall8t` back to the real home
+//! directory and let a test write into it.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+
+/// One test's throwaway world: an isolated `$HOME` (so `~/.pall8t` is a
+/// temp tree) and a project directory to run in.
+///
+/// Kept under `/tmp` rather than `std::env::temp_dir()` for the same
+/// reason `relay.rs`'s tests are: the relay binds Unix sockets under
+/// `$HOME/.pall8t/run`, and macOS' per-user temp directory is long enough
+/// to blow the 104-byte `sun_path` budget once a socket name is appended.
+struct Sandbox {
+    root: PathBuf,
+}
+
+impl Sandbox {
+    fn new(name: &str) -> Self {
+        let root = PathBuf::from("/tmp").join(format!("p8t-cli-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for sub in ["home", "project", "bin"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        Sandbox { root }
+    }
+
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
+    }
+
+    fn project(&self) -> PathBuf {
+        self.root.join("project")
+    }
+
+    /// `~/.pall8t` as this sandbox's children see it.
+    fn pall8t_root(&self) -> PathBuf {
+        self.home().join(".pall8t")
+    }
+
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pall8t"));
+        self.apply_env(&mut cmd);
+        cmd
+    }
+
+    /// A `/bin/sh` in the same throwaway world, for the one test that needs
+    /// a child of something other than itself.
+    fn sh_command(&self) -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        self.apply_env(&mut cmd);
+        cmd
+    }
+
+    fn apply_env(&self, cmd: &mut Command) {
+        cmd.env_clear();
+        // `env_clear` is what makes these tests independent of the
+        // developer's shell — including `HERDR_*`, which would otherwise
+        // make "no pane here" untrue when the suite runs inside a herdr
+        // pane. It also drops the coverage instrumentation's output path,
+        // and a child that cannot write a profile silently contributes
+        // nothing to the report, so that one variable is forwarded back.
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            cmd.env("LLVM_PROFILE_FILE", profile);
+        }
+        // Never omit HOME: with it unset, dirs falls back to the real
+        // passwd entry and the test writes into the user's home. PATH is an
+        // empty directory, so `container` (and `git`, and `herdr`) are
+        // definitively not found — that is what makes the runtime-missing
+        // arms deterministic instead of dependent on whether the developer
+        // has apple/container installed.
+        cmd.env("HOME", self.home())
+            .env("PATH", self.root.join("bin"))
+            .current_dir(self.project());
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().unwrap()
+    }
+
+    /// Like [`Sandbox::run`], but never waits forever.
+    ///
+    /// For the subcommand that is *supposed* to refuse and exit: `herdr
+    /// relay` serves until its parent goes away, so if the refusal it is
+    /// being tested for ever stopped happening, a plain `output()` would
+    /// hang the suite instead of failing it. Killing at the deadline turns
+    /// that into a normal assertion failure.
+    fn run_bounded(&self, args: &[&str], limit: std::time::Duration) -> Output {
+        let mut child = self
+            .command()
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child.wait_with_output().unwrap()
+    }
+
+    /// Writes a project `.pall8t/config.toml`.
+    fn write_project_config(&self, body: &str) {
+        let dir = self.project().join(".pall8t");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
+    /// Writes the global `~/.pall8t/config.toml`.
+    fn write_global_config(&self, body: &str) {
+        std::fs::create_dir_all(self.pall8t_root()).unwrap();
+        std::fs::write(self.pall8t_root().join("config.toml"), body).unwrap();
+    }
+}
+
+/// A stand-in `container` CLI on the sandbox's `PATH`.
+///
+/// This is *not* the "live runtime" `docs/testing.md` rules out: nothing
+/// here virtualizes apple/container's behaviour. It replays literal
+/// captured output for the three read-only queries pall8t parses
+/// (`--version`, `list --all --format json`, `image list --format json`)
+/// and records the argv of every call, so the tests can assert the one
+/// thing that is genuinely pall8t's contract with the runtime — the
+/// command lines it constructs — without a VM, a build, or a machine that
+/// happens to have apple/container installed.
+struct FakeRuntime<'a> {
+    sandbox: &'a Sandbox,
+}
+
+impl<'a> FakeRuntime<'a> {
+    /// `version` is the banner `container --version` replies with;
+    /// `containers` and `images` are the JSON bodies for the two listings.
+    fn install(sandbox: &'a Sandbox, version: &str, containers: &str, images: &str) -> Self {
+        std::fs::write(sandbox.root.join("containers.json"), containers).unwrap();
+        std::fs::write(sandbox.root.join("images.json"), images).unwrap();
+        let root = sandbox.root.display();
+        let script = format!(
+            r#"#!/bin/sh
+# Stand-in apple/container CLI for pall8t's integration tests.
+# Its own PATH, because the one it inherits is the deliberately empty
+# directory that hides the real runtime — without this, `cat` below is not
+# found and every listing silently comes back empty.
+PATH=/bin:/usr/bin
+printf '%s\n' "$*" >> "{root}/argv.log"
+case "$1" in
+  --version) echo "{version}" ;;
+  system)   [ "$2" = "status" ] || [ "$2" = "start" ] || exit 1 ;;
+  list)     cat "{root}/containers.json" ;;
+  image)
+    case "$2" in
+      # `image list` is the last thing pall8t asks the runtime before it
+      # execs into it. A test that wants to observe the launch path removes
+      # the runtime here (see `vanish_after_image_list`).
+      list)   cat "{root}/images.json"; [ -f "{root}/vanish" ] && rm -f "{root}/bin/container" ;;
+      delete) ;;
+      *) exit 1 ;;
+    esac ;;
+  build)   echo "fake build ok" >&2 ;;
+  stop)    ;;
+  run|exec) echo "fake $1 reached" ;;
+  *) exit 1 ;;
+esac
+exit 0
+"#
+        );
+        let bin = sandbox.root.join("bin").join("container");
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        FakeRuntime { sandbox }
+    }
+
+    /// The default install: a current runtime, no containers, no images.
+    fn current(sandbox: &'a Sandbox) -> Self {
+        Self::install(
+            sandbox,
+            "container CLI version 1.2.2 (build: release, commit: unspeci)",
+            "[]",
+            "[]",
+        )
+    }
+
+    fn set_containers(&self, json: &str) {
+        std::fs::write(self.sandbox.root.join("containers.json"), json).unwrap();
+    }
+
+    fn set_images(&self, refs: &[String]) {
+        let json = serde_json::to_string(refs).unwrap();
+        std::fs::write(self.sandbox.root.join("images.json"), json).unwrap();
+    }
+
+    /// Makes the runtime disappear right after the image check, which is
+    /// the last thing `pall8t run` asks it before `execve`. Handing the
+    /// launch path a runtime it cannot exec turns a process replacement
+    /// into an ordinary error return — the only way a test can watch what
+    /// `run` did on its way there, since an `execve` leaves nothing behind
+    /// to inspect. It also pins real behaviour: a runtime that vanishes
+    /// mid-launch must fail loudly, not exit 0 having started nothing.
+    fn vanish_after_image_list(&self) {
+        std::fs::write(self.sandbox.root.join("vanish"), b"").unwrap();
+    }
+
+    fn clear_log(&self) {
+        let _ = std::fs::remove_file(self.sandbox.root.join("argv.log"));
+    }
+
+    /// Every command line pall8t handed the runtime, one per line.
+    fn argv_log(&self) -> String {
+        std::fs::read_to_string(self.sandbox.root.join("argv.log")).unwrap_or_default()
+    }
+
+    fn called(&self, needle: &str) -> bool {
+        self.argv_log().lines().any(|l| l.contains(needle))
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn version_reports_the_crate_version() {
+    let sb = Sandbox::new("version");
+    let out = sb.run(&["--version"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains(env!("CARGO_PKG_VERSION")),
+        "`--version` must print the version cargo built, so a release \
+         binary can be identified in the field: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn help_lists_every_subcommand() {
+    let sb = Sandbox::new("help");
+    let out = sb.run(&["--help"]);
+    assert!(out.status.success());
+    let text = stdout(&out);
+    for cmd in ["init", "run", "build", "ls", "exec", "stop", "herdr"] {
+        assert!(
+            text.contains(cmd),
+            "`{cmd}` is a supported subcommand and must appear in --help: {text}"
+        );
+    }
+}
+
+#[test]
+fn the_internal_subcommands_stay_hidden_from_help() {
+    let sb = Sandbox::new("hidden");
+    let out = sb.run(&["herdr", "--help"]);
+    assert!(out.status.success());
+    assert!(
+        !stdout(&out).contains("relay"),
+        "`herdr relay` is spawned by `pall8t run`, never typed — listing it \
+         invites hand-running the one subcommand that chmods and sweeps a \
+         directory: {}",
+        stdout(&out)
+    );
+    assert!(
+        !stdout(&out).contains("name-agent"),
+        "and `herdr name-agent` is likewise pall8t's own machinery: it \
+         outlives the run that spawned it and reports to a log, neither of \
+         which makes sense typed by hand: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn an_unknown_subcommand_fails_rather_than_doing_something_else() {
+    let sb = Sandbox::new("unknown");
+    let out = sb.run(&["frobnicate"]);
+    assert!(
+        !out.status.success(),
+        "an unrecognized subcommand must not exit 0 — a wrapper script \
+         checking the exit code has to be able to tell"
+    );
+}
+
+#[test]
+fn init_creates_the_skeletons_then_reports_them_as_existing() {
+    let sb = Sandbox::new("init");
+
+    let first = sb.run(&["init"]);
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
+    let home = sb.pall8t_root().join("home");
+    let global = sb.pall8t_root().join("config.toml");
+    let containerfile = sb.pall8t_root().join("Containerfile");
+    let project = sb.project().join(".pall8t").join("config.toml");
+    for path in [&home, &global, &containerfile, &project] {
+        assert!(
+            path.exists(),
+            "init must materialize {} — that is the whole command",
+            path.display()
+        );
+    }
+    assert!(
+        stdout(&first).contains("created:"),
+        "the first run reports what it made: {}",
+        stdout(&first)
+    );
+    assert!(
+        home.starts_with(sb.home()),
+        "everything init writes must sit under $HOME, not a hardcoded path: {}",
+        home.display()
+    );
+
+    let second = sb.run(&["init"]);
+    assert!(second.status.success());
+    assert!(
+        stdout(&second).contains("exists, skipped:") && !stdout(&second).contains("created:"),
+        "init is idempotent: a second run must report every file as already \
+         there rather than rewriting it: {}",
+        stdout(&second)
+    );
+}
+
+#[test]
+fn init_never_overwrites_an_edited_file() {
+    let sb = Sandbox::new("init-edit");
+    sb.run(&["init"]);
+    let containerfile = sb.pall8t_root().join("Containerfile");
+    std::fs::write(&containerfile, "FROM scratch\n# mine\n").unwrap();
+
+    let out = sb.run(&["init"]);
+
+    assert!(out.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&containerfile).unwrap(),
+        "FROM scratch\n# mine\n",
+        "the Containerfile is the user's to edit — re-running init must \
+         never restore the shipped default over it"
+    );
+}
+
+#[test]
+fn every_command_that_needs_the_runtime_says_where_to_get_it() {
+    let sb = Sandbox::new("no-cli");
+    // `run` and `build` are included deliberately: they must fail on the
+    // missing runtime *before* building an image, so this stays a
+    // read-only test.
+    for args in [
+        vec!["ls"],
+        vec!["build"],
+        vec!["run"],
+        vec!["stop", "pall8t-x"],
+        vec!["exec", "pall8t-x", "--", "true"],
+    ] {
+        let out = sb.run(&args);
+        assert!(
+            !out.status.success(),
+            "`pall8t {}` cannot work without the container CLI and must exit \
+             non-zero",
+            args.join(" ")
+        );
+        assert!(
+            stderr(&out).contains("github.com/apple/container"),
+            "the error has to name where to get the missing runtime, not just \
+             that something failed (`pall8t {}`): {}",
+            args.join(" "),
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn exec_without_a_command_says_how_to_pass_one() {
+    let sb = Sandbox::new("exec-usage");
+    let out = sb.run(&["exec", "pall8t-x"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("pall8t exec <id> -- <cmd>"),
+        "the usage line is the fix, and it must arrive before the container \
+         CLI is even consulted: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn herdr_doctor_json_reports_no_pane_outside_herdr() {
+    let sb = Sandbox::new("doctor-json");
+    let out = sb.run(&["herdr", "doctor", "--json"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let checks: serde_json::Value = serde_json::from_str(stdout(&out).trim())
+        .unwrap_or_else(|e| panic!("--json must emit parseable JSON ({e}): {}", stdout(&out)));
+    let checks = checks.as_array().expect("doctor reports a list of checks");
+    assert!(
+        !checks.is_empty(),
+        "doctor with no herdr around still has something to report — that \
+         there is no pane is the report"
+    );
+    for c in checks {
+        assert!(
+            c.get("name").is_some() && c.get("ok").is_some() && c.get("detail").is_some(),
+            "herdr consumes this shape; every check needs name/ok/detail: {c}"
+        );
+    }
+    assert!(
+        checks.iter().any(|c| c["ok"] == false),
+        "outside a herdr pane at least one check must fail — a doctor that \
+         says everything is fine here would be lying"
+    );
+}
+
+#[test]
+fn herdr_doctor_prints_a_mark_per_check_without_json() {
+    let sb = Sandbox::new("doctor-text");
+    let out = sb.run(&["herdr", "doctor"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains('✓') || text.contains('✗'),
+        "the human-readable arm marks each check pass/fail: {text}"
+    );
+}
+
+#[test]
+fn herdr_doctor_sees_the_socket_when_the_pane_env_points_at_a_live_one() {
+    let sb = Sandbox::new("doctor-sock");
+    // A real listener, so the connect-only probe has something to answer
+    // for. No herdr involved — doctor never sends a request.
+    let sock = sb.root.join("herdr.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let out = sb
+        .command()
+        .args(["herdr", "doctor", "--json"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "pane_test")
+        .env("HERDR_SOCKET_PATH", &sock)
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let checks: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    let socket_check = checks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"].as_str().is_some_and(|n| n.contains("socket")))
+        .expect("a socket check exists");
+    assert_eq!(
+        socket_check["ok"], true,
+        "something is listening on the path the pane env names, so the probe \
+         must say so: {socket_check}"
+    );
+    drop(listener);
+}
+
+#[test]
+fn a_deprecated_config_section_is_warned_about_on_stderr_only() {
+    let sb = Sandbox::new("deprecated");
+    sb.write_project_config("[home]\nmode = \"isolated\"\n");
+
+    let out = sb.run(&["herdr", "doctor", "--json"]);
+
+    assert!(out.status.success());
+    assert!(
+        stderr(&out).contains("[home]") && stderr(&out).contains("no longer supported"),
+        "an ignored setting must be said out loud, or the user keeps \
+         believing it works: {}",
+        stderr(&out)
+    );
+    serde_json::from_str::<serde_json::Value>(stdout(&out).trim()).expect(
+        "the warning belongs on stderr: stdout stays parseable JSON for the \
+         tools that consume --json",
+    );
+}
+
+#[test]
+fn an_invalid_config_names_the_file_it_could_not_read() {
+    let sb = Sandbox::new("bad-toml");
+    sb.write_project_config("cpus = \n");
+
+    let out = sb.run(&["run"]);
+
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains(".pall8t/config.toml"),
+        "with two config files in play, the error must say which one is \
+         broken: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_config_still_using_repos_is_an_error_naming_its_replacement() {
+    let sb = Sandbox::new("repos");
+    sb.write_project_config("[[repos]]\nsource = \"~/src/lib\"\n");
+
+    let out = sb.run(&["run"]);
+
+    assert!(
+        !out.status.success(),
+        "[[repos]] silently ignored would leave a directory the user believes \
+         is mounted missing from the sandbox"
+    );
+    assert!(
+        stderr(&out).contains("[[mounts]]"),
+        "the error has to name the replacement, not just the removal: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_config_problem_is_reported_even_without_the_container_runtime() {
+    let sb = Sandbox::new("cfg-before-cli");
+    sb.write_global_config("[[repos]]\nsource = \"~/src/lib\"\n");
+
+    let out = sb.run(&["build"]);
+
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("[[mounts]]") && !stderr(&out).contains("github.com/apple/container"),
+        "config is read before the runtime check on purpose: someone fixing \
+         a broken config shouldn't have to install apple/container first to \
+         be told what is wrong with it: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn the_relay_refuses_a_listen_path_outside_its_own_run_directory() {
+    let sb = Sandbox::new("relay-guard");
+    let stray = sb.root.join("stray.sock");
+
+    let out = sb.run_bounded(
+        &[
+            "herdr",
+            "relay",
+            "--socket",
+            "/nonexistent/herdr.sock",
+            "--listen",
+            stray.to_str().unwrap(),
+            "--mode",
+            "full",
+            "--log",
+            sb.root.join("relay.log").to_str().unwrap(),
+        ],
+        std::time::Duration::from_secs(10),
+    );
+
+    assert!(
+        !out.status.success(),
+        "the relay chmods its directory to 0700 and unlinks sockets in it — \
+         pointed at a directory it does not own, it must refuse before doing \
+         any of that"
+    );
+    assert!(
+        stderr(&out).contains(".pall8t/run"),
+        "the refusal has to say where the socket belongs: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stray.exists(),
+        "nothing may be bound outside the run directory"
+    );
+}
+
+#[test]
+fn the_relay_rejects_a_policy_mode_it_does_not_know() {
+    let sb = Sandbox::new("relay-mode");
+    let out = sb.run(&[
+        "herdr",
+        "relay",
+        "--socket",
+        "/nonexistent/herdr.sock",
+        "--listen",
+        sb.pall8t_root()
+            .join("run")
+            .join("x.sock")
+            .to_str()
+            .unwrap(),
+        "--mode",
+        "sometimes",
+        "--log",
+        sb.root.join("relay.log").to_str().unwrap(),
+    ]);
+
+    assert!(
+        !out.status.success(),
+        "an unknown mode must fail loudly: falling back to a default would \
+         pick a policy the caller did not ask for"
+    );
+    assert!(
+        stderr(&out).contains("sometimes"),
+        "the error names the mode it could not parse: {}",
+        stderr(&out)
+    );
+}
+
+/// The relay end to end as `pall8t run` uses it: spawn it, read the socket
+/// path off its stdout, connect to *that* path, and check policy is
+/// applied and audited. A fake herdr on the upstream side stands in for
+/// the host session; no real herdr is involved.
+#[test]
+fn the_relay_serves_and_polices_the_socket_it_announces() {
+    let sb = Sandbox::new("relay-serve");
+    let upstream_path = sb.root.join("h.sock");
+    let upstream = std::os::unix::net::UnixListener::bind(&upstream_path).unwrap();
+    std::thread::spawn(move || {
+        for conn in upstream.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let mut r = BufReader::new(conn.try_clone().unwrap());
+                if r.read_line(&mut line).is_ok() {
+                    let _ = conn.write_all(b"{\"id\":\"r1\",\"result\":{\"ok\":true}}\n");
+                }
+            });
+        }
+    });
+
+    let log = sb.root.join("relay.log");
+    let listen = sb.pall8t_root().join("run").join("pall8t-itest.sock");
+    let mut child = sb
+        .command()
+        .args([
+            "herdr",
+            "relay",
+            "--socket",
+            upstream_path.to_str().unwrap(),
+            "--listen",
+            listen.to_str().unwrap(),
+            "--mode",
+            "readonly",
+            "--log",
+            log.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut announced = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut announced)
+        .unwrap();
+    assert_eq!(
+        announced.trim(),
+        listen.to_str().unwrap(),
+        "the readiness line is a contract: `pall8t run` mounts exactly the \
+         path the relay prints, and cannot proceed until the socket exists"
+    );
+    assert!(
+        listen.exists(),
+        "the path is announced only once it is bound — announcing early \
+         would hand `container run` a mount source that isn't there yet"
+    );
+
+    let allowed = roundtrip(&listen, r#"{"id":"r1","method":"pane.list","params":{}}"#);
+    assert_eq!(
+        allowed["result"]["ok"], true,
+        "an inspection method is allowed in readonly and reaches the herdr \
+         socket: {allowed}"
+    );
+
+    let denied = roundtrip(&listen, r#"{"id":"r2","method":"pane.split","params":{}}"#);
+    assert_eq!(
+        denied["error"]["code"], "sandbox_denied",
+        "readonly mode must stop a mutation at the relay, and answer in \
+         herdr's own error shape so the in-container CLI renders it: {denied}"
+    );
+
+    // A request line with a real payload on it: `agent.prompt` bodies and
+    // graphics blobs run to kilobytes, and the relay's cap is herdr's own
+    // (1 MB). A smaller cap would truncate this line mid-JSON, leaving
+    // policy unable to classify it — and readonly denies what it cannot
+    // classify, so a shrunken cap turns working reads into refusals.
+    let padding = "x".repeat(8192);
+    let big = format!(r#"{{"id":"r3","method":"pane.list","params":{{"pad":"{padding}"}}}}"#);
+    let big_reply = roundtrip(&listen, &big);
+    assert_eq!(
+        big_reply["result"]["ok"], true,
+        "an 8 KB read request is well under herdr's 1 MB line cap and must \
+         cross intact: {big_reply}"
+    );
+
+    let audit = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        audit.contains("\"allow\"") && audit.contains("\"deny\""),
+        "every decision is audited on the host — that log is what makes \
+         `full` mode a deliberate, reviewable opening: {audit}"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for line in audit.lines() {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        let ts = entry["ts"].as_u64().expect("every entry carries a ts");
+        assert!(
+            ts.abs_diff(now) < 300,
+            "an audit trail is only reviewable if it says *when*: {line}"
+        );
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn roundtrip(listen: &Path, request: &str) -> serde_json::Value {
+    let mut conn = std::os::unix::net::UnixStream::connect(listen).unwrap();
+    conn.write_all(request.as_bytes()).unwrap();
+    conn.write_all(b"\n").unwrap();
+    let mut body = String::new();
+    conn.read_to_string(&mut body).unwrap();
+    serde_json::from_str(body.trim().lines().next().unwrap()).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Against a stand-in runtime: the command lines pall8t builds, and the
+// paths that only run once `container` answers.
+// ---------------------------------------------------------------------------
+
+/// Literal shape of `container list --all --format json` (apple/container
+/// 1.0.0): `status` is a nested object. Two pall8t containers and one
+/// container pall8t did not start.
+const CONTAINERS_JSON: &str = r#"[
+  { "id": "pall8t-x-1",
+    "configuration": { "id": "pall8t-x-1", "image": { "reference": "pall8t-x:501-20-aaa" } },
+    "status": { "state": "running", "networks": [], "startedDate": "2026-07-11T02:33:10Z" } },
+  { "id": "pall8t-x-2",
+    "configuration": { "id": "pall8t-x-2", "image": { "reference": "pall8t-x:501-20-bbb" } },
+    "status": { "state": "stopped", "networks": [] } },
+  { "id": "someone-elses",
+    "configuration": { "id": "someone-elses", "image": { "reference": "ubuntu:24.04" } },
+    "status": { "state": "running", "networks": [] } }
+]"#;
+
+#[test]
+fn ls_reports_only_the_containers_pall8t_started() {
+    let sb = Sandbox::new("ls");
+    FakeRuntime::install(
+        &sb,
+        "container CLI version 1.2.2 (build: release, commit: unspeci)",
+        CONTAINERS_JSON,
+        "[]",
+    );
+
+    let out = sb.run(&["ls"]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("pall8t-x-1\trunning") && text.contains("pall8t-x-2\tstopped"),
+        "each pall8t container is listed with its real state — reading the \
+         nested `status.state`, not a top-level string that never exists: {text}"
+    );
+    assert!(
+        !text.contains("someone-elses"),
+        "`ls` is scoped to containers pall8t started; listing the user's own \
+         containers would invite stopping one: {text}"
+    );
+}
+
+#[test]
+fn ls_json_is_machine_readable_and_alone_on_stdout() {
+    let sb = Sandbox::new("ls-json");
+    FakeRuntime::install(
+        &sb,
+        "container CLI version 1.2.2 (build: release, commit: unspeci)",
+        CONTAINERS_JSON,
+        "[]",
+    );
+
+    let out = sb.run(&["ls", "--json"]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let items: serde_json::Value = serde_json::from_str(stdout(&out).trim())
+        .unwrap_or_else(|e| panic!("herdr consumes this stream ({e}): {}", stdout(&out)));
+    let items = items.as_array().unwrap();
+    assert_eq!(items.len(), 2, "one object per pall8t container: {items:?}");
+    assert_eq!(items[0]["name"], "pall8t-x-1");
+    assert_eq!(
+        items[0]["status"], "running",
+        "the state is spelled the way the JSON contract says, not Debug-formatted"
+    );
+}
+
+#[test]
+fn an_outdated_runtime_is_warned_about_without_dirtying_json_output() {
+    let sb = Sandbox::new("old-runtime");
+    FakeRuntime::install(
+        &sb,
+        "container CLI version 1.0.0 (build: release, commit: abc1234)",
+        "[]",
+        "[]",
+    );
+
+    let out = sb.run(&["ls", "--json"]);
+
+    assert!(out.status.success());
+    assert!(
+        stderr(&out).contains("apple/container 1.0.0 is older than"),
+        "a runtime that leaks host env into the sandbox weakens the boundary \
+         pall8t documents, and the user has to hear about it: {}",
+        stderr(&out)
+    );
+    serde_json::from_str::<serde_json::Value>(stdout(&out).trim())
+        .expect("the warning goes to stderr so `ls --json` stays parseable");
+}
+
+#[test]
+fn a_current_runtime_draws_no_version_warning() {
+    let sb = Sandbox::new("new-runtime");
+    FakeRuntime::current(&sb);
+
+    let out = sb.run(&["ls"]);
+
+    assert!(out.status.success());
+    assert!(
+        !stderr(&out).contains("older than"),
+        "a warning users learn to scroll past stops working on the day it is \
+         right — it must stay silent on a supported runtime: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn stop_names_the_container_it_stopped() {
+    let sb = Sandbox::new("stop");
+    let fake = FakeRuntime::current(&sb);
+
+    let out = sb.run(&["stop", "pall8t-x-1"]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        fake.called("stop pall8t-x-1"),
+        "the id is forwarded verbatim: {}",
+        fake.argv_log()
+    );
+    assert!(stdout(&out).contains("stopped pall8t-x-1"));
+}
+
+#[test]
+fn build_tags_the_image_from_the_containerfile_and_reports_the_tag() {
+    let sb = Sandbox::new("build");
+    let fake = FakeRuntime::current(&sb);
+    sb.run(&["init"]);
+
+    let out = sb.run(&["build"]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let built = stdout(&out);
+    assert!(
+        built.starts_with("built "),
+        "the tag it produced is the command's answer, and a wrapper reads it \
+         off stdout: {built}"
+    );
+    let tag = built.trim().strip_prefix("built ").unwrap();
+    assert!(
+        fake.called(&format!("-t {tag}")),
+        "the tag reported is the tag actually built: {}",
+        fake.argv_log()
+    );
+    assert!(
+        fake.called("--build-arg UID=") && fake.called("--build-arg GID="),
+        "the image is built for the invoking user, so files it writes in the \
+         mounted workspace belong to that user on the host: {}",
+        fake.argv_log()
+    );
+    assert!(
+        !fake.called("--no-cache"),
+        "a plain `build` reuses the layer cache; --no-cache is the opt-in: {}",
+        fake.argv_log()
+    );
+}
+
+#[test]
+fn build_no_cache_forwards_the_flag() {
+    let sb = Sandbox::new("build-nocache");
+    let fake = FakeRuntime::current(&sb);
+    sb.run(&["init"]);
+
+    let out = sb.run(&["build", "--no-cache"]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        fake.called("--no-cache"),
+        "`--no-cache` exists to re-run the RUN steps that fetch \"latest\"; \
+         dropping it silently would serve a stale agent CLI forever: {}",
+        fake.argv_log()
+    );
+}
+
+/// `pall8t build` once, to learn the tag this machine's uid/gid and the
+/// shipped default Containerfile produce. Hardcoding `501-20` would make
+/// the pruning tests pass or fail on whose laptop they run.
+fn build_once(sb: &Sandbox, fake: &FakeRuntime) -> String {
+    sb.run(&["init"]);
+    let out = sb.run(&["build"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    fake.clear_log();
+    stdout(&out)
+        .trim()
+        .strip_prefix("built ")
+        .expect("build reports the tag it produced")
+        .to_string()
+}
+
+/// `pall8t-base:501-20` out of `pall8t-base:501-20-<hash>` — the sibling
+/// tags a prune is scoped to.
+fn tag_prefix(tag: &str) -> String {
+    tag.rsplit_once('-')
+        .expect("a tag is <base>:<uid>-<gid>-<hash>")
+        .0
+        .to_string()
+}
+
+#[test]
+fn build_prunes_a_superseded_image_but_keeps_one_a_container_still_runs() {
+    let sb = Sandbox::new("build-prune");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    let prefix = tag_prefix(&tag);
+    let in_use = format!("{prefix}-inuse");
+    let superseded = format!("{prefix}-old");
+
+    fake.set_containers(&format!(
+        r#"[
+          {{ "id": "pall8t-x-1",
+            "configuration": {{ "id": "pall8t-x-1", "image": {{ "reference": "{in_use}" }} }},
+            "status": {{ "state": "running", "networks": [] }} }}
+        ]"#
+    ));
+    fake.set_images(&[
+        tag.clone(),
+        superseded.clone(),
+        in_use.clone(),
+        "ubuntu:24.04".to_string(),
+    ]);
+
+    let out = sb.run(&["build"]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        fake.called(&format!("image delete {superseded}")),
+        "a superseded build under the same base, for this uid/gid, and unused \
+         — that is exactly what pruning is for: {}",
+        fake.argv_log()
+    );
+    assert!(
+        !fake.called(&format!("image delete {in_use}")),
+        "an existing container still runs that image; deleting it out from \
+         under a live container is the failure this check exists to prevent: {}",
+        fake.argv_log()
+    );
+    assert!(
+        !fake.called(&format!("image delete {tag}")),
+        "the tag just built is the one thing a prune must never take: {}",
+        fake.argv_log()
+    );
+    assert!(
+        !fake.called("image delete ubuntu:24.04"),
+        "pruning is scoped to images pall8t built for this user: {}",
+        fake.argv_log()
+    );
+}
+
+#[test]
+fn build_skips_pruning_when_an_image_in_use_cannot_be_determined() {
+    let sb = Sandbox::new("build-indeterminate");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    let superseded = format!("{}-old", tag_prefix(&tag));
+
+    // A listing entry carrying no image reference: pall8t cannot tell what
+    // that container runs, so every candidate becomes unsafe to delete.
+    fake.set_containers(
+        r#"[
+          { "id": "pall8t-x-1", "configuration": { "id": "pall8t-x-1" },
+            "status": { "state": "running", "networks": [] } }
+        ]"#,
+    );
+    fake.set_images(&[tag.clone(), superseded.clone()]);
+
+    let out = sb.run(&["build"]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        !fake.called("image delete"),
+        "indeterminate in-use refs must skip the prune entirely rather than \
+         guess — {superseded} is prunable on every other criterion: {}",
+        fake.argv_log()
+    );
+    assert!(
+        stderr(&out).contains("skipping prune"),
+        "and say so, or a user wonders why old images pile up: {}",
+        stderr(&out)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The launch path: what `pall8t run` hands the runtime, and the herdr
+// bridge it builds on the way there.
+// ---------------------------------------------------------------------------
+
+/// Installs a stand-in host `herdr` CLI and returns its path. It answers
+/// `--version` (which is how pall8t decides *which* Linux build the
+/// sandbox needs), replays whatever JSON the test left for the two list
+/// queries pall8t parses, can be told to withhold `agent get` for a few
+/// probes, and accepts everything else, recording argv.
+fn fake_host_herdr(sb: &Sandbox, version: &str) -> PathBuf {
+    let path = sb.root.join("herdr");
+    let root = sb.root.display();
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+PATH=/bin:/usr/bin
+printf '%s\n' "$*" >> "{root}/herdr-argv.log"
+case "$1 $2" in
+  "--version "*) echo "herdr {version}" ;;
+  "tab list") cat "{root}/herdr-tab-list.json" ;;
+  "agent list") cat "{root}/herdr-agent-list.json" ;;
+  "agent rename")
+    # A name another run took since the pre-exec scan: the test names it
+    # in rename-taken, and herdr's own `agent_name_taken` comes back.
+    taken=$(cat "{root}/rename-taken" 2>/dev/null || echo "")
+    if [ -n "$taken" ] && [ "$4" = "$taken" ]; then
+      echo "{{\"id\":\"cli:agent:rename\",\"error\":{{\"code\":\"agent_name_taken\",\"message\":\"agent name $4 is already used; candidates: terminal_id=t1\"}}}}" >&2
+      exit 1
+    fi
+    ;;
+  "agent get")
+    # herdr does not recognize the sandboxed agent the instant the run
+    # starts. A test can say how many probes it takes by writing the count
+    # to agent-get-ready; with no such file the first probe succeeds.
+    n=$(cat "{root}/agent-get-count" 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > "{root}/agent-get-count"
+    need=$(cat "{root}/agent-get-ready" 2>/dev/null || echo 1)
+    if [ "$n" -lt "$need" ]; then
+      echo '{{"id":"cli:agent:get","error":{{"code":"agent_not_found","message":"agent target w13:p3 not found"}}}}' >&2
+      exit 1
+    fi
+    ;;
+esac
+exit 0
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Waits for `needle` to show up in `path`, and returns the file's
+/// contents either way. The agent half of herdr naming runs in a detached
+/// child that outlives `pall8t run`, so its effects land *after* the
+/// command returns; a deadline turns "the child was never spawned" into a
+/// failed assertion instead of a hung suite.
+fn wait_for_line(path: &Path, needle: &str, limit: std::time::Duration) -> String {
+    wait_until(limit, || {
+        std::fs::read_to_string(path).is_ok_and(|body| body.contains(needle))
+    });
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Seeds `~/.pall8t/tools/herdr/<version>/herdr` and the sha256 sidecar
+/// that records it, so the bridge finds a *verified* cached Linux binary
+/// and never reaches for the network. The sidecar is the full sha256 of
+/// the file, stored one directory up from the one that gets mounted.
+fn seed_verified_linux_herdr(sb: &Sandbox, version: &str) {
+    let root = sb.pall8t_root().join("tools").join("herdr");
+    let dir = root.join(version);
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("herdr");
+    std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
+    let out = Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .arg(&bin)
+        .output()
+        .unwrap();
+    let digest = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    std::fs::write(root.join(format!("{version}.sha256")), digest).unwrap();
+}
+
+#[test]
+fn run_hands_the_runtime_the_workspace_mount_and_the_configured_command() {
+    let sb = Sandbox::new("run-plain");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+    fake.vanish_after_image_list();
+
+    let out = sb.run(&["run"]);
+
+    assert!(
+        !out.status.success(),
+        "the runtime disappeared before the launch; that must be an error, \
+         not a silent success"
+    );
+    assert!(
+        stderr(&out).contains("failed to exec `container`"),
+        "and the error must say the launch itself failed, not something \
+         earlier: {}",
+        stderr(&out)
+    );
+    assert!(
+        !fake.called("build "),
+        "the image for this Containerfile already exists, so `run` must not \
+         rebuild it: {}",
+        fake.argv_log()
+    );
+}
+
+/// The `run` command line pall8t handed the fake runtime.
+fn run_line(fake: &FakeRuntime) -> String {
+    fake.argv_log()
+        .lines()
+        .find(|l| l.starts_with("run "))
+        .expect("pall8t must reach `container run`")
+        .to_string()
+}
+
+/// The provenance labels have to survive the same whole trip: `cmd_run`
+/// assembling them, `RunSpec`, `run_argv`. `container.rs` unit-tests the
+/// *emission* (one `--label` per entry, values sanitised) and the *reading*
+/// back out of `ls --json`, but neither notices if the run stops putting
+/// anything in the vector — `run_labels` returning `vec![]` passes every
+/// one of them. This is the test that would go red, and the reason the
+/// labels are worth anything: `pall8t ls` identifies its own containers by
+/// `pall8t.version` now, so a run that quietly stopped labelling would
+/// vanish from its own listing.
+#[test]
+fn a_run_labels_the_container_with_its_own_provenance() {
+    let sb = Sandbox::new("run-labels");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    sb.run(&["run"]);
+    let line = run_line(&fake);
+
+    assert!(
+        line.contains(&format!(
+            "--label pall8t.version={}",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "the version label is the one `pall8t ls` matches on, so it is the \
+         one that must never go missing: {line}"
+    );
+
+    // Each label is checked against the argv element it is *about*, not
+    // merely for being present. Presence is the weak form: a label built
+    // from the wrong variable, or from an empty string, still contains
+    // `pall8t.image=`. Tying each one to its source of truth in the same
+    // command line is what makes a wrong value fail.
+    let value_of = |key: &str| -> String {
+        line.split_whitespace()
+            .find_map(|a| a.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no `{key}...` in the run argv: {line}"))
+            .to_string()
+    };
+
+    let workdir = line
+        .split_whitespace()
+        .skip_while(|a| *a != "-w")
+        .nth(1)
+        .expect("a run always sets -w");
+    assert_eq!(
+        value_of("pall8t.project="),
+        workdir,
+        "the project label must name the directory the run actually mounted \
+         as the workspace — the two coming apart is exactly the confusion \
+         `pall8t ls` exists to resolve: {line}"
+    );
+
+    assert_eq!(
+        value_of("pall8t.image="),
+        tag,
+        "and the image label must be the tag this run resolved to, since \
+         the container itself reports only a digest: {line}"
+    );
+}
+
+/// `[container] ssh` has to survive the whole trip — config files, the
+/// `--ssh` override, the merge rule, `RunSpec`, `run_argv` — and the only
+/// place its effect is observable is the argv pall8t hands the runtime.
+/// The unit tests cover each link; this one pins that they are actually
+/// joined, so a wiring slip (`let ssh = false;` in `cmd_run`) has
+/// somewhere to go red. It also pins the asymmetry that matters most: a
+/// *project* config cannot switch forwarding on, only off. The runtime is
+/// left in place rather than vanished: the fake logs the `run` line and
+/// exits, which is the launch this needs to read.
+#[test]
+fn only_the_human_can_forward_the_agent_never_a_projects_own_config() {
+    let sb = Sandbox::new("run-ssh-argv");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    // (global config, project config, argv, --ssh expected, why)
+    let cases: [(&str, &str, &[&str], bool, &str); 5] = [
+        (
+            "",
+            "",
+            &["run"],
+            false,
+            "forwarding is opt-in: a run that never asked for it must not be \
+             handed the user's agent",
+        ),
+        (
+            "",
+            "",
+            &["run", "--ssh"],
+            true,
+            "`pall8t run --ssh` is the human saying it out loud, per run",
+        ),
+        (
+            "[container]\nssh = true\n",
+            "",
+            &["run"],
+            true,
+            "and the user's own ~/.pall8t/config.toml is the standing way in",
+        ),
+        (
+            "",
+            "[container]\nssh = true\n",
+            &["run"],
+            false,
+            "but a project config must NOT be able to switch it on: it ships \
+             with the repository, so this is cloned code voting itself \
+             access to the user's keys",
+        ),
+        (
+            "[container]\nssh = true\n",
+            "[container]\nssh = false\n",
+            &["run"],
+            false,
+            "narrowing stays honored — a project may always decline what the \
+             global allowed",
+        ),
+    ];
+
+    for (global, project, args, expected, why) in cases {
+        sb.write_global_config(global);
+        sb.write_project_config(project);
+        fake.clear_log();
+        sb.run(args);
+        let line = run_line(&fake);
+        assert_eq!(line.contains("--ssh"), expected, "{why}. argv was: {line}");
+    }
+}
+
+/// Refusing a project's request is only half the job: dropping a stated
+/// intent in silence is this repo's definition of a bug, and here the
+/// silence would hide that a repository tried to reach the user's keys.
+#[test]
+fn a_project_config_that_asked_for_ssh_is_told_it_was_ignored() {
+    let sb = Sandbox::new("run-ssh-ignored");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    sb.write_project_config("[container]\nssh = true\n");
+    let out = sb.run(&["run"]);
+    let err = stderr(&out);
+    assert!(
+        err.contains("was ignored"),
+        "a project asking to enable forwarding must be told it did not \
+         happen: {err}"
+    );
+    assert!(
+        err.contains("--ssh"),
+        "and told how to ask legitimately, or the message is a refusal with \
+         no remedy: {err}"
+    );
+}
+
+/// The other half of the same wiring: what the run says about the host's
+/// agent. A capability this wide that announces itself only on failure is
+/// one a run can carry without anyone noticing, so the working path speaks
+/// too.
+#[test]
+fn the_run_says_whether_the_agent_is_being_forwarded_or_is_missing() {
+    let sb = Sandbox::new("run-ssh-warn");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    // The harness clears the environment, so this run genuinely has no
+    // SSH_AUTH_SOCK — no need to unset one.
+    let unset = sb.run(&["run", "--ssh"]);
+    assert!(
+        stderr(&unset).contains("SSH_AUTH_SOCK is unset on the host"),
+        "forwarding with no agent at all must say so on stderr: {}",
+        stderr(&unset)
+    );
+
+    let off = sb.run(&["run"]);
+    assert!(
+        !stderr(&off).contains("SSH_AUTH_SOCK") && !stderr(&off).contains("ssh is on"),
+        "and a run that never asked to forward has nothing to say: {}",
+        stderr(&off)
+    );
+
+    // The case a presence-only check misses: a path still exported for a
+    // socket that died with its agent.
+    let dead = sb.root.join("dead-agent.sock");
+    let stale = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &dead)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&stale).contains(&format!("points at {}", dead.display())),
+        "a socket path with nothing behind it must be named, not treated as \
+         a working agent: {}",
+        stderr(&stale)
+    );
+
+    // The case an *existence* check misses, and the one that named this
+    // pin (CodeRabbit, PR #63): an agent that died without cleaning up
+    // leaves a socket node behind. It is not the reboot case above — the
+    // path is right there on disk, `Path::exists` says yes, and a
+    // presence-only probe hands the run a socket that refuses every
+    // connection while saying nothing. Binding a listener and dropping it
+    // reproduces exactly that inode.
+    let dead_node = sb.root.join("dead-node.sock");
+    drop(std::os::unix::net::UnixListener::bind(&dead_node).unwrap());
+    assert!(
+        dead_node.exists(),
+        "the fixture is only meaningful while the socket node is still on \
+         disk — that is the whole difference from the unlinked case above"
+    );
+    let refused = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &dead_node)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&refused).contains(&format!("points at {}", dead_node.display())),
+        "a socket node nothing is listening on must warn exactly as a missing \
+         one does: it forwards no agent either, and the user is left with the \
+         same unexplained publickey denial: {}",
+        stderr(&refused)
+    );
+
+    // And the working path. It takes a *listening* socket now — a regular
+    // file used to stand in, back when pall8t only stat'd the path.
+    let live = sb.root.join("live-agent.sock");
+    let _listening = std::os::unix::net::UnixListener::bind(&live).unwrap();
+    let on = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &live)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&on).contains("ssh is on"),
+        "forwarding that actually happens must announce itself, or a run can \
+         carry the user's agent with nothing on screen saying so: {}",
+        stderr(&on)
+    );
+    assert!(
+        !stderr(&on).contains("no agent is listening"),
+        "and an agent that answers must not be warned about — a probe that \
+         cried wolf on every run would be ignored on the run that mattered: {}",
+        stderr(&on)
+    );
+}
+
+/// pall8t hands the runtime the command the config names, verbatim — in a
+/// herdr pane as anywhere else. Until the tmux integration was dropped, a
+/// configured command whose first token was `tmux` was silently replaced
+/// with plain `claude` here, on the theory that herdr already multiplexes;
+/// it also caught tmux commands wrapping some *other* agent. Nothing
+/// rewrites the command now, and this is what says so.
+#[test]
+fn a_configured_command_reaches_the_runtime_verbatim_inside_a_herdr_pane() {
+    let sb = Sandbox::new("run-herdr-command");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+    sb.write_project_config(
+        "[run]\ncommand = [\"tmux\", \"new\", \"-A\", \"-s\", \"claude\", \"claude\"]\n",
+    );
+
+    let out = sb
+        .command()
+        .arg("run")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "w13:p3")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        fake.called("tmux new -A -s claude claude"),
+        "the configured command is what runs in the sandbox, unrewritten: {}",
+        fake.argv_log()
+    );
+}
+
+/// What replaced the per-run copy, and the one assertion that tells the two
+/// apart. ADR-0007 copied the verified herdr binary into a private
+/// directory per run and mounted *that* read-write, because nothing could
+/// be mounted read-only at the time; ADR-0009 made read-only mounts real,
+/// so the cache itself goes in with `ro` and no copy is made. Swapping
+/// `Mount::ro` back to `Mount::rw` here would leave the shared cache
+/// mounted writable — every sandbox able to corrupt the binary every other
+/// sandbox executes, which is strictly worse than either design. The `ro`
+/// in this argv is the whole safety property, so it is asserted literally.
+#[test]
+fn the_herdr_cli_is_mounted_from_the_verified_cache_read_only() {
+    let sb = Sandbox::new("run-herdr-ro");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
+    seed_verified_linux_herdr(&sb, "0.8.2");
+    let herdr_sock = sb.root.join("herdr.sock");
+    let host_herdr = std::os::unix::net::UnixListener::bind(&herdr_sock).unwrap();
+
+    sb.command()
+        .args(["run", "--", "claude"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "pane_42")
+        .env("HERDR_SOCKET_PATH", &herdr_sock)
+        .env("HERDR_BIN_PATH", &herdr_bin)
+        .output()
+        .unwrap();
+
+    let cache = sb.pall8t_root().join("tools").join("herdr").join("0.8.2");
+    let mount = run_line(&fake)
+        .split_whitespace()
+        .find(|a| a.contains("target=/opt/pall8t/bin"))
+        .expect("the herdr CLI has to reach the sandbox as a mount")
+        .to_string();
+    assert_eq!(
+        mount,
+        format!(
+            "type=virtiofs,source={},target=/opt/pall8t/bin,ro",
+            cache.display()
+        ),
+        "the source is the verified cache itself and the mount carries \
+         `ro`; without the flag this is the shared cache mounted writable, \
+         which is the one arrangement both designs existed to prevent"
+    );
+    drop(host_herdr);
+}
+
+/// The whole bridge, assembled: a herdr pane's environment, a host herdr
+/// CLI, a verified cached Linux build, and a real socket to forward to.
+/// `pall8t run` must announce the pane's agent to herdr, spawn the relay,
+/// and mount the relay's socket into the sandbox — the transport this PR
+/// introduced.
+#[test]
+fn a_run_inside_a_herdr_pane_builds_the_socket_bridge() {
+    let sb = Sandbox::new("run-herdr");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
+    seed_verified_linux_herdr(&sb, "0.8.2");
+    let herdr_sock = sb.root.join("herdr.sock");
+    let host_herdr = std::os::unix::net::UnixListener::bind(&herdr_sock).unwrap();
+    fake.vanish_after_image_list();
+
+    let out = sb
+        .command()
+        .args(["run", "--", "claude"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "pane_42")
+        .env("HERDR_TAB_ID", "tab_7")
+        .env("HERDR_WORKSPACE_ID", "ws_1")
+        .env("HERDR_SOCKET_PATH", &herdr_sock)
+        .env("HERDR_BIN_PATH", &herdr_bin)
+        .output()
+        .unwrap();
+
+    let err = stderr(&out);
+    assert!(
+        err.contains("herdr bridge active"),
+        "with a pane, a socket, and a cached Linux binary all present, the \
+         bridge must come up — a warning here means it silently degraded: {err}"
+    );
+
+    let relay_sockets: Vec<_> = std::fs::read_dir(sb.pall8t_root().join("run"))
+        .expect("the relay creates its own run directory")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sock"))
+        .collect();
+    assert_eq!(
+        relay_sockets.len(),
+        1,
+        "exactly one socket for this run: it is bound before `container run` \
+         is told to mount it, and it is the bridge's whole transport: {relay_sockets:?}"
+    );
+
+    // The per-run copy is gone: ADR-0007 staged the binary into
+    // `tools/herdr-run/<container>/` so one sandbox could not overwrite the
+    // binary a concurrently running sandbox executes. A read-only mount of
+    // the verified cache removes the write outright instead — what replaces
+    // it is asserted in `the_herdr_cli_is_mounted_from_the_verified_cache_read_only`,
+    // which can see the argv this pre-exec test cannot.
+    assert!(
+        !sb.pall8t_root().join("tools").join("herdr-run").exists(),
+        "no per-run copy directory is created at all: leaving the staging \
+         behind would mean every launch still pays a multi-megabyte copy \
+         that nothing mounts"
+    );
+
+    let herdr_calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    assert!(
+        herdr_calls.contains("pane report-metadata"),
+        "the pane's agent identity is announced to herdr, or the pane shows \
+         no agent at all: {herdr_calls}"
+    );
+    assert!(
+        !herdr_calls.contains("rename") && !herdr_calls.contains("tab list"),
+        "and with [herdr] auto_rename unset nothing is named — naming is \
+         opt-in, so a config that never asked for it must not even look at \
+         the tab list (issue #71): {herdr_calls}"
+    );
+    assert!(
+        err.contains("failed to exec `container`"),
+        "everything above happens on the way to the launch, which then \
+         reports the missing runtime: {err}"
+    );
+    drop(host_herdr);
+}
+
+/// `herdr tab list`'s reply for a workspace `w13` whose sole tab is
+/// `w13:t2`, carrying `tab_label`. The `number` field is deliberately 2,
+/// different from the tab's position (1) — pall8t's own suffix now reads
+/// the *position*, the same number herdr's own auto label already shows
+/// (issue #76), so a run against this fixture expects `demo-1`; a
+/// regression here would mean something started reading the id-encoded
+/// `number` field again.
+fn tab_list_with_label(tab_label: &str) -> String {
+    format!(
+        r#"{{"id":"cli:tab:list","result":{{"tabs":[{{"agent_status":"unknown","focused":true,"label":"{tab_label}","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}}],"type":"tab_list"}}}}"#
+    )
+}
+
+/// A sandbox wired for the naming tests: a built image, an opted-in
+/// project config, a stand-in host `herdr`, an empty `agent list`, and a
+/// file standing in for herdr's API socket.
+///
+/// The socket is a plain file, never connected to — `tab_numbers` only
+/// *stats* it, because a herdr server run is identified by the socket's
+/// `(dev, ino, birthtime)` and nothing else. Replacing the file is
+/// therefore exactly how a test says "a different herdr server is
+/// listening now".
+struct NamingWorld {
+    sb: Sandbox,
+    herdr_bin: PathBuf,
+    tag: String,
+}
+
+fn naming_world(name: &str) -> NamingWorld {
+    let sb = Sandbox::new(name);
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
+    std::fs::write(
+        sb.root.join("herdr-agent-list.json"),
+        r#"{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}"#,
+    )
+    .unwrap();
+    sb.write_project_config(
+        "[herdr]\nsandbox = \"off\"\nauto_rename = true\nagent_name = \"demo\"\n",
+    );
+    let world = NamingWorld { sb, herdr_bin, tag };
+    world.restart_herdr_server();
+    world
+}
+
+/// So the naming tests can keep reaching the sandbox's own paths
+/// (`sb.root`, `sb.pall8t_root()`) through the world that owns it.
+impl std::ops::Deref for NamingWorld {
+    type Target = Sandbox;
+    fn deref(&self) -> &Sandbox {
+        &self.sb
+    }
+}
+
+impl NamingWorld {
+    fn socket(&self) -> PathBuf {
+        self.sb.root.join("herdr.sock")
+    }
+
+    /// Replaces the socket file, so its inode is a different one — what
+    /// `tab_numbers` reads as "a new herdr server run".
+    fn restart_herdr_server(&self) {
+        let _ = std::fs::remove_file(self.socket());
+        std::fs::write(self.socket(), b"").unwrap();
+    }
+
+    fn set_tabs(&self, body: &str) {
+        std::fs::write(self.sb.root.join("herdr-tab-list.json"), body).unwrap();
+    }
+
+    fn state_path(&self) -> PathBuf {
+        self.sb
+            .pall8t_root()
+            .join("state")
+            .join("herdr-naming.json")
+    }
+
+    fn seed_state(&self, body: &str) {
+        let path = self.state_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn state(&self) -> serde_json::Value {
+        let text = std::fs::read_to_string(self.state_path()).unwrap_or_default();
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// The counters recorded for this world's socket — the only session
+    /// key any of these tests uses.
+    fn session(&self) -> serde_json::Value {
+        self.state()["sessions"][self.socket().to_str().unwrap()].clone()
+    }
+
+    /// The `ServerRun` shape `tab_numbers` would record for the socket as
+    /// it stands now, built from the test's own stat of the same file, so
+    /// a seeded state can claim to be either this server run or another.
+    fn server_run_json(&self) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(self.socket()).unwrap();
+        let birth = m
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        let (secs, nanos) = birth.map_or(("null".to_string(), "null".to_string()), |d| {
+            (d.as_secs().to_string(), d.subsec_nanos().to_string())
+        });
+        format!(
+            r#"{{"dev":{},"ino":{},"birth_secs":{secs},"birth_nanos":{nanos}}}"#,
+            m.dev(),
+            m.ino()
+        )
+    }
+
+    /// One `pall8t run` in `tab_id`, returning its stderr. The runtime is
+    /// re-armed each time, since `vanish_after_image_list` consumes it.
+    fn run(&self, tab_id: &str) -> String {
+        self.run_command(tab_id, "claude")
+    }
+
+    fn run_command(&self, tab_id: &str, command: &str) -> String {
+        let fake = FakeRuntime::current(&self.sb);
+        fake.set_images(std::slice::from_ref(&self.tag));
+        fake.vanish_after_image_list();
+        let out = self
+            .sb
+            .command()
+            .args(["run", "--", command])
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", "w13:p3")
+            .env("HERDR_TAB_ID", tab_id)
+            .env("HERDR_WORKSPACE_ID", "w13")
+            .env("HERDR_BIN_PATH", &self.herdr_bin)
+            .env("HERDR_SOCKET_PATH", self.socket())
+            .output()
+            .unwrap();
+        stderr(&out)
+    }
+}
+
+/// A state file whose counters claim to belong to the herdr server run
+/// currently listening on this world's socket. `body` is the rest of the
+/// session object (`"next": {…}, "tabs": {…}`).
+fn seeded_state(world: &NamingWorld, body: &str) -> String {
+    format!(
+        r#"{{"version":1,"sessions":{{"{}":{{"server":{},"last_used":1,{body}}}}}}}"#,
+        world.socket().to_str().unwrap(),
+        world.server_run_json()
+    )
+}
+
+/// One opted-in `pall8t run` in herdr pane `w13:p3` of workspace `w13`,
+/// replaying `tab_list_body` for `herdr tab list` — the raw reply body, so
+/// a caller can pass a well-formed fixture (see [`tab_list_with_label`])
+/// or deliberately broken content to exercise `fetch_tabs`'s failure path.
+///
+/// Returns the world (for the log and argv files the detached agent namer
+/// writes after the run returns) and the run's stderr.
+fn opted_in_naming_run(sandbox: &str, tab_id: &str, tab_list_body: &str) -> (NamingWorld, String) {
+    let world = naming_world(sandbox);
+    world.set_tabs(tab_list_body);
+    let err = world.run(tab_id);
+    (world, err)
+}
+
+/// Naming, opted into (issue #71). `sandbox = "off"` on purpose: naming is
+/// about herdr's view of the pane, not about the bridge, so it has to
+/// happen with the bridge switched off entirely — the mode that spawns no
+/// relay, and the reason the agent half is its own child rather than the
+/// relay's job.
+#[test]
+fn an_opted_in_run_names_the_tab_immediately_and_the_agent_after_the_exec() {
+    let world = naming_world("run-naming");
+    // A count already under way for the server run that is listening. The
+    // number is seeded rather than left at 1 so this assertion can only
+    // pass one way: 1 is also what the tab's position, its id-encoded
+    // number and an empty counter would all have produced, and a test that
+    // cannot tell those apart would have watched the numbering move
+    // between them without noticing.
+    world.seed_state(&seeded_state(&world, r#""next":{"demo":7},"tabs":{}"#));
+    // A tab still on herdr's own auto label ("1") is pall8t's to rename.
+    world.set_tabs(&tab_list_with_label("1"));
+    let err = world.run("w13:t2");
+    let sb = &world;
+    assert!(
+        err.contains(r#"naming this tab "demo-7""#)
+            && err.contains("its agent takes the same name"),
+        "the run says what it named, with [herdr] agent_name overriding the \
+         directory basename and pall8t's own counter as the suffix: {err}"
+    );
+    let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    assert!(
+        calls.contains("tab rename w13:t2 demo-7"),
+        "the tab is renamed before the exec — it needs no detected agent, so \
+         the human sees the right label from the moment the run starts: {calls}"
+    );
+
+    // The agent half cannot run here: at this point the pane's agent is
+    // still pall8t itself. It belongs to the detached child, which reports
+    // to its own log because the pane's terminal now belongs to the agent.
+    let log = wait_for_line(
+        &sb.pall8t_root().join("logs").join("herdr-naming.log"),
+        "named the agent",
+        std::time::Duration::from_secs(10),
+    );
+    assert!(
+        log.contains(r#"named the agent "demo-7""#),
+        "the agent gets the same name as the tab, from a process that \
+         outlives the exec: {log}"
+    );
+    // Re-read: the child runs after `pall8t run` has returned, so its
+    // calls land in the log only once the wait above has seen it work.
+    let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    assert!(
+        calls.contains("agent rename w13:p3 demo-7"),
+        "and it is a real `agent rename` on the pane that does it — the log \
+         line alone would still be written by a rename that never happened: \
+         {calls}"
+    );
+    assert!(
+        calls.contains("agent get w13:p3"),
+        "which it only attempts once herdr reports an agent in the pane: {calls}"
+    );
+    assert!(
+        calls.contains("agent list"),
+        "and the name was checked against the live agents first, so two runs \
+         that would collide get distinct names: {calls}"
+    );
+}
+
+/// The other half of naming's tab rule: a label the human chose is never
+/// clobbered, while the agent is still named. Without this, forcing the
+/// "is this tab still on herdr's own label?" check to `true` — renaming
+/// every tab, including yours — passes the whole suite (a mutant
+/// `cargo mutants` caught).
+#[test]
+fn a_tab_the_human_labeled_keeps_its_label_and_the_agent_is_still_named() {
+    // "release work" is neither herdr's auto label nor a name pall8t
+    // could have written here — only a human types it.
+    let (sb, err) = opted_in_naming_run(
+        "run-naming-mine",
+        "w13:t2",
+        &tab_list_with_label("release work"),
+    );
+    let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    assert!(
+        !calls.contains("tab rename"),
+        "a label the human chose must survive the run untouched: {calls}"
+    );
+    assert!(
+        err.contains(r#"this tab keeps its label "release work""#)
+            && err.contains(r#"address the agent as "demo-1""#),
+        "and the run must say so rather than claiming a tab it did not name — \
+         naming both strings is what shows the human that the label they will \
+         read off the tab is not the name that reaches this agent: {err}"
+    );
+    let log = wait_for_line(
+        &sb.pall8t_root().join("logs").join("herdr-naming.log"),
+        "named the agent",
+        std::time::Duration::from_secs(10),
+    );
+    assert!(
+        log.contains(r#"named the agent "demo-1""#),
+        "the agent half is independent of the tab half and still runs: {log}"
+    );
+    let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    assert!(
+        calls.contains("agent rename w13:p3 demo-1") && !calls.contains("tab rename"),
+        "the agent really is renamed, and the tab really is not: {calls}"
+    );
+}
+
+/// Regression pin, from live testing: two tabs wearing the same label is
+/// the failure this whole line of work started from, and the labels the
+/// *other* tabs wear are what stop it.
+///
+/// The state below is one a live herdr actually reached (both tabs
+/// carrying `vpnp-2` in `session.json`), reproduced with this suite's
+/// `demo` base. Numbering alone cannot prevent it: with no record of
+/// either tab, both adopt the number their own restored label carries, so
+/// both ask for `demo-2`. `agent.list` cannot report the clash either --
+/// the older tab's agent had exited, which is why the fixture leaves it
+/// empty. The *label* is the only thing left that can bump the name.
+#[test]
+fn a_label_another_tab_already_wears_is_not_taken_twice() {
+    let collided = r#"{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"unknown","focused":false,"label":"demo-2","number":1,"pane_count":1,"tab_id":"w13:t1","workspace_id":"w13"},{"agent_status":"unknown","focused":true,"label":"demo-2","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}],"type":"tab_list"}}"#;
+    let (sb, err) = opted_in_naming_run("run-naming-collided", "w13:t2", collided);
+    assert!(
+        err.contains(r#"naming this tab "demo-2-2""#),
+        "the name has to step past the label the other tab already wears, or \
+         `herdr agent prompt demo-2` reaches whichever of the two herdr picks \
+         and the label a human reads names nothing in particular: {err}"
+    );
+    let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    // Line-exact on both sides: "demo-2" is a prefix of "demo-2-2", so a
+    // substring test would call the colliding rename a pass.
+    assert!(
+        calls.lines().any(|l| l == "tab rename w13:t2 demo-2-2")
+            && !calls.lines().any(|l| l == "tab rename w13:t2 demo-2"),
+        "and it is the bumped name that reaches `tab.rename`: {calls}"
+    );
+    let log = wait_for_line(
+        &sb.pall8t_root().join("logs").join("herdr-naming.log"),
+        "named the agent",
+        std::time::Duration::from_secs(10),
+    );
+    assert!(
+        log.contains(r#"named the agent "demo-2-2""#),
+        "both halves take the same stepped-past name -- a tab and an agent \
+         that disagree is the drift naming exists to remove: {log}"
+    );
+}
+
+/// Regression pin, rewritten for the numbering rewrite. It used to check
+/// that a broken `tab.list` fell *back* to the tab id for a number -- a
+/// patch over the fact that position-based numbering depended on that call
+/// succeeding. It now checks something stronger: the dependency is gone by
+/// construction, because the number comes from pall8t's own state file and
+/// no herdr call takes part in producing it.
+#[test]
+fn a_broken_herdr_tab_list_still_names_the_agent() {
+    let world = naming_world("run-naming-tablist-broken");
+    // A count already under way for this very server run, so the name the
+    // run produces can only have come from the state file.
+    world.seed_state(&seeded_state(&world, r#""next":{"demo":7},"tabs":{}"#));
+    // "not json": simulates `tab.list`'s reply shape having changed, or any
+    // other failure `fetch_tabs` treats the same way.
+    world.set_tabs("not json");
+    let err = world.run("w13:t9");
+
+    assert!(
+        err.contains("could not make sense of the herdr tab list"),
+        "the failure is surfaced, not swallowed: {err}"
+    );
+    assert!(
+        !err.contains("naming this tab"),
+        "with no usable tab list, ownership of the label is unknown, so \
+         the tab itself is never touched: {err}"
+    );
+    let log = wait_for_line(
+        &world.pall8t_root().join("logs").join("herdr-naming.log"),
+        "named the agent",
+        std::time::Duration::from_secs(10),
+    );
+    assert!(
+        log.contains(r#"named the agent "demo-7""#),
+        "the agent takes the number the state file was already up to. The \
+         old suffix needed `tab.list` to succeed and fell back to parsing \
+         the tab id when it didn't; there is nothing to fall back to now \
+         because there was never a herdr call in the way: {log}"
+    );
+    assert_eq!(
+        world.session()["tabs"]["w13:t9"]["number"],
+        7,
+        "and the number is recorded against the tab, so a rerun here keeps it"
+    );
+}
+
+/// A tab keeps the name it already advertises. Without this a rerun would
+/// take a fresh number, the tab would be relabeled, and every message
+/// already addressed to the old name would miss.
+#[test]
+fn a_second_run_in_the_same_tab_reuses_its_number() {
+    let world = naming_world("run-naming-rerun");
+    world.set_tabs(&tab_list_with_label("1"));
+    let first = world.run("w13:t2");
+    assert!(
+        first.contains(r#"naming this tab "demo-1""#),
+        "the first run in a fresh session starts the count at 1: {first}"
+    );
+
+    // Run 2 sees the label run 1 left, exactly as herdr would report it.
+    world.set_tabs(&tab_list_with_label("demo-1"));
+    let second = world.run("w13:t2");
+    assert!(
+        second.contains(r#"naming this tab "demo-1""#),
+        "the second run in the same tab must land on the same name, not \
+         walk the counter forward: {second}"
+    );
+    assert_eq!(
+        world.session()["next"]["demo"],
+        2,
+        "and the counter is still 2 -- a rerun consumes nothing, or a tab \
+         reopened and rerun a few times would push every later tab's \
+         number up for no reason"
+    );
+    assert_eq!(
+        world.session()["tabs"]["w13:t2"]["number"],
+        1,
+        "one record for the one tab, still holding its number"
+    );
+}
+
+/// The reset the whole design is built around: a new herdr server run
+/// starts the count over. herdr exposes no session id, so this turns
+/// entirely on the API socket being re-bound -- a different inode is the
+/// only evidence there is.
+#[test]
+fn a_new_herdr_server_starts_the_numbering_over() {
+    let world = naming_world("run-naming-restart");
+    world.set_tabs(&tab_list_with_label("1"));
+    world.seed_state(&seeded_state(
+        &world,
+        r#""next":{"demo":8},"tabs":{"w13:t2":{"base":"demo","number":7}}"#,
+    ));
+
+    // The server that was listening when those numbers were counted is
+    // gone; a new one bound a new socket in its place.
+    world.restart_herdr_server();
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains(r#"naming this tab "demo-1""#),
+        "a fresh herdr server means a fresh count -- the 8 the old run had \
+         reached belongs to a server that is no longer listening: {err}"
+    );
+    assert_eq!(
+        world.session()["tabs"]["w13:t2"]["number"],
+        1,
+        "the old per-tab record went with it. Keeping it would have handed \
+         this tab 7 while the counter walked up from 1 to hand 7 out again"
+    );
+}
+
+/// The other half of the reset: herdr restores every tab's `custom_name`
+/// from `session.json`, so a count that restarted blindly at 1 would be
+/// handing out names that are still on screen.
+///
+/// Two rules meet here. The tab keeps the number its own restored label
+/// carries rather than being renamed, and the counter starts past the
+/// highest number any label on screen uses -- so the next tab continues
+/// the sequence a human can already see instead of colliding into it.
+#[test]
+fn a_restored_label_is_kept_and_the_count_continues_past_it() {
+    let world = naming_world("run-naming-restored");
+    // What herdr restored after the restart: our tab still labeled
+    // `demo-3`, a neighbour still labeled `demo-5`. No state file at all,
+    // as if pall8t had never run on this machine.
+    let restored = r#"{"id":"cli:tab:list","result":{"tabs":[{"agent_status":"unknown","focused":false,"label":"demo-5","number":1,"pane_count":1,"tab_id":"w13:t1","workspace_id":"w13"},{"agent_status":"unknown","focused":true,"label":"demo-3","number":2,"pane_count":1,"tab_id":"w13:t2","workspace_id":"w13"}],"type":"tab_list"}}"#;
+    world.set_tabs(restored);
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains(r#"naming this tab "demo-3""#),
+        "the tab keeps the number its own label already carries. Renaming a \
+         restored `demo-3` to `demo-1` would break every reference to it \
+         for no gain: {err}"
+    );
+    assert_eq!(
+        world.session()["next"]["demo"],
+        6,
+        "and the counter sits past `demo-5`, the highest number on screen -- \
+         not at 4, which is merely past the number this tab took, and would \
+         walk onto the neighbour's label two tabs from now"
+    );
+    assert!(
+        !err.contains("numbering"),
+        "and no warning: there was no state file, which is what every first \
+         run looks like. Only a file that exists and cannot be read is worth \
+         saying something about: {err}"
+    );
+}
+
+/// A run that names nothing must not consume a number, or the count climbs
+/// on runs that produced no name at all -- and the numbers a human reads
+/// grow gaps nothing explains.
+#[test]
+fn a_run_that_names_nothing_burns_no_number() {
+    let world = naming_world("run-naming-noop");
+    // A label a human chose, so the tab is not pall8t's to rename, and a
+    // command herdr recognizes no agent in, so no agent is coming either.
+    world.set_tabs(&tab_list_with_label("release work"));
+    let err = world.run_command("w13:t2", "./not-an-agent.sh");
+
+    assert!(
+        !err.contains("naming this tab") && !err.contains("address the agent as"),
+        "nothing was named: {err}"
+    );
+    assert!(
+        !world.state_path().exists(),
+        "so nothing was counted either -- the state file was never even \
+         created, which is what pins that the allocation happens *after* \
+         the decision not to name anything"
+    );
+}
+
+/// A state file from a newer pall8t is left exactly as it was. A rollback,
+/// or two builds sharing one `$HOME`, must not have their numbering
+/// silently rewritten by whichever binary ran last.
+#[test]
+fn a_state_file_from_a_newer_pall8t_is_never_clobbered() {
+    let world = naming_world("run-naming-future");
+    let future = r#"{"version":999,"sessions":{},"something_this_version_never_heard_of":true}"#;
+    world.seed_state(future);
+    world.set_tabs(&tab_list_with_label("1"));
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains("written by a newer pall8t (format 999)"),
+        "the run says why it is not numbering, naming the format it will \
+         not touch: {err}"
+    );
+    assert!(
+        err.contains(r#"naming this tab "demo""#),
+        "and it still names the tab, from the bare base -- losing the \
+         number costs the name its suffix, never the run: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(world.state_path()).unwrap(),
+        future,
+        "byte for byte what the newer pall8t wrote"
+    );
+}
+
+/// "Absent" and "there but unreadable" must not collapse into one quiet
+/// path. The first is every first run and says nothing; the second resets
+/// every number in the project, and doing that silently would look like
+/// pall8t inventing it.
+///
+/// The state path is made a *directory* rather than chmod'd unreadable, so
+/// the read fails the same way for any user the suite runs as, root
+/// included.
+#[test]
+fn a_state_file_that_cannot_be_read_says_so() {
+    let world = naming_world("run-naming-unreadable");
+    std::fs::create_dir_all(world.state_path()).unwrap();
+    world.set_tabs(&tab_list_with_label("1"));
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains("cannot read") && err.contains("numbering"),
+        "a state file that exists and cannot be read is reported. Treating \
+         every read error as a missing file would hide it behind the one \
+         case that is genuinely unremarkable: {err}"
+    );
+    assert!(
+        err.contains(r#"naming this tab "demo-1""#),
+        "and the run still names the tab -- losing the state costs the name \
+         its number at worst, never the run: {err}"
+    );
+    assert!(
+        err.contains("numbers will repeat until this is fixed"),
+        "the number could not be recorded either, since the same path is \
+         unwritable, and that is the consequence worth telling the user \
+         about rather than a bare IO error: {err}"
+    );
+}
+
+/// The opposite decision, and the reason it is the opposite: a file this
+/// version simply cannot read is not evidence that another version needs
+/// it. Refusing to write over it would leave numbering broken forever.
+#[test]
+fn a_corrupt_state_file_does_not_stop_the_run() {
+    let world = naming_world("run-naming-corrupt");
+    world.seed_state("{ this is not json");
+    world.set_tabs(&tab_list_with_label("1"));
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains("is not readable as herdr tab numbering state"),
+        "the reset is announced. Every name in the project jumps back down \
+         the count when this happens, and doing that silently would look \
+         like pall8t inventing it: {err}"
+    );
+    assert!(
+        err.contains(r#"naming this tab "demo-1""#),
+        "numbering starts over rather than giving up: {err}"
+    );
+    assert_eq!(
+        world.session()["tabs"]["w13:t2"]["number"],
+        1,
+        "and the unreadable file is replaced with a valid one, so the next \
+         run is back to normal instead of starting over again"
+    );
+}
+
+/// The agent half on its own, driven through the hidden subcommand the
+/// run spawns.
+///
+/// This is the only place the *waiting* is exercised: herdr does not
+/// recognize the sandboxed agent the instant `pall8t run` starts — it
+/// only does once the argv0 hint takes effect, after the exec — so the
+/// namer has to keep asking. In the launch tests above the run is already
+/// over by the time the child looks, which is why the wait has to be
+/// tested from a parent that stays alive.
+#[test]
+fn the_agent_namer_waits_for_herdr_to_detect_the_agent_then_stays_out_of_the_way() {
+    let sb = Sandbox::new("namer-waits");
+    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
+    // Two probes come back `agent_not_found`, as a pane whose agent herdr
+    // has not identified yet really does; the third finds it.
+    std::fs::write(sb.root.join("agent-get-ready"), "3").unwrap();
+    let log = sb.root.join("naming.log");
+
+    let mut child = sb
+        .command()
+        .args([
+            "herdr",
+            "name-agent",
+            "--pane",
+            "w13:p3",
+            "--name",
+            "demo-2",
+            "--herdr-bin",
+            herdr_bin.to_str().unwrap(),
+            "--log",
+            log.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let body = wait_for_line(&log, "named the agent", std::time::Duration::from_secs(30));
+    assert!(
+        body.contains(r#"named the agent "demo-2""#),
+        "an agent herdr has not recognized yet must be waited for, not \
+         treated as absent — dropping it is the difference between a named \
+         agent and none at all: {body}"
+    );
+    let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    assert_eq!(
+        calls.matches("agent get w13:p3").count(),
+        3,
+        "it asked until herdr answered, rather than once: {calls}"
+    );
+    assert!(
+        calls.contains("agent rename w13:p3 demo-2"),
+        "and then renamed the pane's agent for real: {calls}"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the namer outlives its work on purpose: it is a child of a run \
+         that has exec'd into the `container` client, which reaps nothing, \
+         so exiting here would leave a <defunct> entry for the whole session"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The race the pre-exec collision scan cannot close: another run takes
+/// the free name between that scan and the rename. The namer walks the
+/// counter on — and drags the tab label along, or the tab would advertise
+/// a name that resolves to somebody else's agent.
+#[test]
+fn a_name_taken_since_the_scan_moves_the_agent_and_its_tab_label_together() {
+    let sb = Sandbox::new("namer-collision");
+    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
+    std::fs::write(sb.root.join("rename-taken"), "demo-2").unwrap();
+    let log = sb.root.join("naming.log");
+
+    let mut child = sb
+        .command()
+        .args([
+            "herdr",
+            "name-agent",
+            "--pane",
+            "w13:p3",
+            "--name",
+            "demo-2",
+            // Passed only when pall8t labeled this tab itself, so the
+            // relabel can never touch a label a human chose.
+            "--tab",
+            "w13:t2",
+            "--herdr-bin",
+            herdr_bin.to_str().unwrap(),
+            "--log",
+            log.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let body = wait_for_line(
+        &log,
+        "relabeled the tab",
+        std::time::Duration::from_secs(30),
+    );
+    let calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();
+    assert!(
+        calls.contains("agent rename w13:p3 demo-2")
+            && calls.contains("agent rename w13:p3 demo-2-2"),
+        "the taken name is tried, then extended — giving up would leave the \
+         pane addressable only by its pane id: {calls}"
+    );
+    assert!(
+        calls.contains("tab rename w13:t2 demo-2-2"),
+        "and the tab follows the name the agent actually got: a tab reading \
+         demo-2 would send `herdr agent prompt demo-2` to another run's \
+         agent: {calls}"
+    );
+    assert!(
+        body.contains(r#"named the agent "demo-2-2""#)
+            && body.contains(r#"relabeled the tab "demo-2-2""#),
+        "both halves are reported to the log, since nothing is watching the \
+         pane at this point: {body}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn a_run_without_a_usable_herdr_socket_degrades_instead_of_failing() {
+    let sb = Sandbox::new("run-nobridge");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+    fake.vanish_after_image_list();
+
+    // A pane environment that names no socket: `prepare_bridge` cannot
+    // build anything, and that must not take the run down with it.
+    let out = sb
+        .command()
+        .args(["run"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "pane_42")
+        .output()
+        .unwrap();
+
+    let err = stderr(&out);
+    assert!(
+        err.contains("herdr bridge disabled"),
+        "a bridge that cannot be built is announced, not swallowed: {err}"
+    );
+    assert!(
+        err.contains("failed to exec `container`"),
+        "and the run continues to the launch regardless — the bridge is a \
+         convenience, never a precondition: {err}"
+    );
+}
+
+/// Spawns a relay from a shell that lives for `parent_lifetime_secs` and
+/// then exits, so the test controls exactly when the relay is orphaned.
+/// Returns the shell's handle and the socket the relay is told to bind.
+///
+/// `/bin/sleep` by absolute path: the sandbox hands its children an empty
+/// `PATH`, and a bare `sleep` would simply not be found — the shell would
+/// exit at once and every one of these tests would silently become the
+/// already-orphaned case.
+fn spawn_orphanable_relay(sb: &Sandbox, name: &str, parent_lifetime_secs: u32) -> (Child, PathBuf) {
+    let listen = sb.pall8t_root().join("run").join(format!("{name}.sock"));
+    let log = sb.root.join("relay.log");
+    let child = sb
+        .sh_command()
+        .arg("-c")
+        .arg(format!(
+            "{} herdr relay --socket /nonexistent/herdr.sock --listen {} \
+             --mode full --log {} >/dev/null 2>&1 & /bin/sleep {parent_lifetime_secs}",
+            env!("CARGO_BIN_EXE_pall8t"),
+            listen.display(),
+            log.display(),
+        ))
+        .spawn()
+        .unwrap();
+    (child, listen)
+}
+
+/// The relay's lifetime is the run's. Nothing supervises it: it polls for
+/// reparenting and exits once the pall8t process that spawned it is gone
+/// (`pall8t run` becomes the `container` client via exec, keeping the same
+/// pid, so the relay outlives the exec but not the session). Were that
+/// check dropped or inverted, every run would leave a relay behind — each
+/// holding a socket and a policy-checked path into the host herdr session.
+#[test]
+fn the_relay_exits_once_the_run_that_spawned_it_is_gone() {
+    let sb = Sandbox::new("relay-lifetime");
+    let (mut parent, listen) = spawn_orphanable_relay(&sb, "pall8t-served", 8);
+    let alive = || std::os::unix::net::UnixStream::connect(&listen).is_ok();
+
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), alive),
+        "while the run that spawned it is alive, the relay serves"
+    );
+
+    // Past two poll intervals with the parent still there. Without this the
+    // test cannot tell "exits when the run ends" from "exits on a timer" —
+    // an inverted comparison, or one against a pid that was never the
+    // parent's, kills the relay mid-session while the sandbox is still
+    // using it, and every assertion below would still pass.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(
+        alive(),
+        "and it must keep serving for as long as that run lives — a bridge \
+         that drops out from under a working sandbox is worse than one that \
+         leaks"
+    );
+
+    parent.wait().unwrap();
+
+    assert!(
+        wait_until(std::time::Duration::from_secs(30), || socket_is_dead(
+            &listen
+        )),
+        "only then does it stop: a relay that outlives its run is a leaked \
+         process bridging a sandbox that no longer exists"
+    );
+}
+
+/// The same guarantee at the one moment it is easiest to lose: the parent
+/// only has to live long enough to read the readiness line, so it can
+/// already be gone by the time the relay looks at its own parent. Reading
+/// `getppid()` at that point yields the reparent target, and comparing it
+/// against itself is a condition that can never become true — the relay
+/// would serve forever. A `pall8t run` that fails right after reading the
+/// line reaches exactly this state.
+#[test]
+fn the_relay_does_not_outlive_a_run_that_was_already_gone() {
+    let sb = Sandbox::new("relay-orphan");
+    // `sleep 0`: the shell backgrounds the relay and exits at once, so the
+    // relay is orphaned before it can look.
+    let (mut parent, listen) = spawn_orphanable_relay(&sb, "pall8t-orphan", 0);
+    parent.wait().unwrap();
+
+    assert!(
+        wait_until(std::time::Duration::from_secs(10), || listen.exists()),
+        "the relay still got as far as binding — the socket file it left \
+         behind is what proves this test observed a relay at all, rather \
+         than one that never started"
+    );
+    assert!(
+        wait_until(std::time::Duration::from_secs(30), || socket_is_dead(
+            &listen
+        )),
+        "but nothing may still be serving it: with no run left to bridge, \
+         staying up leaks a process for as long as the machine is on"
+    );
+}
+
+/// Bound, but with nothing listening: the socket file is still there (the
+/// relay does not unlink it) and a connect is refused.
+fn socket_is_dead(path: &Path) -> bool {
+    matches!(
+        std::os::unix::net::UnixStream::connect(path).map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
+    )
+}
+
+/// Polls `cond` until it holds or `limit` elapses. Returns whether it held
+/// — so a caller asserts on the answer instead of blocking the suite.
+fn wait_until(limit: std::time::Duration, cond: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if cond() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}

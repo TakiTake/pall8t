@@ -220,10 +220,14 @@ multi-megabyte copy leaves every launch. The copy-and-prune machinery —
 `stage_run_local_herdr`, `prune_stale_run_bins`, `should_reap_run_bin`,
 and their grace window — is deleted.
 
-`~/.pall8t/tools/herdr-run/` is no longer read or written. Leftover
-directories there are inert and can be deleted; pall8t does not remove
-them itself, because an older pall8t still running would be executing out
-of one.
+`~/.pall8t/tools/herdr-run/` is no longer read or written *by this
+version*. Leftover directories there are inert to it and can be deleted —
+but only once every sandbox started by an older pall8t has exited, because
+such a run is still executing the binary out of its own directory and
+deleting it pulls the CLI out from under a live agent. That is also why
+pall8t does not remove them itself: it cannot tell, from a directory
+alone, whether the run that owns it is still alive. After the first
+upgrade with no pre-upgrade runs left, the whole tree is safe to remove.
 
 ### Security posture, restated
 
