@@ -1,0 +1,213 @@
+# Quality gates that scale with the change, not with the codebase.
+#
+# The motivating problem: an agent can add a thousand lines of tests in a
+# minute, and line coverage will happily go *up* while the suite gets no
+# better at noticing breakage. Coverage answers "was this line reached?";
+# only mutation testing answers "would anything have failed if this line
+# were wrong?". A real instance from this repo: a 100%-covered assertion
+# read `nofile.starts_with("nofile=")` and passed for `nofile=1`, a value
+# that leaves the sandbox unable to open files.
+#
+# So the gate here is incremental mutation testing over the PR's own diff.
+# It is affordable *because* it is incremental — a full run builds the
+# crate once per mutant and takes the better part of an hour (see
+# mutants.yml, which still runs weekly for the whole-tree trend), while
+# the diff of a typical PR yields a handful of mutants in under a minute.
+#
+# What it does and does not constrain is worth being exact about, because
+# it is easy to over-claim: cargo-mutants mutates *product* code and never
+# `#[cfg(test)]` code, so the mutant count follows the source lines a PR
+# adds, not the test lines. A PR that only adds tests yields zero mutants
+# and passes — the same as a docs-only PR. What the gate enforces is the
+# other direction: code arriving in a PR must come with tests that would
+# notice it breaking, which is exactly where the `nofile` assertion above
+# would have been caught. Bulk-generated tests with nothing new to defend
+# are visible in the suite-cost job below, not here.
+#
+# Unlike the weekly full run, this one BLOCKS. mutants.yml is report-only
+# on purpose — gating a whole-tree run from day one means gating on a
+# backlog nobody chose, and that teaches reflexive ignoring. `--in-diff`
+# has no backlog to inherit: it only ever mutates lines the PR itself
+# touched, so a red build here is always about the change in front of you.
+name: Quality gates
+
+on:
+  pull_request:
+
+concurrency:
+  # One run per PR. A push that supersedes the commit under test makes the
+  # running check obsolete — mutating a diff that no longer exists answers
+  # nobody's question, and this job can hold a runner for 45 minutes. Only
+  # pull_request triggers this workflow, so `github.ref` is the PR's own
+  # merge ref and cancelling never reaches another PR or a branch build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Would the suite go red if this PR's own code were broken?
+  mutation-of-the-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # `--in-diff` needs the merge base, which a shallow clone lacks.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Diff against the base branch
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          # Three-dot: what this branch added, not what the base moved on
+          # to. A two-dot diff on a stale branch would mutate other
+          # people's merged work and fail this PR for it.
+          git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
+          echo "changed lines: $(wc -l < pr.diff)"
+
+      - name: Mutate only the changed lines
+        # No continue-on-error: a missed mutant here is a test that would
+        # not have noticed this PR breaking.
+        #
+        # Read a red build via the counts in the step summary, because it
+        # is not only missed mutants that fail this step — *any* non-zero
+        # exit does, including a mutant whose tests timed out and a
+        # baseline build that did not compile. That is deliberate (a run
+        # that did not finish has proved nothing about the change), but it
+        # does mean one slow or flaky test can turn this red with every
+        # mutant caught. `timeout: 0` in the summary rules that out.
+        #
+        # A docs-only PR mutates nothing and exits 0 ("Diff changes no
+        # Rust source files"), so this does not punish documentation. A
+        # test-only PR is the same: `#[cfg(test)]` code is never mutated.
+        #
+        # --no-shuffle for a stable order, matching mutants.yml, so two
+        # runs of the same diff list their mutants the same way.
+        run: cargo mutants --in-diff pr.diff --no-shuffle --output mutants-diff -j 2
+
+      - name: Report
+        if: always()
+        run: |
+          out=mutants-diff/mutants.out
+          {
+            echo "## Mutation testing (this PR's diff)"
+            if [ -d "$out" ]; then
+              for f in caught missed timeout unviable; do
+                echo "- $f: $(wc -l < "$out/$f.txt" 2>/dev/null || echo 0)"
+              done
+              if [ -s "$out/missed.txt" ]; then
+                echo
+                echo '### Missed — the suite stayed green with this broken'
+                echo '```'
+                cat "$out/missed.txt"
+                echo '```'
+                echo 'Each line is a change to your code that no test noticed.'
+              fi
+            else
+              echo '- no Rust source in this diff'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mutants-diff
+          path: mutants-diff/mutants.out
+          retention-days: 30
+
+  # Coverage is the weaker question, kept as a floor rather than a target:
+  # it catches code that has no test pointing at it *at all*, which the
+  # mutation job cannot see (an unreached line yields unviable mutants, not
+  # missed ones). The floor sits below the current number on purpose —
+  # it is a ratchet against collapse, not a score to optimise. Chasing the
+  # last few points produces exactly the assertion-free tests this file
+  # exists to discourage; docs/testing.md says the same in prose.
+  coverage-floor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Lines covered, with a floor
+        run: |
+          # Keep the exit status by hand, and never pipe this command.
+          # The default shell for a `run:` block is `bash -e`, WITHOUT
+          # pipefail (only an explicit `shell: bash` adds `-o pipefail`),
+          # so `cargo llvm-cov --fail-under-lines 90 | tee cov.txt` would
+          # report tee's 0 and the floor would silently stop gating —
+          # a green check that has measured nothing. `|| status=$?` is
+          # also what keeps `-e` from killing the step before the summary
+          # gets written; the last line is what actually fails the job.
+          status=0
+          cargo llvm-cov --summary-only --fail-under-lines 90 > cov.txt || status=$?
+          cat cov.txt
+          {
+            echo '## Coverage'
+            echo '```'
+            tail -n 16 cov.txt
+            echo '```'
+            if [ "$status" -ne 0 ]; then
+              echo
+              echo 'Below the 90% floor. The question is which real'
+              echo 'decision lost its test, not how to raise the number.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+  # What a suite costs to own. Neither number gates: there is no correct
+  # test count, and runner speed varies. They are recorded so that a jump
+  # is visible in the PR that caused it — a hundred new tests that add a
+  # minute of wall time is a fact worth seeing next to the diff that
+  # introduced them, whoever (or whatever) wrote it. This is also the only
+  # job that sees a test-only PR at all, since it mutates nothing.
+  suite-cost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Count and time the suite
+        run: |
+          # Build first so the timing measures the tests, not rustc.
+          cargo test --no-run --quiet
+          start=$(date +%s)
+          cargo test -- --test-threads=1 > out.txt 2>&1 || true
+          elapsed=$(( $(date +%s) - start ))
+          # awk rather than paste+bc: one fewer thing that has to exist
+          # on the runner, and it yields 0 rather than empty on no match.
+          # Only "ok." binaries are counted, so a failing binary drops its
+          # tests from the total — the CI job is what reports that, and a
+          # count that fell is read next to a red CI, never on its own.
+          passed=$(grep -Eo '^test result: ok\. [0-9]+' out.txt \
+                   | grep -Eo '[0-9]+' | awk '{s+=$1} END{print s+0}')
+          {
+            echo '## Suite cost'
+            echo "- tests: ${passed}"
+            echo "- wall time (serial): ${elapsed}s"
+            if [ "$passed" -gt 0 ]; then
+              echo "- per test: $(( elapsed * 1000 / passed ))ms"
+            fi
+            echo
+            echo 'Not a gate. A sharp rise in either, against a diff that'
+            echo 'did not add matching behaviour, is the signal.'
+          } >> "$GITHUB_STEP_SUMMARY"
