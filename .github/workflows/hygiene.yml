@@ -11,7 +11,24 @@ on:
   schedule:
     # Weekly, Saturday 03:00 JST (Friday 18:00 UTC).
     - cron: '0 18 * * 5'
+  # Also per PR, still report-only: copy-paste is cheapest to notice in
+  # the change that introduces it, and bulk-generated code is where it
+  # shows up. The weekly run stays for whole-tree drift that no single PR
+  # is responsible for.
+  pull_request:
   workflow_dispatch:
+
+concurrency:
+  # One run per PR: a push that supersedes the commit under test makes the
+  # running scan obsolete. Scheduled and manual runs get a group of their
+  # own (run_id is unique) so they neither cancel each other nor queue
+  # behind one another — the weekly whole-tree trend is nobody's
+  # foreground task, and a `workflow_run` that sat pending behind it would
+  # look broken.
+  group: >-
+    ${{ github.workflow }}-${{ github.event_name == 'pull_request'
+        && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -29,12 +46,30 @@ jobs:
 
       - name: Scan for copy-paste duplication
         # jscpd exits zero here (no --threshold set); the SARIF is the report.
+        #
+        # Pinned, not `jscpd@latest`. The pull_request trigger above turned
+        # this from a weekly run into one that fires on every proposed
+        # change, and `npx --yes` fetches and executes whatever npm serves
+        # at that moment: an unpinned dependency is a published package
+        # away from running someone else's code on this runner, and the
+        # hours right after a publish are exactly when a compromised
+        # release is still live. 5.2.0 is the version that produced this
+        # repo's last green scan (2026-09-13), not merely the newest —
+        # bump it deliberately, after a run proves the new one works.
         run: |
-          npx --yes jscpd --pattern 'src/**/*.rs' \
+          npx --yes jscpd@5.2.0 --pattern 'src/**/*.rs' \
             --reporters consoleFull,sarif --output .jscpd --min-tokens 70 \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload to Code Scanning
+        # Same-repo only. A PR from a fork gets a read-only GITHUB_TOKEN
+        # whatever this file requests, so the upload cannot succeed there:
+        # without this guard a fork PR gets a red X from a workflow whose
+        # whole contract is that it never blocks. The scan itself still
+        # runs on a fork PR and its findings stay in the step summary.
+        if: >-
+          github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: .jscpd/jscpd-report.sarif
