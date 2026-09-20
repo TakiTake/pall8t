@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use pall8t::{config, container, herdr, image, mounts, naming, worktree};
 use std::io::IsTerminal;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 /// Run AI coding agents in apple/container sandboxes. Headless: pall8t is
@@ -27,6 +28,10 @@ enum Cmd {
         /// forces them all writable instead
         #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
         readonly: Option<bool>,
+        /// Forward the host's SSH agent into the sandbox for this run,
+        /// overriding `[container] ssh`. `--ssh=false` forces it off
+        #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+        ssh: Option<bool>,
         /// Command to run instead of the configured one (after --)
         #[arg(last = true)]
         command: Vec<String>,
@@ -124,7 +129,11 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Init => cmd_init(),
-        Cmd::Run { readonly, command } => cmd_run(command, readonly),
+        Cmd::Run {
+            readonly,
+            ssh,
+            command,
+        } => cmd_run(command, readonly, ssh),
         Cmd::Build { no_cache } => cmd_build(no_cache),
         Cmd::Ls { json } => cmd_ls(json),
         Cmd::Exec { id, command } => cmd_exec(&id, &command),
@@ -256,12 +265,56 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
+/// Provenance for `pall8t ls --json` and anything else asking what a
+/// running sandbox is: what pall8t knows and the container does not say
+/// about itself. Values are sanitised in [`container::run_argv`] (a `=` in
+/// a project path would fail the run outright), so this only decides
+/// *which* facts are recorded.
+fn run_labels(cwd: &Path, image_tag: &str, main_git_dir: Option<&Path>) -> Vec<(String, String)> {
+    let mut labels = vec![
+        (
+            container::LABEL_VERSION.to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+        ("pall8t.project".to_string(), cwd.display().to_string()),
+        ("pall8t.image".to_string(), image_tag.to_string()),
+    ];
+    if let Some(git_dir) = main_git_dir {
+        labels.push((
+            "pall8t.worktree.git_dir".to_string(),
+            git_dir.display().to_string(),
+        ));
+    }
+    labels
+}
+
+/// The herdr half of the provenance, for a run that has a pane around it.
+/// Separate from [`run_labels`] because it is conditional on the herdr
+/// environment and independent of whether the *bridge* then succeeds — a
+/// bridge failure is best-effort and must not cost the run its labels.
+fn herdr_labels(env: &herdr::HerdrEnv, sandbox: config::HerdrSandbox) -> Vec<(String, String)> {
+    let mut labels = vec![("pall8t.herdr.pane".to_string(), env.pane_id.clone())];
+    if let Some(w) = &env.workspace_id {
+        labels.push(("pall8t.herdr.workspace".to_string(), w.clone()));
+    }
+    if let Some(t) = &env.tab_id {
+        labels.push(("pall8t.herdr.tab".to_string(), t.clone()));
+    }
+    labels.push((
+        "pall8t.herdr.sandbox".to_string(),
+        sandbox.as_str().to_string(),
+    ));
+    labels
+}
+
+fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<bool>) -> Result<()> {
     let (cwd, cfg, uid, gid, resolved) = workspace_image(image::BuildMode::IfMissing)?;
     let run_name = container::run_name(&cwd);
 
     let mut mounts = vec![container::Mount::identity(cwd.clone())];
-    if let Some(git_dir) = worktree::main_git_dir(&cwd) {
+    // One probe, two consumers: the mount below and the provenance label.
+    let main_git_dir = worktree::main_git_dir(&cwd);
+    if let Some(git_dir) = main_git_dir.clone() {
         eprintln!(
             "pall8t: git worktree detected — also mounting {}",
             git_dir.display()
@@ -284,14 +337,40 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
         mounts.push(m);
     }
     mounts.push(container::Mount::rw(container::home_mount()?, home_dest));
-    // A read-only mount arrives inside the container owned by root rather
-    // than the host user, so git refuses to read it until each such path is
-    // marked safe (see `mounts::safe_directory_env`).
-    let readonly_paths: Vec<_> = mounts
-        .iter()
-        .filter(|m| m.readonly)
-        .map(|m| m.dest.clone())
-        .collect();
+    // A mount's own directory inode arrives inside the container owned by
+    // root rather than the host user — the workspace included, not just
+    // read-only reference mounts — so git refuses `status`/`log` there
+    // until each mounted path is marked safe (see
+    // `mounts::safe_directory_env`). Computed here, before the herdr
+    // bridge appends its own mounts: those are a binary directory and a
+    // socket, never a repository.
+    let mount_targets: Vec<_> = mounts.iter().map(|m| m.dest.clone()).collect();
+
+    let mut labels = run_labels(&cwd, &resolved.tag, main_git_dir.as_deref());
+
+    let ssh = config::ssh_enabled(cfg.ssh, cli_ssh);
+    // `var_os`, not `var`: SSH_AUTH_SOCK is a path, and a path is not
+    // required to be UTF-8.
+    let host_auth_sock = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
+    // Connecting is the probe, not `Path::exists`: an agent that died
+    // without cleaning up leaves a socket node that exists and refuses
+    // every connection, which is the stale case the warning is for. The
+    // connection is dropped immediately — reaching accept() is the whole
+    // question, so nothing is written and no agent-protocol request is
+    // made.
+    let agent_reachable = |sock: &Path| UnixStream::connect(sock).is_ok();
+    if let Some(msg) = config::ssh_warning(ssh, host_auth_sock.as_deref(), agent_reachable) {
+        eprintln!("{msg}");
+    } else if ssh {
+        // Say so on the *working* path too, not only when it is broken.
+        // A capability this wide that announces itself only on failure is
+        // one a run can carry without anyone noticing — and the herdr
+        // bridge, which is narrower, already says "herdr bridge active".
+        eprintln!(
+            "pall8t: [container] ssh is on — this run can use your SSH agent \
+             to authenticate as you anywhere your keys are trusted"
+        );
+    }
 
     let herdr_env = herdr::detect();
     // An explicit `-- <cmd>` override is user intent and bypasses the
@@ -321,8 +400,9 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
     // The bridge (ADR-0007) makes the herdr CLI work inside the sandbox:
     // relay + env + Linux binary mount + bootstrap wrap. Best-effort — a
     // bridge failure warns and the run proceeds without it.
-    let mut env_vars = mounts::safe_directory_env(&readonly_paths);
+    let mut env_vars = mounts::safe_directory_env(&mount_targets);
     if let Some(env) = &herdr_env {
+        labels.extend(herdr_labels(env, cfg.herdr.sandbox));
         match herdr::prepare_bridge(env, cfg.herdr.sandbox, &run_name) {
             Ok(Some(bridge)) => {
                 eprintln!(
@@ -349,6 +429,9 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>) -> Result<()> {
         gid,
         tty: stdin_is_tty(),
         env: env_vars,
+        ssh,
+        labels,
+        hardening: cfg.hardening,
         command,
     };
     exec_container(&container::run_argv(&spec), herdr_agent.as_deref())
@@ -369,9 +452,19 @@ fn cmd_ls(json: bool) -> Result<()> {
     ensure_container_system()?;
     let containers = container::list_pall8t()?;
     if json {
+        // Additive: `name`/`status` are the shape herdr and scripts already
+        // read, and `image`/`labels` join them rather than replacing
+        // anything. A container from an older pall8t simply has no labels.
         let items: Vec<serde_json::Value> = containers
             .iter()
-            .map(|c| serde_json::json!({ "name": c.name, "status": c.state.as_str() }))
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "status": c.state.as_str(),
+                    "image": c.image,
+                    "labels": c.labels,
+                })
+            })
             .collect();
         print_json(&items)?;
     } else {

@@ -62,6 +62,7 @@ Two layers, merged per field with the project winning: global `~/.pall8t/config.
 [container]
 cpus = 4
 memory = "8g"
+# ssh = true                     # forward the host's SSH agent into the sandbox (default: false)
 # containerfile = "path/to/other/Containerfile"   # relative to the project dir; default: .pall8t/Containerfile
 # watch = ["flake.nix", "flake.lock"]   # extra files whose content also decides whether to rebuild
 
@@ -76,6 +77,36 @@ source = "~/src/other-lib"
 ```
 
 Override for a single run without editing the file: `pall8t run --readonly` (or `--readonly=false` to force them all writable). The flag wins over every entry's own setting.
+
+### Hardening the sandbox
+
+Everything pall8t runs is already in its own VM. `[container] hardening` decides how much the runtime confines the container *inside* that VM:
+
+```toml
+[container]
+hardening = "strict"   # default: "default"
+```
+
+- **`"default"`** — what every pall8t release has run: a writable root filesystem and the runtime's normal capability set.
+- **`"strict"`** — `--cap-drop ALL` (the capability *bounding* set is emptied, so nothing inside can regain one), a read-only root filesystem, `/tmp` on a tmpfs, and an 8192 file-descriptor ceiling. The only writable paths left are the ones pall8t mounted on purpose — your workspace and the container home — plus `/tmp` itself, which is that tmpfs: writable, but in memory and gone when the run ends. Everything else answers `EROFS`.
+
+Opt-in per project, because whether it holds depends on the project's toolchain — a build that writes outside the workspace, or a tool that needs a capability, works under `default` and fails under `strict`. Verified on apple/container 1.2.2: under `strict`, a write to `/var/tmp` fails with `EROFS` and `CapBnd` reads `0000000000000000`; under `default`, the same write succeeds and `CapBnd` carries the runtime's usual set.
+
+Independently of the profile, every run gets `--init`: an init process inside the container that forwards signals to the agent and reaps the orphans it leaves behind (a background shell, teammate agents, or a `tmux` session if you added tmux back to your own Containerfile — the default image dropped it). The agent's own exit code still comes back unchanged — `exit 42` gives 42, a signal-killed command gives 143.
+
+### SSH agent forwarding
+
+`[container] ssh = true` forwards the host's SSH agent into the sandbox (`container run --ssh`): apple/container mounts the agent socket at `/var/host-services/ssh-auth.sock` inside the guest and points the container's `SSH_AUTH_SOCK` at it. **No key material crosses the boundary** — the sandbox sends signing requests to the agent on the host, which is the point: without it, git-over-SSH inside the sandbox needs a private key sitting in `~/.pall8t/home/.ssh`, where the agent can read it and where it stays after the run.
+
+Off by default ([ADR-0012](docs/adr/0012-ssh-agent-forwarding.md)), because while the run lasts, code in the sandbox can authenticate as you anywhere your keys are trusted. `pall8t run --ssh` turns it on for one run; `--ssh=false` turns it off for one run. A run that forwards says so on stderr. Forwarding belongs to the container, not to one command: `pall8t exec` into a container that was started with it reaches the agent too, for as long as that container is up.
+
+**Only you can switch it on.** `ssh = true` is honored from *your* `~/.pall8t/config.toml` or from `--ssh`. A project's `.pall8t/config.toml` may turn forwarding **off**, never on — it ships with the repository, and that is the code the sandbox exists to contain. A project asking to enable it is told its request was ignored.
+
+Two things worth knowing before you turn it on. The **whole agent** is forwarded, not one key: every identity it holds, against every host that trusts it, for the length of the run. `ssh-add -c` (confirm each signature), `ssh-add -t` (expiry), or a dedicated agent holding just the key that run needs are the ways to narrow that, and all three are yours to apply, not pall8t's. And for pushing to GitHub specifically, a **fine-grained PAT is the tighter credential** — it scopes to chosen repos and permissions, which an SSH user key cannot do. Agent forwarding earns its keep where a token is not an option.
+
+If forwarding is on and the host has no agent, pall8t warns — both when `SSH_AUTH_SOCK` is unset and when nothing is listening on the socket it names. pall8t connects rather than just checking the path exists, because an agent that dies without cleaning up (killed, OOM'd, or outlived by the tmux session still exporting its path) leaves the socket file sitting there: it looks present and refuses every connection. The runtime forwards nothing in that case but *still* sets `SSH_AUTH_SOCK` inside the container, and `ssh` ignores an agent it cannot reach rather than reporting it — so without the warning the only symptom is `git@github.com: Permission denied (publickey).`, pointing at a key problem you do not have.
+
+A forwarded agent is only half of what git-over-SSH needs: the sandbox runs non-interactively, so an unknown host key is not a prompt anyone can answer. The default image therefore bakes GitHub's SSH host keys into `/etc/ssh/ssh_known_hosts` at build time, from the authenticated `api.github.com/meta` rather than `ssh-keyscan`. **A custom Containerfile needs to do the same** (or `ssh` inside the sandbox fails with "Host key verification failed" while the agent it was handed goes unconsulted) — see the line in the built-in [`Containerfile`](Containerfile).
 
 Note that `~` expands on the **host**, and an identity mount lands at that same absolute path inside the container — `~/src/other-lib` is `/Users/you/src/other-lib` in the sandbox, not `/home/dev/src/other-lib`. Set `target` if you want it somewhere friendlier.
 
@@ -92,6 +123,28 @@ The image tag embeds the Containerfile's content hash, so any edit — no commit
 
 A build streams `container build`'s own output live to stderr — no `-v` flag, this is always on, since a silent multi-minute build looks hung. Deliberately kept off pall8t's own stdout, which `pall8t build`'s final `built <tag>` line and `pall8t ls --json` need to stay machine-readable.
 
+### What a running sandbox says about itself
+
+Every container `pall8t run` starts is labelled, and `pall8t ls --json` hands the labels back:
+
+```console
+$ pall8t ls --json | jq '.[0]'
+{
+  "name": "pall8t-my-project-9f2c1a04-4711",
+  "status": "running",
+  "image": "pall8t-my-project:501-20-3b8f01c2d4e6",
+  "labels": {
+    "pall8t.version": "0.6.0",
+    "pall8t.project": "/Users/me/src/my-project",
+    "pall8t.image": "pall8t-my-project:501-20-3b8f01c2d4e6",
+    "pall8t.herdr.pane": "w1G:p2",
+    "pall8t.herdr.sandbox": "full"
+  }
+}
+```
+
+That is enough to map a herdr pane to the sandbox serving it, or a sandbox back to the project and image it booted, without parsing the container name. `name` and `status` are unchanged, so anything already reading them keeps working; the `pall8t.herdr.*` labels appear only for a run started from a herdr pane, and a container started by an older pall8t has no labels at all.
+
 ## Working with git worktrees
 
 Cutting worktrees is the caller's business — you or herdr — but pall8t makes them work inside the sandbox:
@@ -103,6 +156,17 @@ pall8t run
 ```
 
 pall8t detects that cwd's `.git` is a worktree pointer and identity-mounts the main repository's `.git` alongside, so `status`/`commit`/`diff` inside the container behave exactly as on the host.
+
+herdr can cut the worktree for you, which is the natural pairing — one pane per task, each with its own checkout and its own sandbox:
+
+```sh
+herdr worktree create --branch task    # checkout under ~/.herdr/worktrees/<repo>/<branch-slug>
+pall8t run                             # in the pane herdr opens there
+```
+
+That layout puts the checkout far from the repository it belongs to (under herdr's own root rather than beside the main checkout), which pall8t handles the same way — the worktree's pointer file names the main `.git` by absolute path, and that path is mounted. Pinned by a test that builds the layout with real git.
+
+Either way, every path pall8t mounts is marked `safe.directory` for git inside the container. It has to be: a mount's own directory arrives owned by root there (the files inside it map to you correctly), and git refuses a repository whose top-level directory it doesn't think you own.
 
 ## herdr integration
 
@@ -134,6 +198,7 @@ auto_rename = true     # opt-in: name this run's tab *and* agent `<base>-<n>`, s
 - **Naming the tab and the agent** — `auto_rename` (issue #71; numbering scheme [ADR-0011](docs/adr/0011-tab-numbering-state.md)). A herdr agent's *name* is what makes cross-sandbox agent-to-agent messaging usable — `herdr agent prompt api-2 "run the tests" --wait`. Without one the only working target is the pane id (`w13:p3`), which changes every run and reads like nothing: neither tab labels nor tab ids resolve as agent targets (verified on herdr 0.8.2). pall8t gives the tab and the agent the same string, `<base>-<n>`: `<base>` is the workspace directory's basename, slugged (or `agent_name`), and `<n>` is **pall8t's own counter**, kept per base name in `~/.pall8t/state/herdr-naming.json` — handed out once and never reused while one herdr server run lasts, so a tab keeps its name for its whole life and that name stays usable as an address other agents type. [ADR-0011](docs/adr/0011-tab-numbering-state.md) has the rest: how the count survives a herdr restart, and why it needs no herdr call at all (a failing `tab.list` costs the tab its rename, never the agent its number). Delete the state file to start numbering over — the next run seeds itself from the labels on screen. A name already claimed gets a further counter (`foo-1-2`), counting both a name a live agent answers to and a label another tab already wears, since herdr enforces no uniqueness on labels. A tab *you* renamed is never clobbered; one still on herdr's own label, or on a label pall8t wrote on an earlier run, is taken over — and when a label is left alone the run says which name actually reaches the agent. The two halves land at different times: the tab is renamed before the sandbox even starts, the agent only once herdr recognizes it (after the exec into `container run`), so a small detached `pall8t` child waits for that and renames it then, logging to `~/.pall8t/logs/herdr-naming.log`. Best-effort and independent — a failing agent rename never stops the tab from being named — and naming happens in every `sandbox` mode, `off` included.
 - **The herdr CLI works *inside* the sandbox** — `sandbox = "full"` or `"readonly"` ([ADR-0007](docs/adr/0007-herdr-bridge.md)). The sandboxed agent gets `HERDR_ENV`/`HERDR_{WORKSPACE,TAB,PANE}_ID`, a working `HERDR_SOCKET_PATH`, and a version-matched Linux `herdr` binary on `PATH`, so herdr's own agent skill runs unmodified: a sandboxed agent can inspect neighboring panes, split, start sibling agents, and wait on them. Under the hood a host-side relay listens on its own Unix socket under `~/.pall8t/run/` and pall8t mounts *that* socket into the sandbox at `HERDR_SOCKET_PATH` (apple/container forwards a socket mount into the guest as a live socket, verified on 1.2.2 — see the [ADR-0007 amendment](docs/adr/0007-herdr-bridge.md#amendment-2026-08-23-the-socket-premise-was-wrong)). Every request is audit-logged to `~/.pall8t/logs/herdr-relay-<container>.log` and `herdr.sock` itself is never handed to the sandbox; the policy check is where the host-admin namespaces (`server.`, `session.`, `integration.`, `plugin.`) are denied in every mode, and an unrecognized method counts as a mutation, so a newer herdr's additions are transparent in `full` and refused in `readonly`. Note that panes and agents created through the bridge run **on the host**, outside the sandbox — `full` is a deliberate, audited opening for multi-agent coordination; set `readonly`/`off` to close it. Setup is best-effort (a failure warns and the run continues without the bridge); the first bridged run downloads the matching `herdr-linux-*` release into `~/.pall8t/tools/` (cached per version). Custom Containerfiles need nothing extra — the bridge is a mount, not an in-container process.
 - **Delegating to a sibling agent** — [`skills/pall8t-herdr/SKILL.md`](skills/pall8t-herdr/SKILL.md). herdr's own skill covers the CLI; this one covers what's specific to asking *another* agent from *inside* a sandbox, starting with the settled-state trap that makes a healthy bridge look stalled: `agent prompt --wait --until idle` can never match a pane the human isn't looking at (it settles into `done`), so it always runs to its timeout. Use the plain `--wait`.
+- **A herdr plugin, in `contrib/`.** `herdr plugin link contrib/herdr-plugin` puts the sandbox controls in herdr itself: what this pane's sandbox is, a second shell inside it, an image rebuild, a stop. It finds the pane's container by the `pall8t.herdr.pane` label rather than by name — see [contrib/herdr-plugin/README.md](contrib/herdr-plugin/README.md).
 
 Native session resume/restore (`pall8t resume`, live session-id reporting via `herdr pane report-agent-session`) isn't implemented yet: it needs a change to pall8t's foreground/exec-replace process model, and, upstream, a way for herdr to let a custom source supply its own resume command instead of its current hardcoded `claude --resume <id>` table. Tracked in [issue #18](https://github.com/TakiTake/pall8t/issues/18).
 

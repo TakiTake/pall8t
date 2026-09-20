@@ -7,6 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`[container] ssh`: forward the host's SSH agent into the sandbox**
+  (`container run --ssh`,
+  [ADR-0012](docs/adr/0012-ssh-agent-forwarding.md)), so an agent can push
+  over SSH without a private key ever entering the container home. Off by
+  default — while the run lasts, the sandbox can authenticate as you
+  anywhere your keys are trusted. `pall8t run --ssh` / `--ssh=false`
+  overrides it for one run, and pall8t warns when forwarding is on but the
+  host has no agent to forward — both an unset `SSH_AUTH_SOCK` and one
+  naming a socket no agent answers on. pall8t connects to it rather than
+  checking the path exists, because an agent killed without cleaning up
+  leaves its socket file behind: present to `Path::exists`, refusing every
+  connection. The runtime would otherwise forward nothing silently while
+  still setting `SSH_AUTH_SOCK` in the guest.
+- **A herdr plugin in `contrib/herdr-plugin/`**: sandbox status, a second
+  shell inside the pane's container, an image rebuild, and a stop —
+  driven from herdr, linked with `herdr plugin link contrib/herdr-plugin`.
+  It resolves the pane's container through the `pall8t.herdr.pane` label
+  and speaks only to the pall8t CLI, so it ships beside the `ls --json`
+  output it depends on.
+- **A drift report for the relay's herdr method classification**
+  (`scripts/herdr-method-drift.py`, plus a weekly report-only workflow):
+  the `READ` allowlist that decides what a sandboxed agent may call under
+  `[herdr] sandbox = "readonly"` is a hand-made snapshot of herdr's
+  inventory, and this says what a newer herdr serves that it doesn't
+  cover. Report only — classification stays a human decision, and herdr's
+  schema is not a complete inventory (methods that hijack the connection,
+  like `pane.graphics.stream`, are absent from it).
+- **`[container] hardening = "strict"`**: drop every Linux capability,
+  mount the container's root filesystem read-only, put `/tmp` on a tmpfs,
+  and cap file descriptors — leaving the workspace, the container home and
+  that `/tmp` as the only writable paths (the tmpfs is writable but lives
+  in memory and is gone when the run ends; everything else is `EROFS`).
+  Opt-in per project: whether it holds depends on the project's toolchain.
+  The default level is unchanged.
+- **Every run now gets an init process** (`container run --init`), which
+  forwards signals to the agent and reaps the orphans it leaves behind
+  (background shells, teammate agents, and a `tmux` session if you put
+  tmux back in your own image). Exit-code propagation is
+  unchanged — verified on 1.2.2 for both a plain exit and a signal.
+- **Every `pall8t run` container carries provenance labels**
+  (`pall8t.version`, `pall8t.project`, `pall8t.image`, the herdr pane /
+  workspace / tab and sandbox mode when running under herdr, and a
+  worktree's main git dir), and `pall8t ls --json` reports them alongside
+  the image. `pall8t ls` now recognizes its containers by the
+  `pall8t.version` label rather than by the `pall8t-` name prefix. The
+  prefix stays as a fallback so containers started by an older pall8t
+  remain visible, which means a container someone else named `pall8t-…`
+  still matches for now — the prefix was never a sound test, and dropping
+  the fallback is what will fix that. Those sessions are `--rm` and in
+  the foreground, so one release is enough for the fallback to go.
+
+### Security
+
+- **A project's `.pall8t/config.toml` can no longer switch SSH forwarding
+  on** — only your own `~/.pall8t/config.toml` or `pall8t run --ssh` can.
+  A project config ships with the repository, so honoring `ssh = true`
+  there let cloned code vote itself the use of your SSH agent, silently.
+  A project may still turn forwarding *off*, and one that asks to enable
+  it is now told the request was ignored and how to ask legitimately.
+- **A run that forwards the agent says so on stderr.** Previously only
+  the failure path spoke, so a working forward left nothing on screen.
+- **A misspelled key under `[container]` now fails the parse** rather than
+  being accepted and ignored (`deny_unknown_fields`, as `[herdr]` already
+  had). The direction that needed it is *narrowing*: a project may only
+  turn forwarding off, so `shh = false` against a global `ssh = true` is a
+  repository saying "do not hand my agent to this code" — silently
+  dropped, that run forwarded the agent anyway with nothing on screen. A
+  typo in the enabling direction was always safe (forwarding stays off);
+  this closes the other one.
+- **The `known_hosts` bake no longer fails open.** `curl … | jq …` in a
+  `RUN` step runs under `/bin/sh` with no `pipefail`, so a failed fetch
+  left `jq` to exit 0 on empty input and the image built with an empty
+  `/etc/ssh/ssh_known_hosts`. The steps are now separate and each is
+  checked, including that the extracted key list is non-empty.
+
+### Fixed
+
+- **`git status`, `git log`, and `git rev-parse` failed inside the sandbox
+  with "detected dubious ownership"** — in the workspace itself, not only
+  in read-only reference mounts. A mount's own directory inode arrives
+  root-owned inside the container while its contents map to the host user
+  correctly, so the earlier measurement (taken on a path *inside* a
+  writable mount) missed it. Every mounted path is now marked
+  `safe.directory`, so git works in the workspace, in a `[[mounts]]`
+  entry, and in a linked worktree. Verified live on apple/container
+  1.2.2, including a worktree created by `herdr worktree create` under
+  `~/.herdr/worktrees/`.
+
+### Changed
+
+- **The default image bakes GitHub's SSH host keys into
+  `/etc/ssh/ssh_known_hosts`** (from the authenticated `api.github.com/meta`,
+  as the repo's own dev image already did). Without them a forwarded agent
+  is unusable for its main purpose: the sandbox is non-interactive, so an
+  unknown host key is not a prompt anyone can answer — `git push` just dies
+  on "Host key verification failed" without ever consulting the agent. A
+  custom Containerfile needs the same line. `jq` joins the default image's
+  tool list to do it.
+
 ### Development
 
 - **The `/release` skill's review step named a skill that doesn't exist.**
@@ -152,6 +253,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The sandbox's Linux `herdr` CLI is now the verified cache itself,
+  mounted read-only**, instead of a per-run copy mounted read-write. The
+  copy existed only because ADR-0007 believed read-only mounts were
+  unavailable; a read-only mount is strictly stronger (the sandbox cannot
+  corrupt even its own CLI) and drops a multi-megabyte copy from every
+  bridged launch. `~/.pall8t/tools/herdr-run/` is no longer used by this
+  version — leftover directories there can be deleted by hand once every
+  sandbox started by an older pall8t has exited, since such a run is still
+  executing out of one.
 - **The herdr sandbox bridge is now a mounted Unix socket, not a TCP
   relay.** The host-side relay listens on its own socket under
   `~/.pall8t/run/` and pall8t mounts that socket into the container at

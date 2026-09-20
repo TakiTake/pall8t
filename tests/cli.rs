@@ -1141,6 +1141,265 @@ fn run_hands_the_runtime_the_workspace_mount_and_the_configured_command() {
     );
 }
 
+/// The `run` command line pall8t handed the fake runtime.
+fn run_line(fake: &FakeRuntime) -> String {
+    fake.argv_log()
+        .lines()
+        .find(|l| l.starts_with("run "))
+        .expect("pall8t must reach `container run`")
+        .to_string()
+}
+
+/// The provenance labels have to survive the same whole trip: `cmd_run`
+/// assembling them, `RunSpec`, `run_argv`. `container.rs` unit-tests the
+/// *emission* (one `--label` per entry, values sanitised) and the *reading*
+/// back out of `ls --json`, but neither notices if the run stops putting
+/// anything in the vector — `run_labels` returning `vec![]` passes every
+/// one of them. This is the test that would go red, and the reason the
+/// labels are worth anything: `pall8t ls` identifies its own containers by
+/// `pall8t.version` now, so a run that quietly stopped labelling would
+/// vanish from its own listing.
+#[test]
+fn a_run_labels_the_container_with_its_own_provenance() {
+    let sb = Sandbox::new("run-labels");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    sb.run(&["run"]);
+    let line = run_line(&fake);
+
+    assert!(
+        line.contains(&format!(
+            "--label pall8t.version={}",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "the version label is the one `pall8t ls` matches on, so it is the \
+         one that must never go missing: {line}"
+    );
+
+    // Each label is checked against the argv element it is *about*, not
+    // merely for being present. Presence is the weak form: a label built
+    // from the wrong variable, or from an empty string, still contains
+    // `pall8t.image=`. Tying each one to its source of truth in the same
+    // command line is what makes a wrong value fail.
+    let value_of = |key: &str| -> String {
+        line.split_whitespace()
+            .find_map(|a| a.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no `{key}...` in the run argv: {line}"))
+            .to_string()
+    };
+
+    let workdir = line
+        .split_whitespace()
+        .skip_while(|a| *a != "-w")
+        .nth(1)
+        .expect("a run always sets -w");
+    assert_eq!(
+        value_of("pall8t.project="),
+        workdir,
+        "the project label must name the directory the run actually mounted \
+         as the workspace — the two coming apart is exactly the confusion \
+         `pall8t ls` exists to resolve: {line}"
+    );
+
+    assert_eq!(
+        value_of("pall8t.image="),
+        tag,
+        "and the image label must be the tag this run resolved to, since \
+         the container itself reports only a digest: {line}"
+    );
+}
+
+/// `[container] ssh` has to survive the whole trip — config files, the
+/// `--ssh` override, the merge rule, `RunSpec`, `run_argv` — and the only
+/// place its effect is observable is the argv pall8t hands the runtime.
+/// The unit tests cover each link; this one pins that they are actually
+/// joined, so a wiring slip (`let ssh = false;` in `cmd_run`) has
+/// somewhere to go red. It also pins the asymmetry that matters most: a
+/// *project* config cannot switch forwarding on, only off. The runtime is
+/// left in place rather than vanished: the fake logs the `run` line and
+/// exits, which is the launch this needs to read.
+#[test]
+fn only_the_human_can_forward_the_agent_never_a_projects_own_config() {
+    let sb = Sandbox::new("run-ssh-argv");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    // (global config, project config, argv, --ssh expected, why)
+    let cases: [(&str, &str, &[&str], bool, &str); 5] = [
+        (
+            "",
+            "",
+            &["run"],
+            false,
+            "forwarding is opt-in: a run that never asked for it must not be \
+             handed the user's agent",
+        ),
+        (
+            "",
+            "",
+            &["run", "--ssh"],
+            true,
+            "`pall8t run --ssh` is the human saying it out loud, per run",
+        ),
+        (
+            "[container]\nssh = true\n",
+            "",
+            &["run"],
+            true,
+            "and the user's own ~/.pall8t/config.toml is the standing way in",
+        ),
+        (
+            "",
+            "[container]\nssh = true\n",
+            &["run"],
+            false,
+            "but a project config must NOT be able to switch it on: it ships \
+             with the repository, so this is cloned code voting itself \
+             access to the user's keys",
+        ),
+        (
+            "[container]\nssh = true\n",
+            "[container]\nssh = false\n",
+            &["run"],
+            false,
+            "narrowing stays honored — a project may always decline what the \
+             global allowed",
+        ),
+    ];
+
+    for (global, project, args, expected, why) in cases {
+        sb.write_global_config(global);
+        sb.write_project_config(project);
+        fake.clear_log();
+        sb.run(args);
+        let line = run_line(&fake);
+        assert_eq!(line.contains("--ssh"), expected, "{why}. argv was: {line}");
+    }
+}
+
+/// Refusing a project's request is only half the job: dropping a stated
+/// intent in silence is this repo's definition of a bug, and here the
+/// silence would hide that a repository tried to reach the user's keys.
+#[test]
+fn a_project_config_that_asked_for_ssh_is_told_it_was_ignored() {
+    let sb = Sandbox::new("run-ssh-ignored");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    sb.write_project_config("[container]\nssh = true\n");
+    let out = sb.run(&["run"]);
+    let err = stderr(&out);
+    assert!(
+        err.contains("was ignored"),
+        "a project asking to enable forwarding must be told it did not \
+         happen: {err}"
+    );
+    assert!(
+        err.contains("--ssh"),
+        "and told how to ask legitimately, or the message is a refusal with \
+         no remedy: {err}"
+    );
+}
+
+/// The other half of the same wiring: what the run says about the host's
+/// agent. A capability this wide that announces itself only on failure is
+/// one a run can carry without anyone noticing, so the working path speaks
+/// too.
+#[test]
+fn the_run_says_whether_the_agent_is_being_forwarded_or_is_missing() {
+    let sb = Sandbox::new("run-ssh-warn");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    // The harness clears the environment, so this run genuinely has no
+    // SSH_AUTH_SOCK — no need to unset one.
+    let unset = sb.run(&["run", "--ssh"]);
+    assert!(
+        stderr(&unset).contains("SSH_AUTH_SOCK is unset on the host"),
+        "forwarding with no agent at all must say so on stderr: {}",
+        stderr(&unset)
+    );
+
+    let off = sb.run(&["run"]);
+    assert!(
+        !stderr(&off).contains("SSH_AUTH_SOCK") && !stderr(&off).contains("ssh is on"),
+        "and a run that never asked to forward has nothing to say: {}",
+        stderr(&off)
+    );
+
+    // The case a presence-only check misses: a path still exported for a
+    // socket that died with its agent.
+    let dead = sb.root.join("dead-agent.sock");
+    let stale = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &dead)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&stale).contains(&format!("points at {}", dead.display())),
+        "a socket path with nothing behind it must be named, not treated as \
+         a working agent: {}",
+        stderr(&stale)
+    );
+
+    // The case an *existence* check misses, and the one that named this
+    // pin (CodeRabbit, PR #63): an agent that died without cleaning up
+    // leaves a socket node behind. It is not the reboot case above — the
+    // path is right there on disk, `Path::exists` says yes, and a
+    // presence-only probe hands the run a socket that refuses every
+    // connection while saying nothing. Binding a listener and dropping it
+    // reproduces exactly that inode.
+    let dead_node = sb.root.join("dead-node.sock");
+    drop(std::os::unix::net::UnixListener::bind(&dead_node).unwrap());
+    assert!(
+        dead_node.exists(),
+        "the fixture is only meaningful while the socket node is still on \
+         disk — that is the whole difference from the unlinked case above"
+    );
+    let refused = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &dead_node)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&refused).contains(&format!("points at {}", dead_node.display())),
+        "a socket node nothing is listening on must warn exactly as a missing \
+         one does: it forwards no agent either, and the user is left with the \
+         same unexplained publickey denial: {}",
+        stderr(&refused)
+    );
+
+    // And the working path. It takes a *listening* socket now — a regular
+    // file used to stand in, back when pall8t only stat'd the path.
+    let live = sb.root.join("live-agent.sock");
+    let _listening = std::os::unix::net::UnixListener::bind(&live).unwrap();
+    let on = sb
+        .command()
+        .args(["run", "--ssh"])
+        .env("SSH_AUTH_SOCK", &live)
+        .output()
+        .unwrap();
+    assert!(
+        stderr(&on).contains("ssh is on"),
+        "forwarding that actually happens must announce itself, or a run can \
+         carry the user's agent with nothing on screen saying so: {}",
+        stderr(&on)
+    );
+    assert!(
+        !stderr(&on).contains("no agent is listening"),
+        "and an agent that answers must not be warned about — a probe that \
+         cried wolf on every run would be ignored on the run that mattered: {}",
+        stderr(&on)
+    );
+}
+
 /// pall8t hands the runtime the command the config names, verbatim — in a
 /// herdr pane as anywhere else. Until the tmux integration was dropped, a
 /// configured command whose first token was `tmux` was silently replaced
@@ -1171,6 +1430,55 @@ fn a_configured_command_reaches_the_runtime_verbatim_inside_a_herdr_pane() {
         "the configured command is what runs in the sandbox, unrewritten: {}",
         fake.argv_log()
     );
+}
+
+/// What replaced the per-run copy, and the one assertion that tells the two
+/// apart. ADR-0007 copied the verified herdr binary into a private
+/// directory per run and mounted *that* read-write, because nothing could
+/// be mounted read-only at the time; ADR-0009 made read-only mounts real,
+/// so the cache itself goes in with `ro` and no copy is made. Swapping
+/// `Mount::ro` back to `Mount::rw` here would leave the shared cache
+/// mounted writable — every sandbox able to corrupt the binary every other
+/// sandbox executes, which is strictly worse than either design. The `ro`
+/// in this argv is the whole safety property, so it is asserted literally.
+#[test]
+fn the_herdr_cli_is_mounted_from_the_verified_cache_read_only() {
+    let sb = Sandbox::new("run-herdr-ro");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    let herdr_bin = fake_host_herdr(&sb, "0.8.2");
+    seed_verified_linux_herdr(&sb, "0.8.2");
+    let herdr_sock = sb.root.join("herdr.sock");
+    let host_herdr = std::os::unix::net::UnixListener::bind(&herdr_sock).unwrap();
+
+    sb.command()
+        .args(["run", "--", "claude"])
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "pane_42")
+        .env("HERDR_SOCKET_PATH", &herdr_sock)
+        .env("HERDR_BIN_PATH", &herdr_bin)
+        .output()
+        .unwrap();
+
+    let cache = sb.pall8t_root().join("tools").join("herdr").join("0.8.2");
+    let mount = run_line(&fake)
+        .split_whitespace()
+        .find(|a| a.contains("target=/opt/pall8t/bin"))
+        .expect("the herdr CLI has to reach the sandbox as a mount")
+        .to_string();
+    assert_eq!(
+        mount,
+        format!(
+            "type=virtiofs,source={},target=/opt/pall8t/bin,ro",
+            cache.display()
+        ),
+        "the source is the verified cache itself and the mount carries \
+         `ro`; without the flag this is the shared cache mounted writable, \
+         which is the one arrangement both designs existed to prevent"
+    );
+    drop(host_herdr);
 }
 
 /// The whole bridge, assembled: a herdr pane's environment, a host herdr
@@ -1223,39 +1531,17 @@ fn a_run_inside_a_herdr_pane_builds_the_socket_bridge() {
          is told to mount it, and it is the bridge's whole transport: {relay_sockets:?}"
     );
 
-    let staged: Vec<PathBuf> = sb
-        .pall8t_root()
-        .join("tools")
-        .join("herdr-run")
-        .read_dir()
-        .expect("the per-run copy directory exists")
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    assert_eq!(
-        staged.len(),
-        1,
-        "one private directory for this run: the shared cache is never the \
-         mount source, so one concurrent sandbox cannot overwrite the binary \
-         another is executing: {staged:?}"
-    );
-    let staged_bin = staged[0].join("herdr");
+    // The per-run copy is gone: ADR-0007 staged the binary into
+    // `tools/herdr-run/<container>/` so one sandbox could not overwrite the
+    // binary a concurrently running sandbox executes. A read-only mount of
+    // the verified cache removes the write outright instead — what replaces
+    // it is asserted in `the_herdr_cli_is_mounted_from_the_verified_cache_read_only`,
+    // which can see the argv this pre-exec test cannot.
     assert!(
-        staged_bin.is_file(),
-        "and it holds the binary itself — an empty directory would mount \
-         nothing and leave the sandbox without a herdr CLI: {staged:?}"
-    );
-    assert_eq!(
-        std::fs::read(&staged_bin).unwrap(),
-        std::fs::read(
-            sb.pall8t_root()
-                .join("tools")
-                .join("herdr")
-                .join("0.8.2")
-                .join("herdr")
-        )
-        .unwrap(),
-        "the copy must be of the *verified* cached build, byte for byte"
+        !sb.pall8t_root().join("tools").join("herdr-run").exists(),
+        "no per-run copy directory is created at all: leaving the staging \
+         behind would mean every launch still pays a multi-megabyte copy \
+         that nothing mounts"
     );
 
     let herdr_calls = std::fs::read_to_string(sb.root.join("herdr-argv.log")).unwrap_or_default();

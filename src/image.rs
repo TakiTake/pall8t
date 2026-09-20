@@ -551,6 +551,8 @@ mod tests {
             containerfile,
             watch: vec![],
             command: vec!["claude".to_string()],
+            ssh: false,
+            hardening: crate::config::Hardening::default(),
             mounts: vec![],
             warnings: vec![],
             herdr: crate::config::HerdrConfig::default(),

@@ -69,6 +69,23 @@ local review failed to catch first (source PRs noted).
   is silent exactly where a confused user looks first (a `doctor`-style
   diagnostic).
 
+**Config a repository can ship** (PR #63)
+- pall8t merges a project's `.pall8t/config.toml` over the user's global
+  one, per field. That file arrives *with the repository*, so for any new
+  setting ask: if a repo I cloned set this, what would it get? Sort the
+  setting first — does it shape what runs **inside** the sandbox (command,
+  image, mounts it needs), or does it widen what the sandbox reaches
+  **outside** itself (credentials, host sockets, bridge policy)? The first
+  is the project's business. The second must take the human's global
+  config or an explicit flag, and `project.or(global)` is the wrong
+  merge for it — `[container] ssh = true` in a cloned repo would have
+  handed that repo the user's SSH agent.
+- Narrowing is always safe to honor; widening is the direction that needs
+  an owner. A setting that can only be *turned off* by the project needs
+  no gate.
+- Refusing is half the fix: a dropped intent must still be reported, or
+  the silence hides that the repository asked at all.
+
 **Fallback to a secondary tool** (PR #50)
 - A fallback that invokes a manager/helper tool (`rustup`, `nvm`, a
   package manager) to repair the active environment must first check the
@@ -125,6 +142,21 @@ local review failed to catch first (source PRs noted).
   must fall on the keep side, the way an unreadable mtime already does.
 - The same rule scales down: any `unwrap_or(false)` on an IO probe is a
   policy decision about the failure case, so state which case it is.
+- **Probe the property you are claiming, not its cheapest proxy** (PR #63).
+  A probe answers the question it asks, and `exists()` asks about an inode,
+  not about a peer — so a socket whose agent was `SIGKILL`ed (or outlived by
+  the tmux session still exporting its path) passes an existence check and
+  refuses every connection. No reboot, no unlink, so the "stale" case the
+  warning was *written for* was the one it stayed silent on. Name the
+  property in the predicate — `agent_reachable`, not `sock_exists` — and the
+  gap gets hard to write down: `connect(2)` separates listening from dead
+  node from unlinked, where one `exists()` collapses all three. Applies to
+  any liveness claim built from a proxy: a pidfile is not a running process,
+  a port in a config is not a bound listener, a lockfile is not a held lock.
+- The tell in review is a doc/comment that claims more than the predicate
+  delivers. Read the two against each other: when the prose says "a socket
+  that died with its agent" and the code says `Path::exists`, the prose is
+  describing the intended probe and the code is the one that ships.
 
 **Interpolating into a delimited wire format** (PR #62)
 - Building `a:b`, `k=v`, `x,y` for another process? The delimiter must be
@@ -238,6 +270,35 @@ local review failed to catch first (source PRs noted).
   `~/.pall8t/repos` was called disposable in four documents while
   `prepare`'s own doc comment two lines away said an existing one is
   reused as-is.
+
+**Where a doc insert landed** (PR #68)
+- CHANGELOG entries are appended under a heading, and the heading the diff
+  found may not be the one you meant: `## [Unreleased]` here has no
+  `### Fixed`, so a fix entry drifts down to the nearest one — which
+  belongs to an already-released version. Nothing catches it: the file
+  parses, CI's release-notes guard only checks the *current* version's
+  heading exists, and the entry then never appears in the next release's
+  notes while retroactively claiming a shipped version contained the fix.
+  Read the section header above an inserted entry, not just the diff hunk.
+- Same question for any append into a structured doc (ADR lists, tables,
+  a README section): `grep -n "^## "` and check which section the new line
+  actually sits in.
+
+**Test fixtures that shell out** (PR #68)
+- A fixture that isolates the host's *config* is not isolated from the
+  host's *environment*. `GIT_DIR` outranks `git -C <fixture>`, and every
+  git hook, `git rebase --exec` and `git bisect run` exports it — so
+  `cargo test` launched from any of those runs the fixture against the
+  surrounding repository: `git init` re-initializes the outer repo, the
+  fixture gets no `.git`, and the fixture's commit lands in the
+  developer's history. Clear the whole channel (`GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`), not the one
+  variable that bit you.
+- Pin it on the *built command* rather than by exporting the variable
+  around a live run — the suite is multi-threaded and the environment is
+  process-wide. And spell the expected list out in the test: a test that
+  iterates the same constant the code does checks one thing fewer when an
+  entry is deleted, and stays green.
 
 **Tests** (standing)
 - Per docs/testing.md: new tests use table form with reasoned assertion

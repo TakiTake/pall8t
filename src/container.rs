@@ -218,6 +218,11 @@ pub struct ContainerInfo {
     /// Image reference the container was created from, when the listing
     /// carries it.
     pub image: Option<String>,
+    /// `configuration.labels` from the listing — pall8t's own provenance
+    /// for containers it started (see [`RunSpec::labels`]), empty for
+    /// anything else (or for a listing that doesn't carry them: the
+    /// schema is pre-1.0, ADR-0001).
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// All containers: `container list --all --format json`.
@@ -258,6 +263,15 @@ fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
                 .pointer("/configuration/image/reference")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let labels = item
+                .pointer("/configuration/labels")
+                .and_then(Value::as_object)
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
             if let Some(name) = name {
                 let state = if status.eq_ignore_ascii_case("running") {
                     State::Running
@@ -268,6 +282,7 @@ fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
                     name: name.to_string(),
                     state,
                     image,
+                    labels,
                 });
             }
         }
@@ -275,12 +290,28 @@ fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
     Ok(items)
 }
 
+/// Label key every `pall8t run` container carries. Its presence is what
+/// makes a container pall8t's, so the marker and the version are the same
+/// key: a container without it isn't ours, whatever it is named.
+pub const LABEL_VERSION: &str = "pall8t.version";
+
+/// Whether a listing entry is a container pall8t started.
+///
+/// The label is the answer; the `pall8t-` name prefix is a fallback for
+/// containers started by a pall8t older than labels — drop it once those
+/// can no longer be running (they are `--rm` foreground sessions, so one
+/// release is plenty). The prefix alone was never sound: any container a
+/// user names `pall8t-…` matched it.
+pub fn is_pall8t_container(c: &ContainerInfo) -> bool {
+    c.labels.contains_key(LABEL_VERSION) || c.name.starts_with("pall8t-")
+}
+
 /// Containers started by pall8t (names carry the `pall8t-` prefix, see
 /// [`run_name`]).
 pub fn list_pall8t() -> Result<Vec<ContainerInfo>> {
     Ok(list_all()?
         .into_iter()
-        .filter(|c| c.name.starts_with("pall8t-"))
+        .filter(is_pall8t_container)
         .collect())
 }
 
@@ -549,6 +580,48 @@ pub fn build_argv(
     argv
 }
 
+/// Runtime flags for one [`crate::config::Hardening`] level.
+///
+/// Verified live on apple/container 1.2.2, all four together: a write
+/// outside the mounts fails with `EROFS`, `/tmp` stays writable,
+/// `CapEff` reads `0000000000000000`, and `ulimit -n` reports the soft
+/// limit set here. The `nofile` ceiling is deliberately generous — a
+/// build with a wide dependency graph opens a lot of files, and a
+/// hardening profile that breaks builds gets switched off rather than
+/// tightened.
+fn hardening_argv(level: crate::config::Hardening) -> Vec<String> {
+    match level {
+        crate::config::Hardening::Default => Vec::new(),
+        crate::config::Hardening::Strict => vec![
+            "--cap-drop".into(),
+            "ALL".into(),
+            "--read-only".into(),
+            // A read-only root filesystem without this leaves the agent
+            // no scratch space at all, and `/tmp` is where every tool
+            // expects to find some.
+            "--tmpfs".into(),
+            "/tmp".into(),
+            "--ulimit".into(),
+            "nofile=8192:16384".into(),
+        ],
+    }
+}
+
+/// A label value apple/container will accept.
+///
+/// Its parser splits on `=` with `maxSplits: 2` and **throws** on three
+/// parts (`invalid label format`), so a value containing `=` fails the
+/// whole `container run` — verified in 1.2.2's `Parser.labels`. A project
+/// directory is free to contain one. Control characters get the same
+/// treatment for the same reason: a label is provenance, and no label is
+/// worth failing a launch over.
+fn label_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c == '=' || c.is_control() { '_' } else { c })
+        .collect()
+}
+
 /// One mount of a [`RunSpec`], rendered by [`run_argv`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
@@ -698,6 +771,20 @@ pub struct RunSpec {
     /// producer today is the herdr bridge (`HERDR_*` identity — see
     /// [`crate::herdr`]).
     pub env: Vec<(String, String)>,
+    /// `--label key=value` provenance for this container: what pall8t
+    /// knows about the run that the container itself doesn't say (see
+    /// [`crate::main`]'s `cmd_run`). Read back by `pall8t ls --json`.
+    pub labels: Vec<(String, String)>,
+    /// Runtime confinement beyond the VM boundary (see
+    /// [`crate::config::Hardening`]), rendered by [`hardening_argv`].
+    pub hardening: crate::config::Hardening,
+    /// Forward the host's SSH agent socket (`--ssh`). apple/container
+    /// takes `SSH_AUTH_SOCK` from *this* process's environment and
+    /// forwards that socket into the guest at
+    /// `/var/host-services/ssh-auth.sock`, setting the guest's own
+    /// `SSH_AUTH_SOCK` to it — so no key material crosses the boundary,
+    /// only signing requests. Opt-in per [`crate::config::ssh_enabled`].
+    pub ssh: bool,
     pub command: Vec<String>,
 }
 
@@ -710,6 +797,23 @@ pub fn run_argv(spec: &RunSpec) -> Vec<String> {
         argv.push("-t".into());
     }
     argv.extend(["--rm".into(), "--name".into(), spec.name.clone()]);
+    if spec.ssh {
+        argv.push("--ssh".into());
+    }
+    // An init process inside the container: forwards signals to the agent
+    // and reaps orphans it leaves behind — worth having wherever the
+    // agent spawns children of its own (agent teams, background shells,
+    // or tmux where a custom image still has it — the default image
+    // dropped tmux). Unconditional because it changes nothing else: verified on
+    // 1.2.2 that the agent's own exit code still comes back (`exit 42` →
+    // 42, with and without), and that pid 1 becomes the init rather than
+    // the agent.
+    argv.push("--init".into());
+    argv.extend(hardening_argv(spec.hardening));
+    for (k, v) in &spec.labels {
+        argv.push("--label".into());
+        argv.push(format!("{k}={}", label_value(v)));
+    }
     for m in &spec.mounts {
         let (flag, value) = m.spec();
         argv.push(flag.into());
@@ -1117,6 +1221,193 @@ mod tests {
     /// 1.0.0): `status` is a nested object, not a bare string. Regression
     /// test for the bug where every container was misreported `stopped`
     /// because the parser looked for a top-level string that never existed.
+    /// Captured from `container ls --format json` on 1.2.2, for a
+    /// container started with two `--label` flags: the labels come back
+    /// under `configuration.labels` as a flat string map.
+    #[test]
+    fn parse_list_all_reads_labels_and_identifies_pall8t_containers() {
+        let json = r#"[
+            {
+                "id": "pall8t-x-1",
+                "configuration": {
+                    "id": "pall8t-x-1",
+                    "labels": { "pall8t.version": "0.4.0", "pall8t.project": "/Users/me/src/x" },
+                    "image": { "reference": "pall8t-x:501-20-abc123" }
+                },
+                "status": { "state": "running", "networks": [] }
+            },
+            {
+                "id": "pall8t-lookalike",
+                "configuration": { "id": "pall8t-lookalike" },
+                "status": { "state": "running", "networks": [] }
+            },
+            {
+                "id": "someone-elses",
+                "configuration": { "id": "someone-elses", "labels": { "app": "db" } },
+                "status": { "state": "running", "networks": [] }
+            }
+        ]"#;
+        let items = parse_list_all(json).unwrap();
+        assert_eq!(
+            items[0].labels.get("pall8t.project").map(String::as_str),
+            Some("/Users/me/src/x"),
+            "labels are read from configuration.labels, where 1.2.2 puts them"
+        );
+        assert!(items[1].labels.is_empty() && items[2].labels.len() == 1);
+
+        assert!(
+            is_pall8t_container(&items[0]),
+            "the version label is what marks a container as ours"
+        );
+        assert!(
+            is_pall8t_container(&items[1]),
+            "a container from a pall8t older than labels has only its name — \
+             keep recognizing it, or `pall8t ls` loses running sessions on upgrade"
+        );
+        assert!(
+            !is_pall8t_container(&items[2]),
+            "someone else's container, whatever labels it carries, is not ours"
+        );
+    }
+
+    #[test]
+    fn label_values_cannot_break_the_run() {
+        assert_eq!(
+            label_value("/Users/me/src/x"),
+            "/Users/me/src/x",
+            "an ordinary value passes through untouched"
+        );
+        assert_eq!(
+            label_value("/Users/me/weird=dir"),
+            "/Users/me/weird_dir",
+            "1.2.2's Parser.labels throws `invalid label format` on a value \
+             containing `=`, which would fail the whole run — and a project \
+             directory is free to contain one"
+        );
+        assert_eq!(
+            label_value("tag\nnewline"),
+            "tag_newline",
+            "control characters get the same treatment: no label is worth \
+             failing a launch over"
+        );
+    }
+
+    #[test]
+    fn hardening_argv_table() {
+        assert!(
+            hardening_argv(crate::config::Hardening::Default).is_empty(),
+            "the default level must add no flags at all — it is what every \
+             release so far has run, and a silent change of confinement is \
+             exactly what an opt-in profile exists to avoid"
+        );
+        let strict = hardening_argv(crate::config::Hardening::Strict);
+        for (flag, value) in [
+            ("--cap-drop", "ALL"),
+            ("--read-only", "--tmpfs"),
+            ("--tmpfs", "/tmp"),
+        ] {
+            let at = strict
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("strict must pass {flag}: {strict:?}"));
+            assert_eq!(
+                strict.get(at + 1).map(String::as_str),
+                Some(value),
+                "{flag} must be followed by {value}"
+            );
+        }
+        assert!(
+            strict.contains(&"/tmp".to_string()),
+            "a read-only root filesystem with no tmpfs leaves the agent no \
+             scratch space, which breaks tools rather than confining them"
+        );
+        let nofile = strict
+            .iter()
+            .position(|a| a == "--ulimit")
+            .map(|i| strict[i + 1].clone())
+            .expect("strict sets a file-descriptor ceiling");
+        assert_eq!(
+            nofile, "nofile=8192:16384",
+            "the exact ceiling is the contract, not merely the `nofile=` \
+             prefix: `nofile=` and `nofile=1` both satisfy a prefix check \
+             while leaving a sandbox that cannot open files, and the \
+             generous ceiling is deliberate — a hardening profile that \
+             breaks wide builds gets switched off rather than tightened"
+        );
+    }
+
+    #[test]
+    fn every_run_gets_an_init_process() {
+        let spec = RunSpec {
+            name: "pall8t-x-abc12345-99".into(),
+            image: "img".into(),
+            workdir: PathBuf::from("/Users/me/src/x"),
+            mounts: vec![],
+            cpus: 4,
+            memory: "8g".into(),
+            uid: 501,
+            gid: 20,
+            tty: false,
+            env: vec![],
+            ssh: false,
+            labels: vec![],
+            hardening: crate::config::Hardening::Default,
+            command: vec!["claude".into()],
+        };
+        let argv = run_argv(&spec);
+        let init = argv
+            .iter()
+            .position(|a| a == "--init")
+            .expect("--init forwards signals to the agent and reaps its orphans");
+        let image_pos = argv.iter().position(|a| a == "img").unwrap();
+        assert!(init < image_pos, "flags precede the image positional");
+        assert!(
+            !argv.contains(&"--read-only".to_string()),
+            "the default hardening level must not confine anything beyond \
+             what pall8t has always done"
+        );
+    }
+
+    #[test]
+    fn labels_emit_one_flag_each() {
+        let spec = RunSpec {
+            name: "pall8t-x-abc12345-99".into(),
+            image: "img".into(),
+            workdir: PathBuf::from("/Users/me/src/x"),
+            mounts: vec![],
+            cpus: 4,
+            memory: "8g".into(),
+            uid: 501,
+            gid: 20,
+            tty: false,
+            env: vec![],
+            ssh: false,
+            labels: vec![
+                ("pall8t.version".into(), "0.4.0".into()),
+                ("pall8t.project".into(), "/Users/me/we=ird".into()),
+            ],
+            hardening: crate::config::Hardening::Default,
+            command: vec!["claude".into()],
+        };
+        let argv = run_argv(&spec);
+        let first = argv.iter().position(|a| a == "--label").unwrap();
+        assert_eq!(argv[first + 1], "pall8t.version=0.4.0");
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--label").count(),
+            2,
+            "one --label flag per entry"
+        );
+        assert!(
+            argv.contains(&"pall8t.project=/Users/me/we_ird".to_string()),
+            "the value is sanitised on the way out, not left to fail the run"
+        );
+        let image_pos = argv.iter().position(|a| a == "img").unwrap();
+        assert!(
+            first < image_pos,
+            "labels are flags and must precede the image positional"
+        );
+    }
+
     #[test]
     fn parse_list_all_reads_nested_status_state() {
         let json = r#"[
@@ -1400,6 +1691,30 @@ mod tests {
         );
     }
 
+    /// The scalar scaffolding every `run_argv` test needs and none of them
+    /// is about: a name, an image, a workdir, host ids. Tests state only
+    /// the fields they actually assert on (`..base_spec()`), the way
+    /// `run_argv_shape` already reads its no-TTY variant. Three hand-copied
+    /// literals is what made adding one field a three-site edit.
+    fn base_spec() -> RunSpec {
+        RunSpec {
+            name: "pall8t-x-abc12345-99".into(),
+            image: "img".into(),
+            workdir: PathBuf::from("/Users/me/src/x"),
+            mounts: vec![],
+            cpus: 4,
+            memory: "8g".into(),
+            uid: 501,
+            gid: 20,
+            tty: false,
+            env: vec![],
+            ssh: false,
+            labels: vec![],
+            hardening: crate::config::Hardening::Default,
+            command: vec!["claude".into()],
+        }
+    }
+
     /// The herdr bridge's socket is the one mount that must go out as
     /// `-v`: 1.2.2's `--mount` parser accepts only a directory source,
     /// while the runtime behind `-v` forwards a socket source into the
@@ -1409,9 +1724,6 @@ mod tests {
     #[test]
     fn socket_mount_goes_out_as_two_field_v() {
         let spec = RunSpec {
-            name: "pall8t-x-abc12345-99".into(),
-            image: "img".into(),
-            workdir: PathBuf::from("/Users/me/src/x"),
             mounts: vec![
                 Mount::identity(PathBuf::from("/Users/me/src/x")),
                 Mount::socket(
@@ -1420,13 +1732,7 @@ mod tests {
                 )
                 .unwrap(),
             ],
-            cpus: 4,
-            memory: "8g".into(),
-            uid: 501,
-            gid: 20,
-            tty: false,
-            env: vec![],
-            command: vec!["claude".into()],
+            ..base_spec()
         };
         let argv = run_argv(&spec);
         let v = argv
@@ -1493,11 +1799,29 @@ mod tests {
     }
 
     #[test]
+    fn ssh_forwarding_emits_the_flag() {
+        let spec = RunSpec {
+            ssh: true,
+            ..base_spec()
+        };
+        let argv = run_argv(&spec);
+        assert!(
+            argv.contains(&"--ssh".to_string()),
+            "`ssh = true` must reach the runtime as --ssh; the flag is the whole \
+             feature, and nothing else in the argv hints at it"
+        );
+        let image_pos = argv.iter().position(|a| a == "img").unwrap();
+        assert!(
+            argv.iter().position(|a| a == "--ssh").unwrap() < image_pos,
+            "flags precede the image positional, or the runtime reads --ssh as \
+             an argument to the container command"
+        );
+    }
+
+    #[test]
     fn run_argv_shape() {
         let spec = RunSpec {
-            name: "pall8t-x-abc12345-99".into(),
             image: "pall8t-x:501-20-abc123456789".into(),
-            workdir: PathBuf::from("/Users/me/src/x"),
             mounts: vec![
                 Mount::identity(PathBuf::from("/Users/me/src/x")),
                 Mount::rw(
@@ -1509,15 +1833,16 @@ mod tests {
                     PathBuf::from("/Users/me/src/lib"),
                 ),
             ],
-            cpus: 4,
-            memory: "8g".into(),
-            uid: 501,
-            gid: 20,
             tty: true,
             env: vec![("HERDR_ENV".into(), "1".into())],
-            command: vec!["claude".into()],
+            ..base_spec()
         };
         let argv = run_argv(&spec);
+        assert!(
+            !argv.contains(&"--ssh".to_string()),
+            "agent forwarding is opt-in: a run that didn't ask for it must not \
+             hand the sandbox the host's SSH agent"
+        );
         let e = argv.iter().position(|a| a == "-e").unwrap();
         assert_eq!(
             argv[e + 1],
