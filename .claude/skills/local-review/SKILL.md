@@ -271,6 +271,35 @@ local review failed to catch first (source PRs noted).
   `prepare`'s own doc comment two lines away said an existing one is
   reused as-is.
 
+**Where a doc insert landed** (PR #68)
+- CHANGELOG entries are appended under a heading, and the heading the diff
+  found may not be the one you meant: `## [Unreleased]` here has no
+  `### Fixed`, so a fix entry drifts down to the nearest one — which
+  belongs to an already-released version. Nothing catches it: the file
+  parses, CI's release-notes guard only checks the *current* version's
+  heading exists, and the entry then never appears in the next release's
+  notes while retroactively claiming a shipped version contained the fix.
+  Read the section header above an inserted entry, not just the diff hunk.
+- Same question for any append into a structured doc (ADR lists, tables,
+  a README section): `grep -n "^## "` and check which section the new line
+  actually sits in.
+
+**Test fixtures that shell out** (PR #68)
+- A fixture that isolates the host's *config* is not isolated from the
+  host's *environment*. `GIT_DIR` outranks `git -C <fixture>`, and every
+  git hook, `git rebase --exec` and `git bisect run` exports it — so
+  `cargo test` launched from any of those runs the fixture against the
+  surrounding repository: `git init` re-initializes the outer repo, the
+  fixture gets no `.git`, and the fixture's commit lands in the
+  developer's history. Clear the whole channel (`GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`), not the one
+  variable that bit you.
+- Pin it on the *built command* rather than by exporting the variable
+  around a live run — the suite is multi-threaded and the environment is
+  process-wide. And spell the expected list out in the test: a test that
+  iterates the same constant the code does checks one thing fewer when an
+  entry is deleted, and stays green.
+
 **Tests** (standing)
 - Per docs/testing.md: new tests use table form with reasoned assertion
   messages; each bug fix and each refuted review finding gets a pin;

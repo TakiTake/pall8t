@@ -175,19 +175,98 @@ mod tests {
     ///
     /// The identity the commits need is passed per-invocation by the
     /// caller, since there is no global config left to supply it.
+    ///
+    /// Config is only half of it: git also takes a *repository* from the
+    /// environment, and `GIT_DIR` outranks the `-C <dir>` above. Exported
+    /// by every git hook (`git commit` runs its hooks with it set), by
+    /// `git rebase --exec` and by `git bisect run` — so `cargo test` from
+    /// any of those would point this fixture at the surrounding
+    /// repository. Measured, not feared: with `GIT_DIR` set, `git -C
+    /// <fixture> init` re-initializes the *outer* repo, the fixture
+    /// directory is left with no `.git` at all, and the `seed` commit
+    /// below lands in the developer's own history. `GIT_WORK_TREE`,
+    /// `GIT_INDEX_FILE` and `GIT_COMMON_DIR` are the rest of that channel
+    /// and travel with it.
     fn git(dir: &Path, args: &[&str]) -> std::io::Result<bool> {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_CONFIG_PARAMETERS")
+        git_command(dir, args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
+    }
+
+    /// The command `git` runs, separated out so the isolation above is
+    /// assertable without running git at all.
+    fn git_command(dir: &Path, args: &[&str]) -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        for key in GIT_ENV_TO_CLEAR {
+            cmd.env_remove(key);
+        }
+        cmd
+    }
+
+    /// Every environment channel that can point git at a repository or a
+    /// configuration other than the fixture's own.
+    const GIT_ENV_TO_CLEAR: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ];
+
+    /// Pins the isolation itself, because its absence is invisible in a
+    /// normal run: the suite passes from a plain shell either way, and
+    /// only a `cargo test` launched with `GIT_DIR` in the environment (a
+    /// git hook, `rebase --exec`, `bisect run`) tells the difference — by
+    /// writing a commit into the surrounding repository. Asserted on the
+    /// built command rather than by exporting `GIT_DIR` around a live git
+    /// run, since the suite is multi-threaded and the environment is
+    /// process-wide.
+    #[test]
+    fn the_fixture_git_cannot_be_pointed_at_the_surrounding_repository() {
+        let cmd = git_command(Path::new("/nonexistent"), &["status"]);
+        let envs: Vec<_> = cmd.get_envs().collect();
+
+        // Spelled out here rather than iterating `GIT_ENV_TO_CLEAR`: a
+        // test that reads the same list the code does cannot notice an
+        // entry being deleted from it — it would just check one thing
+        // fewer and stay green. This list is the specification; the
+        // constant is the implementation of it.
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            assert!(
+                envs.iter()
+                    .any(|(k, v)| *k == std::ffi::OsStr::new(key) && v.is_none()),
+                "{key} must be cleared for the fixture's git: it is inherited \
+                 wherever the suite runs under git itself, and it outranks the \
+                 `-C <fixture>` this helper passes"
+            );
+        }
+
+        for (key, expected) in [
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_SYSTEM", "/dev/null"),
+        ] {
+            assert!(
+                envs.iter().any(|(k, v)| *k == std::ffi::OsStr::new(key)
+                    && *v == Some(std::ffi::OsStr::new(expected))),
+                "{key} must be sent to {expected}, or a host setting such as \
+                 `commit.gpgsign` decides whether this test passes"
+            );
+        }
     }
 
     #[test]
