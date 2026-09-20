@@ -98,3 +98,7 @@ stop there.
   `.coderabbit.yaml` — installed, but automatic review is off, so it runs
   only when someone comments `@coderabbitai review` on the PR (the free
   plan meters reviews).
+- herdr plugin (contrib): `contrib/herdr-plugin/` — sandbox status/shell/
+  rebuild/stop from a herdr pane. A thin shell over the pall8t CLI whose
+  only contract is `pall8t ls --json`; when that output shape changes, it
+  changes in the same commit.

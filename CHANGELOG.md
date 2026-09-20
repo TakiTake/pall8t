@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves its socket file behind: present to `Path::exists`, refusing every
   connection. The runtime would otherwise forward nothing silently while
   still setting `SSH_AUTH_SOCK` in the guest.
+- **A herdr plugin in `contrib/herdr-plugin/`**: sandbox status, a second
+  shell inside the pane's container, an image rebuild, and a stop —
+  driven from herdr, linked with `herdr plugin link contrib/herdr-plugin`.
+  It resolves the pane's container through the `pall8t.herdr.pane` label
+  and speaks only to the pall8t CLI, so it ships beside the `ls --json`
+  output it depends on.
 - **A drift report for the relay's herdr method classification**
   (`scripts/herdr-method-drift.py`, plus a weekly report-only workflow):
   the `READ` allowlist that decides what a sandboxed agent may call under

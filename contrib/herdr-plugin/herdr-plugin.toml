@@ -1,0 +1,49 @@
+# pall8t's herdr plugin: the sandbox controls, where the panes already are.
+#
+# Link it from a checkout (`herdr plugin link contrib/herdr-plugin`) — see
+# README.md next to this file. Everything it does goes through the pall8t
+# CLI; there is no coupling to pall8t's internals beyond `ls --json`.
+id = "pall8t.sandbox"
+name = "pall8t sandbox"
+version = "0.1.0"
+# 0.8.0 is what the actions/panes shape here was written against.
+min_herdr_version = "0.8.0"
+description = "Inspect, rebuild, enter, and stop the pall8t sandbox behind a pane"
+# pall8t is macOS/Apple-silicon only (apple/container is), so the plugin is too.
+platforms = ["macos"]
+
+# Output-producing entrypoints are panes, not actions: an action's stdout
+# lands in the plugin log, while a pane shows it to the person who asked.
+
+[[panes]]
+id = "status"
+title = "pall8t: sandbox status"
+placement = "popup"
+command = ["python3", "pall8t_plugin.py", "status"]
+
+[[panes]]
+id = "shell"
+title = "pall8t: shell in the sandbox"
+placement = "overlay"
+command = ["python3", "pall8t_plugin.py", "shell"]
+
+[[panes]]
+id = "rebuild"
+title = "pall8t: rebuild the image"
+placement = "popup"
+command = ["python3", "pall8t_plugin.py", "rebuild"]
+
+[[panes]]
+id = "rebuild-no-cache"
+title = "pall8t: rebuild the image (no cache)"
+placement = "popup"
+command = ["python3", "pall8t_plugin.py", "rebuild", "--no-cache"]
+
+# Stopping is the one entrypoint with nothing to show, so it stays an
+# action: it prints one line to the plugin log and gets out of the way.
+[[actions]]
+id = "stop"
+title = "pall8t: stop the sandbox"
+description = "Stop the container behind this pane (the agent's session ends)"
+contexts = ["pane"]
+command = ["python3", "pall8t_plugin.py", "stop"]
