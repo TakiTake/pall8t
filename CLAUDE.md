@@ -88,7 +88,11 @@ stop there.
   duplication/unused-deps (`hygiene.yml`) stay **report-only** — weekly,
   on each PR for hygiene, plus on-demand via `gh workflow run <name>`;
   gating a whole-tree backlog teaches reflexive ignoring, while the
-  in-diff gate has no backlog to inherit.
+  in-diff gate has no backlog to inherit. herdr API-method drift
+  (`herdr-drift.yml`, running `scripts/herdr-method-drift.py` against the
+  latest herdr release) is report-only for a different reason: what the
+  relay classifies as a read is a human decision, and herdr's schema is
+  not a complete inventory of what it serves.
 - Review automation: Codex PR review (`codex-review.yml`) stays dormant
   until an `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
   `.coderabbit.yaml` — installed, but automatic review is off, so it runs
