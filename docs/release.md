@@ -19,7 +19,5 @@ vs. user), run `/release` — see [`.claude/skills/release/SKILL.md`](../.claude
    Release with notes pulled from the matching `CHANGELOG.md` section.
 5. Update the formula in [TakiTake/homebrew-tap](https://github.com/TakiTake/homebrew-tap)
    with the new `url` and the `sha256` from the published `.sha256` file, then
-   commit and push the tap. (First release only: the tap repo and its initial
-   `Formula/pall8t.rb` don't exist yet and need to be created, not just
-   updated — until that's done, `brew install TakiTake/tap/pall8t` in the
-   README won't resolve.)
+   commit and push the tap. Pushes to the tap are gated to the user, like
+   the tag push.
