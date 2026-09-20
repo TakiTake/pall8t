@@ -26,12 +26,24 @@ def fail(message: str) -> int:
     return 1
 
 
-def containers() -> list[dict]:
-    pall8t = shutil.which("pall8t")
-    if pall8t is None:
+def pall8t_bin() -> str:
+    """The pall8t to drive, resolved once.
+
+    Every invocation goes through this rather than the bare name: the
+    rebuild below runs with `cwd` set to the project, and a PATH carrying
+    a relative entry would resolve a bare `pall8t` differently there.
+    Resolving here also means one legible error instead of a
+    `FileNotFoundError` traceback in the pane.
+    """
+    found = shutil.which("pall8t")
+    if found is None:
         raise LookupError("pall8t is not on PATH")
+    return found
+
+
+def containers() -> list[dict]:
     out = subprocess.run(
-        [pall8t, "ls", "--json"], capture_output=True, text=True, check=True
+        [pall8t_bin(), "ls", "--json"], capture_output=True, text=True, check=True
     ).stdout
     return json.loads(out or "[]")
 
@@ -98,13 +110,22 @@ def cmd_shell(_args: list[str]) -> int:
     mine = pick(containers())
     name = mine["name"]
     print(f"pall8t exec {name} — the agent keeps running; this is a second shell.\n")
-    # bash first, sh as the fallback: the default image has bash, a
-    # minimal custom one may not.
-    for shell in ("bash", "sh"):
-        code = subprocess.run(["pall8t", "exec", name, "--", shell]).returncode
-        if code != 127:
-            return code
-    return fail(f"no bash or sh inside {name}")
+    # bash when the image has it, sh otherwise — decided *inside* the
+    # container, in one invocation.
+    #
+    # Not two invocations keyed on 127: a shell exits with the status of
+    # its last command, so a session whose last line was a typo exits 127
+    # too. That reading would hand someone a second shell instead of
+    # their prompt back, and on the second typo report "no bash or sh
+    # inside <container>" about an image that has both. An image with
+    # neither is left to the runtime's own "not found" on stderr, which
+    # says more than a guess from an exit code can.
+    return subprocess.run(
+        [
+            pall8t_bin(), "exec", name, "--",
+            "sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh",
+        ]
+    ).returncode
 
 
 def cmd_rebuild(args: list[str]) -> int:
@@ -115,17 +136,24 @@ def cmd_rebuild(args: list[str]) -> int:
     print(f"pall8t build in {project}\n")
     # The build applies to the *next* run: the container in front of you
     # keeps the image it booted, which is the point of an explicit rebuild.
-    code = subprocess.run(["pall8t", "build", *args], cwd=project).returncode
+    code = subprocess.run([pall8t_bin(), "build", *args], cwd=project).returncode
     print("\n(the running sandbox keeps its current image; the next "
           "`pall8t run` picks this one up)")
-    input("press enter to close ")
+    # The popup would close on the last line of build output without
+    # this. Guarded because the entrypoint is only *usually* a pane: run
+    # by hand with stdin closed, `input` raises rather than waiting, and
+    # a rebuild that worked should not end in a traceback.
+    try:
+        input("press enter to close ")
+    except EOFError:
+        pass
     return code
 
 
 def cmd_stop(_args: list[str]) -> int:
     mine = pick(containers())
     name = mine["name"]
-    return subprocess.run(["pall8t", "stop", name]).returncode
+    return subprocess.run([pall8t_bin(), "stop", name]).returncode
 
 
 COMMANDS = {
