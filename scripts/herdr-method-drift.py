@@ -24,10 +24,16 @@ Inventory source: `herdr api schema --json`, whose `schemas.request.oneOf`
 carries one entry per method. Pass --schema to read a saved copy instead.
 
 Caveat the report repeats: the schema is not the whole inventory. herdr
-0.8's `pane.graphics.stream` is documented and served, yet absent from
-the schema (it hijacks the connection rather than answering in the
-request/response shape). So "absent from the schema" is a prompt to go
-look, never a licence to delete a READ entry.
+0.9.1 serves 108 methods and publishes 103 — the five missing ones are
+the `pane.graphics.stream*` family, which needs the streaming socket
+transport rather than the request/response shape this schema describes.
+So "absent from the schema" is a prompt to go look, never a licence to
+delete a READ entry.
+
+The other half of the same caution: a method's *name* does not classify
+it. `pane.selection.read` is genuinely a read, and `pane.edit_scrollback`
+spawns an editor on the host. The list below is a worklist to read
+handlers against, not an answer.
 """
 
 import argparse
