@@ -93,6 +93,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   built them — checked before removal, since that is the usual reason a
   stray artifact matters.
 
+- **An unrecognized `container list` schema no longer reads as "no
+  containers".** `parse_list_all` accepted any JSON that was not an array
+  as an empty inventory, and silently dropped entries carrying no
+  identifier. That answer is what authorizes deletion: `pall8t build`
+  skips pruning superseded images when the in-use set is *unknown*, but a
+  schema that moved to, say, `{"containers": […]}` produced a confident
+  empty list instead — pruning images that running containers still used,
+  while reporting that it had checked. The listing schema is pre-1.0
+  (ADR-0001), so this is a version away rather than hypothetical. Both
+  cases are now errors that name what arrived (issue #84; the sibling
+  half, the per-run herdr binary sweep, went with the per-run copy in
+  0.7.0's read-only cache mount).
+- **A state file from a newer pall8t is left alone even when its body is
+  unreadable.** The downgrade guard decided the schema version *after*
+  deserializing the whole file as today's shape, so it only protected a
+  newer file that still happened to fit — a v2 that renamed a field or
+  changed a type fell through to "not readable, start over" and the next
+  run overwrote a file the newer binary was still using. The version now
+  comes from a `{"version": …}` envelope read before the body (issue #89).
+  A file that fails even at the envelope is still a legitimate reset, and
+  still says so.
+
 - **Four pure-inspection herdr methods were denied under
   `[herdr] sandbox = "readonly"`.** The relay's `READ` allowlist was last
   reconciled against herdr 0.8, and 0.9.1 (protocol 22) is what a user
