@@ -62,6 +62,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A project's `.pall8t/config.toml` can no longer widen `[herdr] sandbox`.**
+  It merged per field with the project winning, so a cloned repository
+  carrying `sandbox = "full"` overrode a user who had globally chosen
+  `"readonly"` or `"off"` — and `full` is the mode whose panes and agents
+  run on the host, outside the sandbox. A project may now only narrow the
+  bridge (`full` → `readonly` → `off`), and one that asked to widen is
+  named on stderr rather than quietly dropped. Same rule, and the same
+  reasoning, as the `ssh` fix below: a project config shapes what runs
+  *inside* the box, never what the box reaches outside itself. The
+  `[[mounts]]` half of that question is deliberately left open (issue
+  #95) — mounting host paths is the feature's whole point, so the answer
+  there is not the same rule.
+
 - **A project's `.pall8t/config.toml` can no longer switch SSH forwarding
   on** — only your own `~/.pall8t/config.toml` or `pall8t run --ssh` can.
   A project config ships with the repository, so honoring `ssh = true`
