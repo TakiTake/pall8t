@@ -536,6 +536,57 @@ fn a_config_still_using_repos_is_an_error_naming_its_replacement() {
 }
 
 #[test]
+/// A mount the run will refuse costs a message, not a container build.
+/// Asserted with no `container` on PATH: the run has to fail on the mount
+/// and never reach the runtime check, so reading the *runtime's* absence
+/// in the error would mean validation had happened too late (issue #90).
+///
+/// Three shapes, because "validated before the build" has to hold for the
+/// whole check and not just the first one that happens to run early.
+fn a_bad_mount_is_refused_before_the_runtime_is_ever_started() {
+    for (label, entry, needle) in [
+        (
+            "a target that is not absolute",
+            "target = \"notes\"",
+            "absolute container path",
+        ),
+        (
+            "a target that walks upward",
+            "target = \"/home/../home/dev\"",
+            "may not contain `..`",
+        ),
+        (
+            "a target carrying the runtime's own field separator",
+            "target = \"/opt/ref,lib\"",
+            "may not contain `,`",
+        ),
+    ] {
+        let sb = Sandbox::new("mount-before-build");
+        let src = sb.home().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        sb.write_global_config(&format!(
+            "[[mounts]]\nsource = \"{}\"\n{entry}\n",
+            src.display()
+        ));
+
+        let out = sb.run(&["run"]);
+        let err = stderr(&out);
+
+        assert!(!out.status.success(), "{label} must fail the run");
+        assert!(
+            err.contains(needle),
+            "{label}: the run must say what is wrong with the mount: {err}"
+        );
+        assert!(
+            !err.contains("github.com/apple/container"),
+            "{label}: and must not have reached the runtime check — being \
+             told to install apple/container first means the mount was \
+             validated after the build would have run: {err}"
+        );
+    }
+}
+
+#[test]
 fn a_config_problem_is_reported_even_without_the_container_runtime() {
     let sb = Sandbox::new("cfg-before-cli");
     sb.write_global_config("[[repos]]\nsource = \"~/src/lib\"\n");
@@ -2087,6 +2138,33 @@ fn a_run_that_names_nothing_burns_no_number() {
 /// A state file from a newer pall8t is left exactly as it was. A rollback,
 /// or two builds sharing one `$HOME`, must not have their numbering
 /// silently rewritten by whichever binary ran last.
+#[test]
+/// The same protection, for the newer file that today's `State` cannot
+/// deserialize at all — a v2 that renamed its map rather than adding a
+/// field. That is the case the version check used to miss: it decided the
+/// version *after* deserializing, so this file fell through to "start
+/// over" and the run overwrote a file another binary was still using
+/// (issue #89).
+fn a_newer_state_file_is_kept_even_when_this_version_cannot_read_its_body() {
+    let world = naming_world("run-naming-future-shape");
+    let future = r#"{"version":2,"panes":{"w13:t2":{"n":7}}}"#;
+    world.seed_state(future);
+    world.set_tabs(&tab_list_with_label("1"));
+    let err = world.run("w13:t2");
+
+    assert!(
+        err.contains("written by a newer pall8t (format 2)"),
+        "the run must recognize the format from the envelope alone, not \
+         from having understood the body: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(world.state_path()).unwrap(),
+        future,
+        "and leave it byte for byte — a body we cannot parse is the \
+         strongest reason to keep our hands off, not the weakest"
+    );
+}
+
 #[test]
 fn a_state_file_from_a_newer_pall8t_is_never_clobbered() {
     let world = naming_world("run-naming-future");

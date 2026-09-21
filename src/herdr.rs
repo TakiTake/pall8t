@@ -269,7 +269,7 @@ pub fn prepare_bridge(
         // outright, which is strictly stronger than a private copy — a
         // sandbox can no longer corrupt even its own CLI — and drops a
         // multi-megabyte copy from every launch.
-        Ok(dir) => mounts.push(crate::container::Mount::ro(dir, CONTAINER_BIN_DIR.into())),
+        Ok(dir) => mounts.push(crate::container::Mount::ro(dir, CONTAINER_BIN_DIR.into())?),
         // Env + relay still work without the CLI (raw socket clients, e.g.
         // herdr's own agent-state integration hooks) — degrade, don't fail.
         Err(e) => eprintln!(
@@ -326,6 +326,51 @@ pub fn wrap_command_for_bridge(command: Vec<String>) -> Vec<String> {
 /// readiness line, and `container run` needs the socket to exist before
 /// it can take it as a mount source. The child outlives the coming exec
 /// and watches its parent to exit with the session.
+/// Long enough for a ~40MB binary on a slow link, and a bound rather than
+/// a hope: the stall cases are handled by curl's own speed floor below,
+/// so this only catches a curl that has stopped being curl.
+const DOWNLOAD_LIMIT: std::time::Duration = std::time::Duration::from_mins(10);
+
+/// Asking a local binary its version is a millisecond of work. Seconds of
+/// grace, then it is wedged.
+const VERSION_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the relay gets to say which socket it bound before the run
+/// gives up on the bridge and carries on without it.
+const RELAY_READY_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The curl invocation, as a seam so its bounds are assertable without a
+/// network.
+///
+/// `--connect-timeout` is the one that matters most: a connection that
+/// never completes is the common hang, and `--retry` multiplies rather
+/// than bounds it. `--speed-limit`/`--speed-time` end a transfer that has
+/// stalled without ending one that is merely slow — a plain `--max-time`
+/// would have to choose between killing a legitimate slow download and
+/// allowing a dead one. `--retry-max-time` bounds the retry loop as a
+/// whole, which is what `--retry 2` on its own does not.
+fn download_argv(tmp: &std::path::Path, url: &str) -> Vec<String> {
+    [
+        "-fsSL",
+        "--connect-timeout",
+        "15",
+        "--speed-limit",
+        "1024",
+        "--speed-time",
+        "30",
+        "--retry",
+        "2",
+        "--retry-max-time",
+        "300",
+        "-o",
+        &tmp.to_string_lossy(),
+        url,
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
 fn spawn_relay(
     socket: &str,
     container_name: &str,
@@ -358,10 +403,35 @@ fn spawn_relay(
         .spawn()
         .context("cannot spawn the herdr relay")?;
     let stdout = child.stdout.take().context("relay stdout not piped")?;
-    let mut line = String::new();
-    std::io::BufReader::new(stdout)
-        .read_line(&mut line)
-        .context("cannot read the relay readiness line")?;
+    // Read the readiness line on a thread, under a deadline. The blocking
+    // read was the last unbounded wait on the launch path: our own relay,
+    // but "our own" is not a bound — a child stuck between spawning and
+    // binding would hold the run open forever, and the bridge's whole
+    // contract is that it degrades to no bridge with a warning.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let read = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(read.map(|_| line));
+    });
+    let line = match rx.recv_timeout(RELAY_READY_LIMIT) {
+        Ok(Ok(line)) => line,
+        Ok(Err(e)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow::Error::new(e).context("cannot read the relay readiness line"));
+        }
+        Err(_) => {
+            // Still running, still silent. Stop it rather than leave a
+            // policy-checked socket served for the session with no reader.
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "the herdr relay did not report a bound socket within {}s",
+                RELAY_READY_LIMIT.as_secs()
+            );
+        }
+    };
     if line.trim().is_empty() {
         // No line at all: the relay exited before binding (its own error
         // went to its stderr, which is dropped — this is the pall8t-side
@@ -389,7 +459,11 @@ fn spawn_relay(
 /// call in the crate; `herdr --version` exits 0, and a nonzero exit
 /// wouldn't yield a `parse_herdr_version`-acceptable token anyway.
 pub fn host_herdr_version(bin: &str) -> Option<String> {
-    let out = crate::util::run_ok(bin, &["--version".to_string()]).ok()?;
+    // The user's own binary, on the launch path, asked only what version
+    // it is: bounded because a herdr that hangs here would hang the run
+    // it is merely being consulted about. Failure is already a `None`
+    // this caller handles.
+    let out = crate::util::run_ok_timeout(bin, &["--version".to_string()], VERSION_LIMIT).ok()?;
     parse_herdr_version(&out)
 }
 
@@ -479,18 +553,8 @@ fn ensure_linux_herdr(host_bin: &str) -> Result<std::path::PathBuf> {
     eprintln!("pall8t: downloading {asset} v{version} for the sandbox…");
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!(".herdr.partial.{}", std::process::id()));
-    crate::util::run_ok(
-        "curl",
-        &[
-            "-fsSL".to_string(),
-            "--retry".to_string(),
-            "2".to_string(),
-            "-o".to_string(),
-            tmp.to_string_lossy().into_owned(),
-            url.clone(),
-        ],
-    )
-    .with_context(|| format!("download failed: {url}"))?;
+    crate::util::run_ok_timeout("curl", &download_argv(&tmp, &url), DOWNLOAD_LIMIT)
+        .with_context(|| format!("download failed: {url}"))?;
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
@@ -676,6 +740,40 @@ mod tests {
         assert!(
             BOOTSTRAP.contains("/opt/pall8t/bin") && BOOTSTRAP.trim().ends_with("exec \"$@\""),
             "what remains is the PATH prepend and the exec into the real command"
+        );
+    }
+
+    #[test]
+    /// The download's bounds, asserted on the argv because the thing they
+    /// guard — a stalled connection to github.com — is not something a
+    /// test should reproduce. Each flag is here for a failure the others
+    /// do not cover, so each is named.
+    fn download_argv_is_bounded_on_every_axis_that_can_hang() {
+        let argv = download_argv(
+            std::path::Path::new("/tmp/x.partial"),
+            "https://example/herdr",
+        );
+        let has = |flag: &str| argv.iter().any(|a| a == flag);
+
+        assert!(
+            has("--connect-timeout"),
+            "a connection that never completes is the common hang, and \
+             `--retry` multiplies it rather than bounding it: {argv:?}"
+        );
+        assert!(
+            has("--speed-limit") && has("--speed-time"),
+            "a transfer that stalled mid-download looks identical to a slow \
+             one to a plain deadline; a speed floor ends the first without \
+             killing the second: {argv:?}"
+        );
+        assert!(
+            has("--retry-max-time"),
+            "`--retry 2` bounds the number of attempts, not the time they \
+             take together: {argv:?}"
+        );
+        assert!(
+            argv.last().is_some_and(|a| a == "https://example/herdr"),
+            "and the URL stays last, after the flags: {argv:?}"
         );
     }
 

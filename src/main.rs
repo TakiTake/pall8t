@@ -207,15 +207,35 @@ fn workspace_image(
     u32,
     image::ResolvedImage,
 )> {
+    let (cwd, cfg) = workspace_config()?;
+    let (uid, gid, resolved) = build_image(&cwd, &cfg, mode)?;
+    Ok((cwd, cfg, uid, gid, resolved))
+}
+
+/// The half of the preamble that touches nothing outside this machine's
+/// filesystem: where we are, and what the config says. Split out so a
+/// launch can be *planned* — and rejected — before [`build_image`] starts
+/// the runtime and builds anything (issue #90).
+fn workspace_config() -> Result<(std::path::PathBuf, config::Config)> {
     let cwd = std::env::current_dir()?
         .canonicalize()
         .context("cannot resolve the current directory")?;
     let cfg = config::load(&cwd)?;
     warn_config_issues(&cfg);
+    Ok((cwd, cfg))
+}
+
+/// The expensive half: runtime up, host ids, image resolved (and built if
+/// missing/forced).
+fn build_image(
+    cwd: &Path,
+    cfg: &config::Config,
+    mode: image::BuildMode,
+) -> Result<(u32, u32, image::ResolvedImage)> {
     ensure_container_system()?;
     let (uid, gid) = container::host_ids();
-    let resolved = image::ensure_built(&cwd, &cfg, uid, gid, mode)?;
-    Ok((cwd, cfg, uid, gid, resolved))
+    let resolved = image::ensure_built(cwd, cfg, uid, gid, mode)?;
+    Ok((uid, gid, resolved))
 }
 
 /// Surfaces settings the loaded config still declares but pall8t no longer
@@ -308,22 +328,10 @@ fn herdr_labels(env: &herdr::HerdrEnv, sandbox: config::HerdrSandbox) -> Vec<(St
 }
 
 fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<bool>) -> Result<()> {
-    let (cwd, cfg, uid, gid, resolved) = workspace_image(image::BuildMode::IfMissing)?;
-    // Everything between here and the exec below — mounts, worktree
-    // detection, tab naming, the herdr bridge and its possible download —
-    // happens with no container yet existing for this run, so nothing in
-    // `container list` speaks for the image it is about to launch. The
-    // reservation does, until it does (issue #88). Best-effort: a hint we
-    // could not write is a warning, not a failed run.
-    if let Err(e) = image::reserve_tag(&resolved.tag) {
-        eprintln!(
-            "pall8t: warning: could not reserve {} ({e:#})",
-            resolved.tag
-        );
-    }
+    let (cwd, cfg) = workspace_config()?;
     let run_name = container::run_name(&cwd);
 
-    let mut mounts = vec![container::Mount::identity(cwd.clone())];
+    let mut mounts = vec![container::Mount::identity(cwd.clone())?];
     // One probe, two consumers: the mount below and the provenance label.
     let main_git_dir = worktree::main_git_dir(&cwd);
     if let Some(git_dir) = main_git_dir.clone() {
@@ -331,7 +339,7 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
             "pall8t: git worktree detected — also mounting {}",
             git_dir.display()
         );
-        mounts.push(container::Mount::identity(git_dir));
+        mounts.push(container::Mount::identity(git_dir)?);
     }
     let home_dest = PathBuf::from("/home/dev");
     // Container-side paths this run is built on, which no configured mount
@@ -348,7 +356,33 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
         eprintln!("pall8t: {}", mounts::describe(&m));
         mounts.push(m);
     }
-    mounts.push(container::Mount::rw(container::home_mount()?, home_dest));
+    mounts.push(container::Mount::rw(container::home_mount()?, home_dest)?);
+
+    // Everything above is decidable from the config and this filesystem,
+    // and every way it can fail is the user's to fix before anything is
+    // built: a target that is not absolute, one that walks upward or
+    // overlaps a protected path, a source that does not exist or is not a
+    // directory, a comma in either. Only now does the runtime start and
+    // the image build, so a typo in `[[mounts]]` costs a message instead
+    // of a container build (issue #90). This extends the reason config
+    // load already precedes the container check — a problem the user can
+    // fix should not require a working `container` first — rather than
+    // contradicting it.
+    let (uid, gid, resolved) = build_image(&cwd, &cfg, image::BuildMode::IfMissing)?;
+    // From here to the exec below, this run has an image and no container:
+    // tab naming and the herdr bridge still come, and a first bridged run
+    // downloads a herdr release in between. Nothing in `container list`
+    // speaks for the image through that window — the reservation does
+    // (issue #88). Mount planning used to sit in this window too; it now
+    // runs before the build (issue #90), which shortens the exposure
+    // without closing it. Best-effort: a hint we could not write is a
+    // warning, not a failed run.
+    if let Err(e) = image::reserve_tag(&resolved.tag) {
+        eprintln!(
+            "pall8t: warning: could not reserve {} ({e:#})",
+            resolved.tag
+        );
+    }
     // A mount's own directory inode arrives inside the container owned by
     // root rather than the host user — the workspace included, not just
     // read-only reference mounts — so git refuses `status`/`log` there

@@ -62,6 +62,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A sandboxed agent could grow the host relay without bound.** The
+  relay spawned a thread per connection with no cap, put no deadline on
+  the first request line, and — the concrete leak — never let go when
+  herdr closed first: the foreground copy ended on upstream's EOF, only
+  the write half of the client socket was shut down, and the thread
+  pumping client→upstream stayed parked reading from a client that need
+  never close, with `join` waiting on it. A guest that opened connections,
+  sent one line each and then stopped talking held two threads and two
+  descriptors per connection **in the host process**, which the sandbox's
+  VM limits do not cover — the class of thing the relay exists to
+  constrain. Connections are now capped (64, refused with a distinct
+  `sandbox_relay_busy` reply and an audit line rather than queued), the
+  first request line carries a deadline, and upstream EOF tears down both
+  directions. The deadline covers only the first line: an established
+  `events.subscribe` may sit silent for hours, and a blanket idle timeout
+  would cut exactly the streaming the bridge exists to carry (issue #85).
+
+- **A project's `.pall8t/config.toml` can no longer widen `[herdr] sandbox`.**
+  It merged per field with the project winning, so a cloned repository
+  carrying `sandbox = "full"` overrode a user who had globally chosen
+  `"readonly"` or `"off"` — and `full` is the mode whose panes and agents
+  run on the host, outside the sandbox. A project may now only narrow the
+  bridge (`full` → `readonly` → `off`), and one that asked to widen is
+  named on stderr rather than quietly dropped. Same rule, and the same
+  reasoning, as the `ssh` fix below: a project config shapes what runs
+  *inside* the box, never what the box reaches outside itself. The
+  `[[mounts]]` half of that question is deliberately left open (issue
+  #95) — mounting host paths is the feature's whole point, so the answer
+  there is not the same rule.
+
 - **A project's `.pall8t/config.toml` can no longer switch SSH forwarding
   on** — only your own `~/.pall8t/config.toml` or `pall8t run --ssh` can.
   A project config ships with the repository, so honoring `ssh = true`
@@ -107,6 +137,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and reservations age out after five minutes — the same grace the relay's
   socket sweep uses (issue #88).
 
+- **A wedged subprocess can no longer hold a launch open forever.** Three
+  waits on the launch path had no bound: the `curl` that fetches the Linux
+  herdr CLI (whose `--retry 2` multiplied a stalled connection rather than
+  bounding it), asking the host's own `herdr` its version, and the read of
+  the relay's readiness line. All three are best-effort — the bridge is
+  documented as degrading to "no bridge" with a warning — so hanging was
+  strictly worse than failing: the user got no sandbox at all instead of a
+  sandbox without the bridge. `curl` now carries a connect timeout, a
+  stall floor (`--speed-limit`/`--speed-time`, which ends a dead transfer
+  without killing a slow one) and a bound on the retry loop as a whole;
+  the other two run under a deadline that kills and reaps the child
+  (issue #86).
+
+- **A mounted path carrying the runtime's own field separator no longer
+  reparses.** A directory mount goes out as
+  `--mount type=virtiofs,source=…,target=…[,ro]`, and nothing rejected a
+  comma in either path — so a path containing one split into what the
+  runtime reads as a further option, in the list where `ro` decides
+  whether the sandbox can write. `Mount::socket` had refused `:` for this
+  reason since it was written; the directory constructor now refuses `,`
+  the same way. A `..` component in a mount *target* is refused too,
+  rather than normalized: a target is resolved inside the container and
+  never here, and `/home/../home/dev` would otherwise pass the lexical
+  check that keeps a configured mount off the container home and land on
+  it anyway (issue #87).
+- **A bad `[[mounts]]` entry is refused before anything is built.** The
+  runtime was started and the image built or pruned before any configured
+  mount was looked at, so a typo in a target cost a full container build
+  and then a refusal. Mount planning — targets, overlaps, sources — now
+  runs first, extending the reason config load already precedes the
+  runtime check: a problem the user can fix should not need a working
+  `container` first (issue #90).
+
+- **An unrecognized `container list` schema no longer reads as "no
+  containers".** `parse_list_all` accepted any JSON that was not an array
+  as an empty inventory, and silently dropped entries carrying no
+  identifier. That answer is what authorizes deletion: `pall8t build`
+  skips pruning superseded images when the in-use set is *unknown*, but a
+  schema that moved to, say, `{"containers": […]}` produced a confident
+  empty list instead — pruning images that running containers still used,
+  while reporting that it had checked. The listing schema is pre-1.0
+  (ADR-0001), so this is a version away rather than hypothetical. Both
+  cases are now errors that name what arrived (issue #84; the sibling
+  half, the per-run herdr binary sweep, went with the per-run copy in
+  0.7.0's read-only cache mount).
+- **A state file from a newer pall8t is left alone even when its body is
+  unreadable.** The downgrade guard decided the schema version *after*
+  deserializing the whole file as today's shape, so it only protected a
+  newer file that still happened to fit — a v2 that renamed a field or
+  changed a type fell through to "not readable, start over" and the next
+  run overwrote a file the newer binary was still using. The version now
+  comes from a `{"version": …}` envelope read before the body (issue #89).
+  A file that fails even at the envelope is still a legitimate reset, and
+  still says so.
+
 - **Four pure-inspection herdr methods were denied under
   `[herdr] sandbox = "readonly"`.** The relay's `READ` allowlist was last
   reconciled against herdr 0.8, and 0.9.1 (protocol 22) is what a user
@@ -144,6 +229,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool list to do it.
 
 ### Development
+
+- **CI, release and the dev shell now build with the same compiler.**
+  `flake.nix` pinned Rust 1.96.0 while every workflow installed a moving
+  `stable` (1.98.1 at the time of writing), so the compiler that gated a
+  change was never the one that produced it, and the released binary was
+  built by a third. Every workflow now reads the pin from the flake via
+  `scripts/rust-version.sh` — one implementation, the way
+  `release-notes.sh` is — and it fails loudly if the flake ever changes
+  shape, rather than silently falling back to whatever `stable` is that
+  day. A report-only `stable-canary` job says what a newer compiler
+  thinks without letting it redden the build (issue #91).
 
 - **The `/release` skill's review step named a skill that doesn't exist.**
   Step 1 told the agent to run `/code-review` and `/skeptical-review` "until

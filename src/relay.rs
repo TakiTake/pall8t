@@ -180,6 +180,51 @@ pub fn allowed(mode: Mode, method: &str) -> bool {
 /// herdr-shaped error reply for a denied request, so the in-container CLI
 /// renders a real error instead of hanging or crashing:
 /// `{"id":…,"error":{"code":"sandbox_denied","message":…}}`.
+/// How many connections the relay serves at once.
+///
+/// The relay is one sandbox's bridge, and herdr's own CLI opens one
+/// connection per command plus one per live subscription — so tens is
+/// generous and hundreds means something is wrong on the guest side.
+/// The number matters less than there being one: without a cap, a client
+/// that opens connections and never closes them grows host threads and
+/// descriptors without bound, in a process the sandbox's VM limits do
+/// not cover (issue #85).
+const MAX_CONNECTIONS: usize = 64;
+
+/// How long a connection has to produce its first request line.
+///
+/// Deliberately *only* the first line. A connection that has not sent one
+/// is not yet doing anything legitimate, so waiting on it forever is pure
+/// exposure — while an established connection may sit silent for a long
+/// time on purpose (`events.subscribe`), which is why the deadline is
+/// cleared the moment the request is forwarded rather than applied to the
+/// conversation.
+///
+/// Passed down to [`serve`] as an argument rather than read there, so the
+/// tests that prove both halves — a first line that never comes is cut, an
+/// established connection idling past the deadline is not — can drive it in
+/// milliseconds instead of adding half a minute of sleeping to every run.
+const FIRST_LINE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The reply to a connection refused because [`MAX_CONNECTIONS`] are
+/// already in flight. Herdr-shaped like [`deny_response`], and a distinct
+/// code from `sandbox_denied`: policy said no is a different fact from
+/// the relay being full, and an agent that cannot tell them apart will
+/// retry the wrong one.
+fn busy_response(cap: usize) -> String {
+    serde_json::json!({
+        "id": serde_json::Value::Null,
+        "error": {
+            "code": "sandbox_relay_busy",
+            "message": format!(
+                "pall8t is already serving {cap} herdr connections for this \
+                 sandbox; close some and retry"
+            )
+        }
+    })
+    .to_string()
+}
+
 fn deny_response(id: &str, method: &str, mode: Mode) -> String {
     let msg = format!(
         "pall8t blocked `{method}` from the sandbox ([herdr] sandbox = \
@@ -467,21 +512,94 @@ pub fn run(socket: &Path, listen: &Path, mode: Mode, log_path: &Path) -> Result<
             "socket": socket.display().to_string(),
         }),
     );
-    serve(&listener, socket, mode, log_path);
+    serve(&listener, socket, mode, log_path, Limits::default());
     Ok(())
 }
 
 /// Accept loop, factored from [`run`] so tests can drive it on a listener
 /// they control.
-fn serve(listener: &UnixListener, socket: &Path, mode: Mode, log_path: &Path) {
+/// Whether a connection arriving while `before` are already being served
+/// fits under `cap`.
+///
+/// One line, extracted because the off-by-one is the whole content: the
+/// arriving connection is not counted in `before` yet, so it fits only
+/// while `before` is strictly under the cap. A cap off by one either way
+/// is invisible to a test that merely opens connections until one is
+/// refused — it refuses, just one connection later — and mutation testing
+/// found exactly that hole in the first version of this arithmetic.
+fn admits(before: usize, cap: usize) -> bool {
+    before < cap
+}
+
+/// Holds one of the [`MAX_CONNECTIONS`] slots for as long as it lives.
+///
+/// A guard rather than a decrement at the end of `handle`, because the
+/// count has to come back down on *every* exit — an error return, a
+/// panic in a serving thread — and a leaked slot is permanent: the cap
+/// would ratchet down until the relay refused everything.
+struct Slot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What bounds a relay's resource use. Passed in rather than read from
+/// the constants, so the tests that prove each bound can drive it small:
+/// a cap of 2 and a deadline in milliseconds exercise the same code the
+/// shipped 64 and 30s do, in a suite that stays fast enough to run.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    first_line: std::time::Duration,
+    max_connections: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            first_line: FIRST_LINE_DEADLINE,
+            max_connections: MAX_CONNECTIONS,
+        }
+    }
+}
+
+fn serve(listener: &UnixListener, socket: &Path, mode: Mode, log_path: &Path, limits: Limits) {
     let socket: Arc<Path> = Arc::from(socket);
     let log_path: Arc<Path> = Arc::from(log_path);
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for conn in listener.incoming() {
-        let Ok(conn) = conn else { continue };
+        let Ok(mut conn) = conn else { continue };
+        // Claim first, then check: two accepts racing must not both see
+        // room for the last slot. The guard exists from here on, so every
+        // path below releases it.
+        let before = live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let slot = Slot(Arc::clone(&live));
+        if !admits(before, limits.max_connections) {
+            // Audited before the reply, like every other decision here:
+            // the log is the record of what the relay did, and writing it
+            // after the client has already been told leaves a window where
+            // the guest knows something the host has not recorded.
+            audit(
+                &log_path,
+                &serde_json::json!({
+                    "ts": epoch_secs(), "event": "busy",
+                    "live": before, "cap": limits.max_connections,
+                }),
+            );
+            // Refused now, not queued into a thread that would be part of
+            // the problem. The client gets a reply rather than a silent
+            // close, so a full relay is diagnosable from the guest.
+            let _ = conn.write_all(busy_response(limits.max_connections).as_bytes());
+            let _ = conn.write_all(b"\n");
+            drop(slot);
+            continue;
+        }
         let socket = Arc::clone(&socket);
         let log_path = Arc::clone(&log_path);
         std::thread::spawn(move || {
-            if let Err(e) = handle(conn, &socket, mode, &log_path) {
+            let _slot = slot;
+            if let Err(e) = handle(conn, &socket, mode, &log_path, limits) {
                 audit(
                     &log_path,
                     &serde_json::json!({
@@ -497,12 +615,31 @@ fn serve(listener: &UnixListener, socket: &Path, mode: Mode, log_path: &Path) {
 /// One connection: read the first request line → policy → forward to the
 /// herdr socket and pump bytes both ways until either side closes
 /// (streaming methods like `events.subscribe` hold the connection).
-fn handle(mut conn: UnixStream, socket: &Path, mode: Mode, log_path: &Path) -> Result<()> {
+fn handle(
+    mut conn: UnixStream,
+    socket: &Path,
+    mode: Mode,
+    log_path: &Path,
+    limits: Limits,
+) -> Result<()> {
     let mut reader = BufReader::new(conn.try_clone()?).take(MAX_REQUEST_LINE);
     let mut line = String::new();
+    // A deadline on the first line only. `try_clone` dups the descriptor
+    // and the timeout is an option on the socket beneath both, so setting
+    // it here covers `reader` too — and clearing it below covers the pump.
+    // `MAX_REQUEST_LINE` already bounds how *big* this line may be; this
+    // bounds how long we wait for one at all, which is what a client that
+    // connects and then says nothing was exploiting.
+    let _ = conn.set_read_timeout(Some(limits.first_line));
     reader
         .read_line(&mut line)
         .context("cannot read the request line")?;
+    // Back to blocking before anything is forwarded: from here the
+    // connection may legitimately be silent for hours (`events.subscribe`
+    // delivers when something happens, not on a schedule), and a deadline
+    // that survived into the pump would cut exactly the streaming methods
+    // the bridge exists to carry.
+    let _ = conn.set_read_timeout(None);
     if line.trim().is_empty() {
         return Ok(());
     }
@@ -555,7 +692,15 @@ fn handle(mut conn: UnixStream, socket: &Path, mode: Mode, log_path: &Path) -> R
         let _ = upstream_write.shutdown(std::net::Shutdown::Write);
     });
     let _ = std::io::copy(&mut upstream, &mut conn);
-    let _ = conn.shutdown(std::net::Shutdown::Write);
+    // `Both`, not `Write`. This point is reached when upstream hit EOF —
+    // every byte herdr sent has already been copied into `conn`, so
+    // nothing is truncated by closing now. But the thread above is parked
+    // in `read` on the *client*, which may never close: shutting only our
+    // write half left it there forever, and the `join` below waited with
+    // it — two threads and two descriptors per connection, held by a
+    // guest that simply stopped talking (issue #85). Shutting the read
+    // half is what makes that read return.
+    let _ = conn.shutdown(std::net::Shutdown::Both);
     let _ = to_upstream.join();
     Ok(())
 }
@@ -994,7 +1139,7 @@ mod tests {
     /// Full stack minus the container: a fake herdr (Unix echo server) on
     /// one side, a client playing the sandboxed herdr CLI on the other,
     /// `serve` in between.
-    fn start_relay(mode: Mode, dir: &Path) -> (PathBuf, PathBuf) {
+    fn start_relay(mode: Mode, dir: &Path, limits: Limits) -> (PathBuf, PathBuf) {
         let sock = dir.join("h.sock");
         let log = dir.join("relay.log");
         let upstream = UnixListener::bind(&sock).unwrap();
@@ -1026,7 +1171,7 @@ mod tests {
         let listener = UnixListener::bind(&listen).unwrap();
         let log_clone = log.clone();
         let sock_clone = sock.clone();
-        std::thread::spawn(move || serve(&listener, &sock_clone, mode, &log_clone));
+        std::thread::spawn(move || serve(&listener, &sock_clone, mode, &log_clone, limits));
         (listen, log)
     }
 
@@ -1046,6 +1191,31 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
+
+    /// A silence longer than [`FIRST_LINE_DEADLINE`], so a deadline left
+    /// on an established connection shows up as a dropped delivery rather
+    /// than passing by luck. Derived from the constant rather than
+    /// written out, so raising the deadline cannot quietly make the test
+    /// stop testing anything.
+    /// What the tests use in place of [`FIRST_LINE_DEADLINE`]. Long
+    /// enough that a loaded machine does not trip it mid-handshake,
+    /// short enough to idle past deliberately.
+    const TEST_FIRST_LINE: std::time::Duration = std::time::Duration::from_millis(400);
+
+    /// The shipped bounds, shrunk to what a test can drive.
+    fn test_limits() -> Limits {
+        Limits {
+            first_line: TEST_FIRST_LINE,
+            max_connections: 2,
+        }
+    }
+
+    /// A silence longer than the deadline in force, so a deadline left on
+    /// an established connection shows up as a dropped delivery rather
+    /// than passing by luck. Derived from it, so changing one cannot
+    /// quietly make the test stop testing anything.
+    const IDLE_BEYOND_THE_DEADLINE: std::time::Duration =
+        TEST_FIRST_LINE.saturating_add(std::time::Duration::from_millis(300));
 
     /// How long a test waits for a reply that should take microseconds.
     /// Generous enough that a loaded machine never trips it, short enough
@@ -1091,7 +1261,7 @@ mod tests {
     #[test]
     fn relay_forwards_allowed_and_denies_blocked() {
         let dir = test_dir("fwd");
-        let (listen, log) = start_relay(Mode::Full, &dir);
+        let (listen, log) = start_relay(Mode::Full, &dir, test_limits());
 
         let resp = roundtrip(
             &listen,
@@ -1188,7 +1358,7 @@ mod tests {
         let listen = dir.join("relay.sock");
         let listener = UnixListener::bind(&listen).unwrap();
         let log_clone = log.clone();
-        std::thread::spawn(move || serve(&listener, &sock, Mode::Full, &log_clone));
+        std::thread::spawn(move || serve(&listener, &sock, Mode::Full, &log_clone, test_limits()));
 
         let mut conn = UnixStream::connect(&listen).unwrap();
         conn.write_all(
@@ -1206,10 +1376,278 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The cap's boundary, which the connection tests cannot pin: they
+    /// open connections until one is refused, so a cap off by one still
+    /// refuses — just one connection later. Mutation testing caught that
+    /// (`+ 1` survived as `* 1`), which is what this table is for.
+    #[test]
+    fn admits_counts_the_arriving_connection() {
+        for (before, cap, want, why) in [
+            (0, 1, true, "the first connection to a cap of one fits"),
+            (
+                1,
+                1,
+                false,
+                "the second does not — the arriving one is not \
+                           counted in `before` yet, so `before + 1` is the \
+                           number that must fit",
+            ),
+            (0, 64, true, "an idle relay admits"),
+            (
+                63,
+                64,
+                true,
+                "the last slot is usable, or the cap is really 63",
+            ),
+            (64, 64, false, "and the one past it is refused"),
+            (
+                65,
+                64,
+                false,
+                "over the cap stays over, however it got there",
+            ),
+            (
+                0,
+                0,
+                false,
+                "a cap of zero admits nothing, rather than \
+                           wrapping into admitting everything",
+            ),
+        ] {
+            assert_eq!(
+                admits(before, cap),
+                want,
+                "{before} already served, cap {cap}: {why}"
+            );
+        }
+    }
+
+    /// The pin for the leak this issue opened on: upstream closes first,
+    /// the client stays open and idle, and the relay must let the
+    /// connection go.
+    ///
+    /// Before the teardown fix it did not. The foreground copy ended on
+    /// upstream's EOF, we shut down only our write half of the client
+    /// socket, and the thread pumping client→upstream stayed parked in
+    /// `read` on a client that never closes — with `join` waiting on it.
+    /// Two threads and two descriptors per connection, in the *host*
+    /// process, held by a guest that simply stopped talking.
+    ///
+    /// Asserted through the connection cap, because that is what a leaked
+    /// connection actually consumes and the one thing a test can see from
+    /// outside: with a cap of 1, a second connection is servable only if
+    /// the first one's slot came back, and the slot comes back only when
+    /// `handle` returns. A client that closed would prove nothing — the
+    /// old code let go then too — so this one deliberately never does.
+    #[test]
+    fn an_idle_client_does_not_hold_its_slot_after_upstream_closes() {
+        let dir = test_dir("teardown");
+        let sock = dir.join("h.sock");
+        let log = dir.join("relay.log");
+        let upstream = UnixListener::bind(&sock).unwrap();
+        // A herdr that answers once and hangs up — the ordinary shape of
+        // a one-shot request, and the order that triggered the leak.
+        std::thread::spawn(move || {
+            for conn in upstream.incoming() {
+                let Ok(mut conn) = conn else { break };
+                std::thread::spawn(move || {
+                    let mut line = String::new();
+                    let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+                    let _ = conn.write_all(b"{\"id\":\"x\",\"result\":{}}\n");
+                    // and closes, while the client is still connected.
+                });
+            }
+        });
+        let listen = dir.join("relay.sock");
+        let listener = UnixListener::bind(&listen).unwrap();
+        let log_clone = log.clone();
+        let limits = Limits {
+            first_line: TEST_FIRST_LINE,
+            max_connections: 1,
+        };
+        std::thread::spawn(move || serve(&listener, &sock, Mode::Full, &log_clone, limits));
+
+        // One connection, one request, one reply — then silence, held
+        // open for the rest of the test.
+        let mut idle = UnixStream::connect(&listen).unwrap();
+        idle.write_all(b"{\"id\":\"r1\",\"method\":\"pane.list\",\"params\":{}}\n")
+            .unwrap();
+        let reply = read_reply(idle.try_clone().unwrap(), "the first request", &log);
+        assert!(
+            reply.contains("\"result\""),
+            "the reply has to arrive before the teardown question is even \
+             meaningful: {reply}"
+        );
+
+        // The slot must come back even though `idle` is still open.
+        let deadline = std::time::Instant::now() + REPLY_DEADLINE;
+        loop {
+            // Nothing here unwraps: when the slot is held, the relay
+            // refuses and closes, so the write, the timeout and the read
+            // all legitimately fail — and an unwrap would report EINVAL
+            // from a socket teardown instead of the fact that matters.
+            // Every failure just means "not served", which is what the
+            // deadline below is judging.
+            let mut line = String::new();
+            if let Ok(mut probe) = UnixStream::connect(&listen) {
+                let _ =
+                    probe.write_all(b"{\"id\":\"r2\",\"method\":\"pane.list\",\"params\":{}}\n");
+                let _ = probe.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                if let Ok(reader) = probe.try_clone() {
+                    let _ = BufReader::new(reader).read_line(&mut line);
+                }
+            }
+            if line.contains("\"result\"") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first connection's slot never came back while its \
+                 client sat idle — that is the leak: two threads and two \
+                 descriptors held in the host relay by a guest that stopped \
+                 talking. Last reply: {line:?}"
+            );
+        }
+        drop(idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cap, and the shape of hitting it: refused *promptly*, with a
+    /// reply that says which of the two "no"s this is.
+    #[test]
+    fn connections_past_the_cap_are_refused_rather_than_parked() {
+        let dir = test_dir("cap");
+        let (listen, log) = start_relay(Mode::Full, &dir, test_limits());
+
+        // Hold MAX_CONNECTIONS open without sending anything: each one
+        // occupies a slot from accept until it closes.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            held.push(UnixStream::connect(&listen).unwrap());
+        }
+        // The relay accepts asynchronously, so wait for the slots to be
+        // taken rather than assuming they are.
+        let deadline = std::time::Instant::now() + REPLY_DEADLINE;
+        let refusal = loop {
+            let conn = UnixStream::connect(&listen).unwrap();
+            conn.set_read_timeout(Some(std::time::Duration::from_millis(250)))
+                .unwrap();
+            let mut line = String::new();
+            let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+            if line.contains("sandbox_relay_busy") {
+                break line;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "with {MAX_CONNECTIONS} connections held open, the next one \
+                 must be refused rather than accepted and parked; last read: \
+                 {line:?}"
+            );
+        };
+
+        let resp: serde_json::Value = serde_json::from_str(refusal.trim()).unwrap();
+        assert_eq!(
+            resp["error"]["code"], "sandbox_relay_busy",
+            "a full relay is a different fact from a denied method, and an \
+             agent that cannot tell them apart retries the wrong one"
+        );
+        assert!(
+            std::fs::read_to_string(&log).unwrap().contains("\"busy\""),
+            "and it is audited, so a sandbox hitting the cap is visible \
+             rather than mysterious"
+        );
+
+        // Releasing the held connections releases their slots: the cap is
+        // a concurrency limit, not a budget the relay spends once.
+        drop(held);
+        let deadline = std::time::Instant::now() + REPLY_DEADLINE;
+        loop {
+            let resp = roundtrip(
+                &listen,
+                &log,
+                r#"{"id":"after","method":"pane.list","params":{}}"#,
+            );
+            if resp.get("result").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "closed connections must return their slots: {resp}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The over-correction guard. `events.subscribe` holds a connection
+    /// open and silent until something happens, so the first-line
+    /// deadline must not survive into the conversation: a bound that
+    /// applied to the whole connection would cut exactly the streaming
+    /// methods the bridge exists to carry, and it would do it quietly —
+    /// the agent would see a subscription that simply stopped.
+    ///
+    /// Driven with a deadline well past `FIRST_LINE_DEADLINE`, so a
+    /// deadline left on the socket would show up as a missing delivery.
+    #[test]
+    fn an_established_streaming_connection_survives_being_idle() {
+        let dir = test_dir("stream");
+        let sock = dir.join("h.sock");
+        let log = dir.join("relay.log");
+        let upstream = UnixListener::bind(&sock).unwrap();
+        // A herdr that acknowledges the subscription, says nothing for
+        // longer than the first-line deadline, then delivers an event.
+        std::thread::spawn(move || {
+            for conn in upstream.incoming() {
+                let Ok(mut conn) = conn else { break };
+                std::thread::spawn(move || {
+                    let mut line = String::new();
+                    let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+                    let _ = conn.write_all(b"{\"id\":\"s1\",\"result\":{\"subscribed\":true}}\n");
+                    std::thread::sleep(IDLE_BEYOND_THE_DEADLINE);
+                    let _ = conn.write_all(b"{\"event\":\"pane.exited\"}\n");
+                });
+            }
+        });
+        let listen = dir.join("relay.sock");
+        let listener = UnixListener::bind(&listen).unwrap();
+        let log_clone = log.clone();
+        std::thread::spawn(move || serve(&listener, &sock, Mode::Full, &log_clone, test_limits()));
+
+        let mut conn = UnixStream::connect(&listen).unwrap();
+        conn.write_all(b"{\"id\":\"s1\",\"method\":\"events.subscribe\",\"params\":{}}\n")
+            .unwrap();
+        let reader = conn.try_clone().unwrap();
+        reader
+            .set_read_timeout(Some(IDLE_BEYOND_THE_DEADLINE + REPLY_DEADLINE))
+            .unwrap();
+        let mut reader = BufReader::new(reader);
+
+        let mut ack = String::new();
+        reader.read_line(&mut ack).unwrap();
+        assert!(
+            ack.contains("subscribed"),
+            "the subscription itself has to be established first: {ack}"
+        );
+
+        let mut event = String::new();
+        let read = reader.read_line(&mut event);
+        assert!(
+            read.is_ok_and(|n| n > 0),
+            "an event delivered after a silence longer than \
+             FIRST_LINE_DEADLINE must still cross the bridge — if this fails \
+             with a timeout, the first-line deadline was left on the socket \
+             and every long-lived subscription dies with it"
+        );
+        assert!(
+            event.contains("pane.exited"),
+            "and it must be the event, intact: {event}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn relay_readonly_denies_mutations() {
         let dir = test_dir("ro");
-        let (listen, log) = start_relay(Mode::Readonly, &dir);
+        let (listen, log) = start_relay(Mode::Readonly, &dir, test_limits());
 
         let resp = roundtrip(
             &listen,
