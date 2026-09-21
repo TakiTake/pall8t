@@ -212,6 +212,7 @@ pub fn system_start() -> Result<()> {
 }
 
 /// One row of `container list --all`.
+#[derive(Debug)]
 pub struct ContainerInfo {
     pub name: String,
     pub state: State,
@@ -223,6 +224,19 @@ pub struct ContainerInfo {
     /// anything else (or for a listing that doesn't carry them: the
     /// schema is pre-1.0, ADR-0001).
     pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// Names the JSON kind in an error, so a schema move reads as a schema
+/// move rather than as a parse failure with no detail.
+fn shape_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// All containers: `container list --all --format json`.
@@ -240,8 +254,23 @@ fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
         return Ok(Vec::new());
     }
     let v: Value = serde_json::from_str(trimmed).context("unexpected `container list` JSON")?;
+    // An unrecognized shape is an error, never an empty list. Callers use
+    // "no containers" to authorize deletion — `image::prune_superseded`
+    // skips the prune when the in-use set is unknown, and that guard is
+    // only as good as this function's refusal to invent the answer. The
+    // schema is pre-1.0 (ADR-0001), so "it moved to {"containers":[…]}"
+    // is a live possibility rather than a hypothetical; an empty `Vec`
+    // here would have pruned images that containers were still using,
+    // while reporting that it had checked (issue #84).
+    let arr = v.as_array().ok_or_else(|| {
+        anyhow::anyhow!(
+            "unexpected `container list` JSON: expected an array of \
+             containers, got {}",
+            shape_of(&v)
+        )
+    })?;
     let mut items = Vec::new();
-    if let Some(arr) = v.as_array() {
+    {
         for item in arr {
             let name = item
                 .pointer("/configuration/id")
@@ -272,19 +301,27 @@ fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
                         .collect()
                 })
                 .unwrap_or_default();
-            if let Some(name) = name {
-                let state = if status.eq_ignore_ascii_case("running") {
-                    State::Running
-                } else {
-                    State::Stopped
-                };
-                items.push(ContainerInfo {
-                    name: name.to_string(),
-                    state,
-                    image,
-                    labels,
-                });
-            }
+            // Same rule one level down: an entry none of the three
+            // identifier pointers matches means the schema moved under
+            // us, and dropping it silently would shrink the inventory a
+            // caller is about to act on.
+            let name = name.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unexpected `container list` JSON: an entry carries no \
+                     identifier under /configuration/id, id, or name"
+                )
+            })?;
+            let state = if status.eq_ignore_ascii_case("running") {
+                State::Running
+            } else {
+                State::Stopped
+            };
+            items.push(ContainerInfo {
+                name: name.to_string(),
+                state,
+                image,
+                labels,
+            });
         }
     }
     Ok(items)
@@ -1496,6 +1533,52 @@ mod tests {
         ]"#;
         let items = parse_list_all(json).unwrap();
         assert_eq!(items[0].state, State::Running);
+    }
+
+    #[test]
+    /// "Empty" must mean an empty array was parsed, never "the shape was
+    /// unrecognized". The distinction is load-bearing rather than tidy:
+    /// `image::prune_superseded` deletes images that no container claims,
+    /// and it decides that from this function's output — so a schema move
+    /// that read as `Ok([])` would delete in-use images while reporting
+    /// that it had verified they were free (issue #84).
+    fn an_unrecognized_listing_shape_is_an_error_not_an_empty_inventory() {
+        for (label, json, needle) in [
+            (
+                "the whole document wrapped in an object, the most likely \
+                 way a pre-1.0 schema moves",
+                r#"{"containers":[{"configuration":{"id":"pall8t-x"}}]}"#,
+                "got an object",
+            ),
+            ("a bare string", r#""none""#, "got a string"),
+            ("null", "null", "got null"),
+        ] {
+            let err = parse_list_all(json)
+                .expect_err(&format!("{label} must not parse as zero containers"))
+                .to_string();
+            assert!(
+                err.contains(needle),
+                "{label}: the error must name what arrived, or a schema move \
+                 reads as a mystery: {err}"
+            );
+        }
+
+        let err = parse_list_all(r#"[{"status":{"state":"running"}}]"#)
+            .expect_err("an entry with no identifier must not be dropped")
+            .to_string();
+        assert!(
+            err.contains("no identifier"),
+            "an entry whose id moved is the same schema move one level \
+             down, and silently dropping it shrinks the inventory a caller \
+             is about to delete from: {err}"
+        );
+
+        assert_eq!(
+            parse_list_all("[]").unwrap().len(),
+            0,
+            "and a genuinely empty array still means no containers — the \
+             point is to tell the two apart, not to refuse both"
+        );
     }
 
     #[test]
