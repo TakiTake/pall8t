@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-21
+
 ### Added
 
 - **`[container] ssh`: forward the host's SSH agent into the sandbox**
@@ -116,13 +118,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Two `__pycache__/*.pyc` files were committed** (in 0.6.0's drift
-  script and herdr plugin), by a `git add -A` that followed a
-  `py_compile`. Untracked, and `__pycache__/`/`*.pyc` added to
-  `.gitignore`. They carry no paths or identifiers from the machine that
-  built them — checked before removal, since that is the usual reason a
-  stray artifact matters.
-
 - **A concurrent `pall8t build` could delete the image a run was about to
   launch.** `pall8t run` resolves its image first and execs `container
   run` last, and everything in between — mounts, worktree detection, tab
@@ -203,8 +198,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pane.selection.read` extracts text through `&self` and stores nothing,
   while `pane.edit_scrollback` looks just as passive and spawns an editor
   on the host, so it stays denied. The reconciliation is what
-  `scripts/herdr-method-drift.py` (0.6.0) exists to prompt; this is its
-  first run put into effect.
+  `scripts/herdr-method-drift.py`, added in this same release, exists to
+  prompt; this is its first run put into effect.
 
 - **`git status`, `git log`, and `git rev-parse` failed inside the sandbox
   with "detected dubious ownership"** — in the workspace itself, not only
@@ -229,6 +224,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool list to do it.
 
 ### Development
+
+- **Two `__pycache__/*.pyc` files were committed** alongside this
+  release's drift script and herdr plugin, by a `git add -A` that
+  followed a `py_compile`. Untracked before release, and
+  `__pycache__/`/`*.pyc` added to `.gitignore`. They carry no paths or
+  identifiers from the machine that built them — checked before removal,
+  since that is the usual reason a stray artifact matters.
 
 - **CI, release and the dev shell now build with the same compiler.**
   `flake.nix` pinned Rust 1.96.0 while every workflow installed a moving
@@ -666,7 +668,8 @@ container home.
   management (`pall8t home log|diff|rollback|ls|rm|gc`); off by default in
   favor of the shared-home mode.
 
-[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/TakiTake/pall8t/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.7.0
 [0.6.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.6.0
 [0.5.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.5.0
 [0.4.0]: https://github.com/TakiTake/pall8t/releases/tag/v0.4.0
