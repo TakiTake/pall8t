@@ -19,7 +19,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Toolchain version, from the flake
+        id: pin
+        run: echo "version=$(scripts/rust-version.sh)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pin.outputs.version }}
 
       - uses: Swatinem/rust-cache@v2
 

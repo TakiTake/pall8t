@@ -212,6 +212,7 @@ pub fn system_start() -> Result<()> {
 }
 
 /// One row of `container list --all`.
+#[derive(Debug)]
 pub struct ContainerInfo {
     pub name: String,
     pub state: State,
@@ -223,6 +224,19 @@ pub struct ContainerInfo {
     /// anything else (or for a listing that doesn't carry them: the
     /// schema is pre-1.0, ADR-0001).
     pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// Names the JSON kind in an error, so a schema move reads as a schema
+/// move rather than as a parse failure with no detail.
+fn shape_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// All containers: `container list --all --format json`.
@@ -240,8 +254,23 @@ fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
         return Ok(Vec::new());
     }
     let v: Value = serde_json::from_str(trimmed).context("unexpected `container list` JSON")?;
+    // An unrecognized shape is an error, never an empty list. Callers use
+    // "no containers" to authorize deletion — `image::prune_superseded`
+    // skips the prune when the in-use set is unknown, and that guard is
+    // only as good as this function's refusal to invent the answer. The
+    // schema is pre-1.0 (ADR-0001), so "it moved to {"containers":[…]}"
+    // is a live possibility rather than a hypothetical; an empty `Vec`
+    // here would have pruned images that containers were still using,
+    // while reporting that it had checked (issue #84).
+    let arr = v.as_array().ok_or_else(|| {
+        anyhow::anyhow!(
+            "unexpected `container list` JSON: expected an array of \
+             containers, got {}",
+            shape_of(&v)
+        )
+    })?;
     let mut items = Vec::new();
-    if let Some(arr) = v.as_array() {
+    {
         for item in arr {
             let name = item
                 .pointer("/configuration/id")
@@ -272,19 +301,27 @@ fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
                         .collect()
                 })
                 .unwrap_or_default();
-            if let Some(name) = name {
-                let state = if status.eq_ignore_ascii_case("running") {
-                    State::Running
-                } else {
-                    State::Stopped
-                };
-                items.push(ContainerInfo {
-                    name: name.to_string(),
-                    state,
-                    image,
-                    labels,
-                });
-            }
+            // Same rule one level down: an entry none of the three
+            // identifier pointers matches means the schema moved under
+            // us, and dropping it silently would shrink the inventory a
+            // caller is about to act on.
+            let name = name.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unexpected `container list` JSON: an entry carries no \
+                     identifier under /configuration/id, id, or name"
+                )
+            })?;
+            let state = if status.eq_ignore_ascii_case("running") {
+                State::Running
+            } else {
+                State::Stopped
+            };
+            items.push(ContainerInfo {
+                name: name.to_string(),
+                state,
+                image,
+                labels,
+            });
         }
     }
     Ok(items)
@@ -651,13 +688,54 @@ pub(crate) enum Kind {
 
 impl Mount {
     /// Explicit constructor for callers that already know all three.
-    pub fn new(host: PathBuf, dest: PathBuf, readonly: bool) -> Self {
-        Mount {
+    ///
+    /// Fallible for the same reason [`Mount::socket`] is, one delimiter
+    /// along: a directory mount goes out as
+    /// `--mount type=virtiofs,source=…,target=…[,ro]`, so a comma in
+    /// either path splits into what the runtime's parser reads as another
+    /// option — and the option that would arrive is `ro`'s neighbour in a
+    /// list where `ro` decides whether the sandbox can write. ADR-0009 is
+    /// about exactly that: a protection flag decided by string parsing
+    /// must not be able to misparse quietly (issue #87).
+    ///
+    /// A `..` component in the target is refused rather than normalized.
+    /// A target is a path *inside* the container that pall8t never
+    /// resolves, so there is nothing to normalize it against here — and
+    /// `overlaps`, which keeps a configured mount off the workspace, the
+    /// worktree git dir and the container home, compares components
+    /// lexically. `/home/../home/dev` would clear that check and land on
+    /// the home anyway. Refusing says what we mean; normalizing would
+    /// paper over a target nobody meant to write.
+    pub fn new(host: PathBuf, dest: PathBuf, readonly: bool) -> Result<Self> {
+        for path in [&host, &dest] {
+            if path.to_string_lossy().contains(',') {
+                anyhow::bail!(
+                    "a mounted path may not contain `,` ({}) — the runtime \
+                     splits `--mount` on it, and the next field is parsed as \
+                     a mount option",
+                    path.display()
+                );
+            }
+        }
+        if dest
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            anyhow::bail!(
+                "a mount target may not contain `..` ({}) — it is a path \
+                 inside the container, resolved there and not here, so a \
+                 target that walks upward escapes the checks that keep a \
+                 mount off the workspace and the container home. Write the \
+                 path you mean, e.g. /home/dev/notes",
+                dest.display()
+            );
+        }
+        Ok(Mount {
             host,
             dest,
             readonly,
             kind: Kind::Directory,
-        }
+        })
     }
 
     /// Forwards the host Unix socket at `host` into the container at
@@ -695,18 +773,18 @@ impl Mount {
     /// absolute path inside the container, so git metadata and path
     /// references stay valid on both sides (ADR-0004's insight, retained
     /// by ADR-0006).
-    pub fn identity(path: PathBuf) -> Self {
+    pub fn identity(path: PathBuf) -> Result<Self> {
         Mount::new(path.clone(), path, false)
     }
 
     /// Writable mount of `host` at `dest`.
-    pub fn rw(host: PathBuf, dest: PathBuf) -> Self {
+    pub fn rw(host: PathBuf, dest: PathBuf) -> Result<Self> {
         Mount::new(host, dest, false)
     }
 
     /// Read-only mount of `host` at `dest` — the sandbox can read it and
     /// cannot change it (ADR-0009).
-    pub fn ro(host: PathBuf, dest: PathBuf) -> Self {
+    pub fn ro(host: PathBuf, dest: PathBuf) -> Result<Self> {
         Mount::new(host, dest, true)
     }
 
@@ -1458,6 +1536,52 @@ mod tests {
     }
 
     #[test]
+    /// "Empty" must mean an empty array was parsed, never "the shape was
+    /// unrecognized". The distinction is load-bearing rather than tidy:
+    /// `image::prune_superseded` deletes images that no container claims,
+    /// and it decides that from this function's output — so a schema move
+    /// that read as `Ok([])` would delete in-use images while reporting
+    /// that it had verified they were free (issue #84).
+    fn an_unrecognized_listing_shape_is_an_error_not_an_empty_inventory() {
+        for (label, json, needle) in [
+            (
+                "the whole document wrapped in an object, the most likely \
+                 way a pre-1.0 schema moves",
+                r#"{"containers":[{"configuration":{"id":"pall8t-x"}}]}"#,
+                "got an object",
+            ),
+            ("a bare string", r#""none""#, "got a string"),
+            ("null", "null", "got null"),
+        ] {
+            let err = parse_list_all(json)
+                .expect_err(&format!("{label} must not parse as zero containers"))
+                .to_string();
+            assert!(
+                err.contains(needle),
+                "{label}: the error must name what arrived, or a schema move \
+                 reads as a mystery: {err}"
+            );
+        }
+
+        let err = parse_list_all(r#"[{"status":{"state":"running"}}]"#)
+            .expect_err("an entry with no identifier must not be dropped")
+            .to_string();
+        assert!(
+            err.contains("no identifier"),
+            "an entry whose id moved is the same schema move one level \
+             down, and silently dropping it shrinks the inventory a caller \
+             is about to delete from: {err}"
+        );
+
+        assert_eq!(
+            parse_list_all("[]").unwrap().len(),
+            0,
+            "and a genuinely empty array still means no containers — the \
+             point is to tell the two apart, not to refuse both"
+        );
+    }
+
+    #[test]
     fn parse_list_all_empty_output_is_empty() {
         assert!(parse_list_all("").unwrap().is_empty());
         assert!(parse_list_all("   ").unwrap().is_empty());
@@ -1725,7 +1849,7 @@ mod tests {
     fn socket_mount_goes_out_as_two_field_v() {
         let spec = RunSpec {
             mounts: vec![
-                Mount::identity(PathBuf::from("/Users/me/src/x")),
+                Mount::identity(PathBuf::from("/Users/me/src/x")).unwrap(),
                 Mount::socket(
                     PathBuf::from("/Users/me/.pall8t/run/pall8t-x-abc12345-99.sock"),
                     PathBuf::from("/tmp/pall8t/herdr.sock"),
@@ -1769,6 +1893,52 @@ mod tests {
     /// property `Mount::spec` claims has to be enforced at construction —
     /// otherwise a home directory with a colon in it silently turns the
     /// container path into mount options.
+    #[test]
+    /// The directory half of the same rule the socket guard states. A
+    /// comma is to `--mount` what `:` is to `-v`: the field separator,
+    /// with `ro` living in the list it separates — so a path carrying one
+    /// does not fail, it reparses, and ADR-0009 is about a protection flag
+    /// that must never be decided by a quiet misparse.
+    fn directory_mount_refuses_a_comma_in_either_path() {
+        let ok = |m: &str| format!("/Users/me/{m}");
+        for (label, host, dest) in [
+            ("in the host path", ok("a,b"), ok("x")),
+            ("in the container path", ok("a"), ok("x,y")),
+        ] {
+            let err = Mount::new(PathBuf::from(&host), PathBuf::from(&dest), true)
+                .expect_err(&format!("a comma {label} must be refused"))
+                .to_string();
+            assert!(err.contains("may not contain `,`"), "{label}: {err}");
+        }
+        assert!(
+            Mount::new(ok("a").into(), ok("b").into(), true).is_ok(),
+            "and an ordinary pair still builds — the guard is on the \
+             delimiter, not on punctuation in general"
+        );
+    }
+
+    #[test]
+    /// `..` in a *target* is refused rather than normalized, because the
+    /// target is resolved inside the container and never here. The case
+    /// that makes it matter: `overlaps` compares components lexically, so
+    /// `/home/../home/dev` clears the protected-path check and then lands
+    /// on the container home anyway.
+    fn a_mount_target_refuses_a_parent_component() {
+        let err = Mount::new("/Users/me/x".into(), "/home/../home/dev".into(), false)
+            .expect_err("a target walking upward must be refused")
+            .to_string();
+        assert!(
+            err.contains("may not contain `..`"),
+            "and must say which part of the pair was wrong: {err}"
+        );
+        assert!(
+            Mount::new("/Users/me/../me/x".into(), "/home/dev/x".into(), false).is_ok(),
+            "the host side is canonicalized before it gets here and is \
+             checked against the real filesystem, so `..` there is not the \
+             same hazard — only the target escapes a check by walking up"
+        );
+    }
+
     #[test]
     fn socket_mount_refuses_a_colon_in_either_path() {
         assert!(
@@ -1823,15 +1993,17 @@ mod tests {
         let spec = RunSpec {
             image: "pall8t-x:501-20-abc123456789".into(),
             mounts: vec![
-                Mount::identity(PathBuf::from("/Users/me/src/x")),
+                Mount::identity(PathBuf::from("/Users/me/src/x")).unwrap(),
                 Mount::rw(
                     PathBuf::from("/Users/me/.pall8t/home"),
                     PathBuf::from("/home/dev"),
-                ),
+                )
+                .unwrap(),
                 Mount::ro(
                     PathBuf::from("/Users/me/src/lib"),
                     PathBuf::from("/Users/me/src/lib"),
-                ),
+                )
+                .unwrap(),
             ],
             tty: true,
             env: vec![("HERDR_ENV".into(), "1".into())],
