@@ -447,8 +447,17 @@ mod tests {
     /// than one that hung, because it would go on to mount nothing.
     fn run_ok_timeout_stops_a_child_that_outlasts_its_bound() {
         let limit = std::time::Duration::from_millis(200);
+        // The child outlasts the bound by a wide margin but finishes
+        // quickly in absolute terms, and both halves of that matter. Wide,
+        // so a loaded machine cannot make it finish inside the bound by
+        // accident. Quick, because this test has to *fail fast* when the
+        // deadline stops working: with a `sleep 60` here, a broken
+        // deadline meant a minute of waiting, which `cargo mutants` scored
+        // as a timeout rather than as the catch it actually was. A child
+        // that exits on its own returns `Ok`, so the `expect_err` below
+        // fires the moment it does.
         let started = std::time::Instant::now();
-        let err = run_ok_timeout("sleep", &["60".to_string()], limit)
+        let err = run_ok_timeout("sleep", &["5".to_string()], limit)
             .expect_err("a child still running at the deadline is a failure")
             .to_string();
         let waited = started.elapsed();
@@ -458,7 +467,7 @@ mod tests {
             "the error must say it was the deadline rather than the command: {err}"
         );
         assert!(
-            waited < std::time::Duration::from_secs(10),
+            waited < std::time::Duration::from_secs(2),
             "the call must return on the deadline, not on the child — waited {waited:?}"
         );
     }
