@@ -123,6 +123,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   built them — checked before removal, since that is the usual reason a
   stray artifact matters.
 
+- **A mounted path carrying the runtime's own field separator no longer
+  reparses.** A directory mount goes out as
+  `--mount type=virtiofs,source=…,target=…[,ro]`, and nothing rejected a
+  comma in either path — so a path containing one split into what the
+  runtime reads as a further option, in the list where `ro` decides
+  whether the sandbox can write. `Mount::socket` had refused `:` for this
+  reason since it was written; the directory constructor now refuses `,`
+  the same way. A `..` component in a mount *target* is refused too,
+  rather than normalized: a target is resolved inside the container and
+  never here, and `/home/../home/dev` would otherwise pass the lexical
+  check that keeps a configured mount off the container home and land on
+  it anyway (issue #87).
+- **A bad `[[mounts]]` entry is refused before anything is built.** The
+  runtime was started and the image built or pruned before any configured
+  mount was looked at, so a typo in a target cost a full container build
+  and then a refusal. Mount planning — targets, overlaps, sources — now
+  runs first, extending the reason config load already precedes the
+  runtime check: a problem the user can fix should not need a working
+  `container` first (issue #90).
+
 - **An unrecognized `container list` schema no longer reads as "no
   containers".** `parse_list_all` accepted any JSON that was not an array
   as an empty inventory, and silently dropped entries carrying no
