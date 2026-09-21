@@ -62,6 +62,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A sandboxed agent could grow the host relay without bound.** The
+  relay spawned a thread per connection with no cap, put no deadline on
+  the first request line, and — the concrete leak — never let go when
+  herdr closed first: the foreground copy ended on upstream's EOF, only
+  the write half of the client socket was shut down, and the thread
+  pumping client→upstream stayed parked reading from a client that need
+  never close, with `join` waiting on it. A guest that opened connections,
+  sent one line each and then stopped talking held two threads and two
+  descriptors per connection **in the host process**, which the sandbox's
+  VM limits do not cover — the class of thing the relay exists to
+  constrain. Connections are now capped (64, refused with a distinct
+  `sandbox_relay_busy` reply and an audit line rather than queued), the
+  first request line carries a deadline, and upstream EOF tears down both
+  directions. The deadline covers only the first line: an established
+  `events.subscribe` may sit silent for hours, and a blanket idle timeout
+  would cut exactly the streaming the bridge exists to carry (issue #85).
+
 - **A project's `.pall8t/config.toml` can no longer switch SSH forwarding
   on** — only your own `~/.pall8t/config.toml` or `pall8t run --ssh` can.
   A project config ships with the repository, so honoring `ssh = true`
