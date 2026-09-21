@@ -155,7 +155,7 @@ pub fn resolve(
             None
         };
 
-        mounts.push(Mount::new(source.clone(), target, readonly));
+        mounts.push(Mount::new(source.clone(), target, readonly)?);
         if let Some(git_dir) = git_dir {
             // This mount is pall8t's idea, not the user's, so it defers to
             // anything already covering that path rather than stacking a
@@ -182,7 +182,7 @@ pub fn resolve(
                 // refs and the index into the main `.git`, so mounting it
                 // read-only would break exactly the commits the writable
                 // mount is for.
-                None => mounts.push(Mount::new(git_dir.clone(), git_dir, readonly)),
+                None => mounts.push(Mount::new(git_dir.clone(), git_dir, readonly)?),
             }
         }
     }
@@ -701,14 +701,14 @@ mod tests {
 
     #[test]
     fn describe_names_the_mode_and_the_retarget() {
-        let identity = Mount::new("/src/lib".into(), "/src/lib".into(), true);
+        let identity = Mount::new("/src/lib".into(), "/src/lib".into(), true).unwrap();
         let d = describe(&identity);
         assert!(
             d.contains("/src/lib") && d.contains("read-only") && !d.contains('→'),
             "an identity mount has one path worth printing: {d}"
         );
 
-        let moved = Mount::new("/src/lib".into(), "/notes".into(), false);
+        let moved = Mount::new("/src/lib".into(), "/notes".into(), false).unwrap();
         let d = describe(&moved);
         assert!(
             d.contains("/src/lib") && d.contains("/notes") && d.contains("writable"),

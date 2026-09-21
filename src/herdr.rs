@@ -269,7 +269,7 @@ pub fn prepare_bridge(
         // outright, which is strictly stronger than a private copy — a
         // sandbox can no longer corrupt even its own CLI — and drops a
         // multi-megabyte copy from every launch.
-        Ok(dir) => mounts.push(crate::container::Mount::ro(dir, CONTAINER_BIN_DIR.into())),
+        Ok(dir) => mounts.push(crate::container::Mount::ro(dir, CONTAINER_BIN_DIR.into())?),
         // Env + relay still work without the CLI (raw socket clients, e.g.
         // herdr's own agent-state integration hooks) — degrade, don't fail.
         Err(e) => eprintln!(
