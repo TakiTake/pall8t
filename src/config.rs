@@ -74,9 +74,15 @@ pub struct HerdrConfig {
 /// the bridge entirely (v1 behavior: the sandbox can't see herdr at all).
 ///
 /// The variant order **is** the confinement order — `Full < Readonly < Off`
-/// — and [`merge`] relies on it to take the narrower of two configs, the
-/// same way [`Hardening`] does. A mode added later belongs at the position
-/// matching how much it confines, not at the end of the list.
+/// — and [`merge`] relies on it to take the narrower of two configs. A mode
+/// added later belongs at the position matching how much it confines, not
+/// at the end of the list.
+///
+/// [`Hardening`] orders its variants for the same reason but spends the
+/// order differently: `merge` honors a project that lowers hardening and
+/// only *reports* it ([`project_hardening_loosened_notice`]), because
+/// hardening confines the box from the inside. This one is refused,
+/// because it decides what the box reaches outside itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HerdrSandbox {
@@ -112,7 +118,11 @@ impl HerdrSandbox {
 /// `--read-only` yields `EROFS` outside the mounts, `--cap-drop ALL`
 /// leaves `CapEff: 0000000000000000`.
 /// The variant order **is** the confinement order — `Default < Strict` —
-/// and [`merge`] relies on it to take the stricter of two configs. A level
+/// and [`project_hardening_loosened_notice`] relies on it to tell a
+/// project that lowered the human's setting from one that tightened it.
+/// (`merge` itself does not compare: a project's hardening wins either
+/// way, unlike [`HerdrSandbox`]. This doc said "merge takes the stricter"
+/// until issue #75, which is not what the code beside it does.) A level
 /// added later belongs at the position matching how much it confines, not
 /// at the end of the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
@@ -691,8 +701,8 @@ fn merge(global: Raw, project: Raw) -> Config {
 
 /// Skeleton written by `pall8t init` as `~/.pall8t/config.toml`.
 pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project .pall8t/config.toml overrides
-# these values field by field — except `ssh`, which a project may only
-# turn off (see below).
+# these values field by field — except `ssh` and `[herdr] sandbox`, which
+# a project may only narrow (see below).
 
 [container]
 # cpus = 4
@@ -760,8 +770,8 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 
 /// Skeleton written by `pall8t init` as `.pall8t/config.toml`.
 pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set here override
-# ~/.pall8t/config.toml — except `ssh`, which this file may only turn off
-# (see below).
+# ~/.pall8t/config.toml — except `ssh` and `[herdr] sandbox`, which this
+# file may only narrow (see below).
 
 [container]
 # cpus = 4
@@ -808,7 +818,10 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 #   pall8t run --readonly
 
 [herdr]
-# sandbox = "full"   # or "readonly" / "off" — see ~/.pall8t/config.toml
+# sandbox = "readonly" # or "off" — this file may only *narrow* what
+                      #   ~/.pall8t/config.toml allows, never widen it, so
+                      #   "full" here does nothing unless the human already
+                      #   allows it (and says so on stderr).
 # auto_rename = true # name this run's herdr tab and agent "<dir>-<n>"
 # agent_name = "api" # ... using this instead of the directory basename
 "#;
@@ -1322,10 +1335,21 @@ mod tests {
             "the warning must name the file that tried, or the user cannot \
              tell which repository asked: {warning}"
         );
+        // Asserted as rendered phrases, not as two words in any order: with
+        // `contains("full") && contains("readonly")` the message reads the
+        // same to this test whichever way round the two are formatted, and
+        // swapping them tells the user the exact inverse of the truth —
+        // that the *project* asked for readonly and their own config wants
+        // full. Verified that the loose form passes with them swapped.
         assert!(
-            warning.contains("full") && warning.contains("readonly"),
-            "and must name what was asked for and what is in force, or the \
-             user cannot tell what they are being protected from: {warning}"
+            warning.contains(r#"sandbox = "full" in /x/.pall8t/config.toml"#),
+            "the warning must name what the project asked for, in the file \
+             it asked in: {warning}"
+        );
+        assert!(
+            warning.contains(r#""readonly" is what your"#),
+            "and must attribute the setting in force to the human's own \
+             config, or the two read as interchangeable: {warning}"
         );
 
         assert!(
