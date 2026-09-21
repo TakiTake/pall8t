@@ -134,7 +134,7 @@ $ pall8t ls --json | jq '.[0]'
   "status": "running",
   "image": "pall8t-my-project:501-20-3b8f01c2d4e6",
   "labels": {
-    "pall8t.version": "0.6.0",
+    "pall8t.version": "0.7.0",
     "pall8t.project": "/Users/me/src/my-project",
     "pall8t.image": "pall8t-my-project:501-20-3b8f01c2d4e6",
     "pall8t.herdr.pane": "w1G:p2",
