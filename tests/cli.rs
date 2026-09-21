@@ -1211,6 +1211,39 @@ fn run_line(fake: &FakeRuntime) -> String {
 /// `pall8t.version` now, so a run that quietly stopped labelling would
 /// vanish from its own listing.
 #[test]
+/// The reservation is written where the pruner looks, naming the tag the
+/// run resolved. Asserted end to end because the two halves that can
+/// break it — *which* directory, and whether anything is written at all —
+/// are invisible to a unit test that is handed a directory: mutating
+/// either to a no-op left every in-module test green (`cargo mutants`),
+/// and the feature would then silently protect nothing.
+fn a_run_reserves_the_image_it_is_about_to_launch() {
+    let sb = Sandbox::new("run-reserves");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    sb.run(&["run"]);
+
+    let dir = sb.home().join(".pall8t").join("state").join("launching");
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("no reservation directory at {}: {e}", dir.display()))
+        .flatten()
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "the run must leave exactly one reservation, named for its pid"
+    );
+    let body = std::fs::read_to_string(entries[0].path()).unwrap();
+    assert!(
+        body.contains(&tag),
+        "and it must name the tag this run resolved — a reservation for \
+         some other string protects nothing: {body} (expected {tag})"
+    );
+}
+
+#[test]
 fn a_run_labels_the_container_with_its_own_provenance() {
     let sb = Sandbox::new("run-labels");
     let fake = FakeRuntime::current(&sb);

@@ -369,6 +369,20 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
     // fix should not require a working `container` first — rather than
     // contradicting it.
     let (uid, gid, resolved) = build_image(&cwd, &cfg, image::BuildMode::IfMissing)?;
+    // From here to the exec below, this run has an image and no container:
+    // tab naming and the herdr bridge still come, and a first bridged run
+    // downloads a herdr release in between. Nothing in `container list`
+    // speaks for the image through that window — the reservation does
+    // (issue #88). Mount planning used to sit in this window too; it now
+    // runs before the build (issue #90), which shortens the exposure
+    // without closing it. Best-effort: a hint we could not write is a
+    // warning, not a failed run.
+    if let Err(e) = image::reserve_tag(&resolved.tag) {
+        eprintln!(
+            "pall8t: warning: could not reserve {} ({e:#})",
+            resolved.tag
+        );
+    }
     // A mount's own directory inode arrives inside the container owned by
     // root rather than the host user — the workspace included, not just
     // read-only reference mounts — so git refuses `status`/`log` there

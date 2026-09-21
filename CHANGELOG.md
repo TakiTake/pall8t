@@ -123,6 +123,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   built them — checked before removal, since that is the usual reason a
   stray artifact matters.
 
+- **A concurrent `pall8t build` could delete the image a run was about to
+  launch.** `pall8t run` resolves its image first and execs `container
+  run` last, and everything in between — mounts, worktree detection, tab
+  naming, and the herdr bridge, which on a first bridged run downloads a
+  herdr release — happens with no container yet existing for that run. So
+  nothing in `container list` spoke for the image, and a build in the same
+  workspace with an edit in between pruned it as superseded; the first run
+  then failed at launch with an image-not-found error. Two sandboxes on
+  one workspace with an edit between them is an ordinary agent workflow.
+  A run now records the tag it is about to launch under
+  `~/.pall8t/state/launching/`, the pruner treats reserved tags as in use,
+  and reservations age out after five minutes — the same grace the relay's
+  socket sweep uses (issue #88).
+
 - **A wedged subprocess can no longer hold a launch open forever.** Three
   waits on the launch path had no bound: the `curl` that fetches the Linux
   herdr CLI (whose `--retry 2` multiplied a stalled connection rather than
