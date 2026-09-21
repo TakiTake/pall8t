@@ -513,6 +513,83 @@ fn in_use_refs() -> Option<Vec<String>> {
 /// keeping `resolved.tag` and anything an existing container runs.
 /// Best-effort: failures are warnings, never an error for the build that
 /// just succeeded.
+/// How long a tag a run has resolved but not yet launched is protected
+/// from pruning.
+///
+/// The window it covers is real work, not slack: `cmd_run` resolves its
+/// image, then validates mounts, detects a worktree, names the tab, and
+/// prepares the herdr bridge — which on a first bridged run downloads a
+/// herdr release — before it ever execs `container run`. Throughout that
+/// window no container exists for this run, so nothing in
+/// `container list` speaks for it (issue #88).
+///
+/// Five minutes, matching `relay::SOCKET_REAP_GRACE`: long enough for
+/// that download on a bad link, short enough that a reservation left by a
+/// run that died mid-launch does not protect a tag for the rest of the
+/// day.
+const LAUNCH_GRACE: std::time::Duration = std::time::Duration::from_mins(5);
+
+/// Where a run records the tag it is about to launch.
+fn reservation_dir() -> Result<PathBuf> {
+    let dir = crate::config::state_dir()?.join("launching");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Records that this process intends to launch `tag`, so a concurrent
+/// `pall8t build` in the same workspace does not prune it out from under
+/// the launch.
+///
+/// Best-effort by design, and the caller treats a failure as a warning:
+/// failing a run because a hint could not be written would trade a rare
+/// race for a certain outage. Named by pid, so two runs racing record
+/// two reservations rather than overwriting one.
+pub fn reserve_tag(tag: &str) -> Result<()> {
+    let path = reservation_dir()?.join(format!("{}.json", std::process::id()));
+    let body = serde_json::json!({ "tag": tag, "ts": crate::util::epoch_secs() });
+    std::fs::write(&path, body.to_string())
+        .with_context(|| format!("cannot write the launch reservation {}", path.display()))
+}
+
+/// Whether a reservation of this age still speaks for its tag.
+///
+/// `None` — an unreadable or future mtime — holds, the same way an
+/// unknown age keeps a socket from being reaped: this decides whether to
+/// *delete an image*, so the unknown case has to fall on the keep side.
+fn reservation_holds(age: Option<std::time::Duration>, grace: std::time::Duration) -> bool {
+    age.is_none_or(|age| age <= grace)
+}
+
+/// Tags reserved by launches in flight, sweeping the entries that have
+/// aged out on the way past.
+///
+/// The reserving process cannot clean up after itself: `cmd_run` execs
+/// into the `container` client, so no code of ours runs after the launch
+/// succeeds. The grace window is what ends a reservation, and this sweep
+/// is where it is applied — the same shape as `reap_stale_sockets`.
+fn reserved_tags(dir: &Path, grace: std::time::Duration) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut tags = Vec::new();
+    for entry in entries.flatten() {
+        if !reservation_holds(crate::util::entry_age(&entry), grace) {
+            let _ = std::fs::remove_file(entry.path());
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Some(tag) = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["tag"].as_str().map(str::to_string))
+        {
+            tags.push(tag);
+        }
+    }
+    tags
+}
+
 fn prune_superseded(resolved: &ResolvedImage, uid: u32, gid: u32) {
     let Some(in_use) = in_use_refs() else {
         eprintln!(
@@ -521,6 +598,24 @@ fn prune_superseded(resolved: &ResolvedImage, uid: u32, gid: u32) {
         );
         return;
     };
+    // A tag another run has resolved but not yet launched counts as in
+    // use. Without this, two sandboxes on one workspace with an edit in
+    // between — an ordinary agent workflow — end with the first run's
+    // `container run` failing on an image the second one deleted while it
+    // was still preparing its bridge.
+    let mut in_use = in_use;
+    match reservation_dir() {
+        Ok(dir) => in_use.extend(reserved_tags(&dir, LAUNCH_GRACE)),
+        Err(e) => {
+            // Same posture as an unreadable in-use snapshot above: not
+            // knowing what is reserved is not evidence that nothing is.
+            eprintln!(
+                "pall8t: warning: could not read launch reservations ({e:#}); \
+                 skipping prune of superseded images"
+            );
+            return;
+        }
+    }
     match container::prunable_images(&resolved.base, &resolved.tag, uid, gid, &in_use) {
         Ok(tags) => {
             for old in tags {
@@ -542,6 +637,76 @@ fn prune_superseded(resolved: &ResolvedImage, uid: u32, gid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decision that protects an image from deletion, so the unknown
+    /// case is pinned explicitly: this walk deletes images, and an
+    /// unreadable mtime must not read as "expired".
+    #[test]
+    fn a_reservation_of_unknown_age_still_protects_its_tag() {
+        let grace = std::time::Duration::from_mins(5);
+        for (age, want, why) in [
+            (Some(std::time::Duration::ZERO), true, "just written"),
+            (
+                Some(grace),
+                true,
+                "the grace window is inclusive, matching reap_stale_sockets",
+            ),
+            (
+                Some(grace + std::time::Duration::from_secs(1)),
+                false,
+                "past it, a run that never launched stops protecting a tag \
+                 for the rest of the day",
+            ),
+            (
+                None,
+                true,
+                "an unreadable or future mtime is not evidence the launch is \
+                 over — this decides whether to delete an image, so unknown \
+                 falls on the keep side",
+            ),
+        ] {
+            assert_eq!(reservation_holds(age, grace), want, "{age:?}: {why}");
+        }
+    }
+
+    /// The walk, on a real directory: what it reports and what it sweeps.
+    #[test]
+    fn reserved_tags_reports_the_live_ones_and_sweeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!("p8t-resv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("111.json");
+        let junk = dir.join("222.json");
+        std::fs::write(&live, r#"{"tag":"pall8t-x:501-20-aaaa","ts":1}"#).unwrap();
+        std::fs::write(&junk, "not json").unwrap();
+
+        let tags = reserved_tags(&dir, std::time::Duration::from_mins(5));
+        assert_eq!(
+            tags,
+            vec!["pall8t-x:501-20-aaaa".to_string()],
+            "a readable reservation speaks for its tag, and an unreadable \
+             one speaks for nothing — but is not itself a reason to prune"
+        );
+        assert!(
+            junk.exists(),
+            "an unparseable reservation inside the grace window is left \
+             alone: it may be a file another run is mid-write on"
+        );
+
+        // A beat, so the files are measurably older than a zero grace.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            reserved_tags(&dir, std::time::Duration::ZERO).is_empty(),
+            "past the grace nothing is reserved"
+        );
+        assert!(
+            !live.exists() && !junk.exists(),
+            "and the aged-out entries are swept on the way past — the \
+             reserving run cannot clean up after itself, since it execs \
+             into the container client"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use std::fs;
 
     fn test_cfg(containerfile: Option<PathBuf>) -> Config {

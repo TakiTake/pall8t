@@ -309,6 +309,18 @@ fn herdr_labels(env: &herdr::HerdrEnv, sandbox: config::HerdrSandbox) -> Vec<(St
 
 fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<bool>) -> Result<()> {
     let (cwd, cfg, uid, gid, resolved) = workspace_image(image::BuildMode::IfMissing)?;
+    // Everything between here and the exec below — mounts, worktree
+    // detection, tab naming, the herdr bridge and its possible download —
+    // happens with no container yet existing for this run, so nothing in
+    // `container list` speaks for the image it is about to launch. The
+    // reservation does, until it does (issue #88). Best-effort: a hint we
+    // could not write is a warning, not a failed run.
+    if let Err(e) = image::reserve_tag(&resolved.tag) {
+        eprintln!(
+            "pall8t: warning: could not reserve {} ({e:#})",
+            resolved.tag
+        );
+    }
     let run_name = container::run_name(&cwd);
 
     let mut mounts = vec![container::Mount::identity(cwd.clone())];
