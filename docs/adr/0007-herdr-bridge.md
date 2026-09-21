@@ -82,10 +82,30 @@ Two facts about apple/container, verified live on 1.1.0, shape the design:
    published SKILL.md works inside the sandbox *unmodified*, including
    `--current` caller context.
 
+### Amendment (2026-09-21): a project config may only narrow this
+
+As first written, `[herdr] sandbox` merged like most fields — a project's
+`.pall8t/config.toml` overrode the global one. That was wrong for this
+setting and is now reversed (issue #75): a project may narrow the policy
+(`full` → `readonly` → `off`) and never widen it, and one that asked to
+widen is named on stderr.
+
+The reason is the line ADR-0012 drew for `ssh`: a project config ships
+with the repository the sandbox exists to contain, so it may shape what
+runs *inside* the box and never widen what the box reaches *outside*
+itself. `full` is the mode where that distinction bites — panes and
+agents a sandboxed agent creates through the bridge run on the host.
+Contrast `[container] hardening`, which a project still lowers freely:
+that one confines the box from the inside, and a project whose toolchain
+breaks under `strict` has to be able to say so.
+
+`[[mounts]]` is the same question with a different answer shape and is
+open as issue #95.
+
 ### Policy: guardrail, not blocker
 
-`[herdr] sandbox` (project overrides global): **`full`** (default),
-`readonly`, `off`. Methods are classified:
+`[herdr] sandbox`: **`full`** (default), `readonly`, `off`. Methods are
+classified:
 
 - **Read** (list/get/read/current/layout/wait/subscribe…): always allowed.
 - **Host admin**: every method in the `server.*`, `integration.*`,

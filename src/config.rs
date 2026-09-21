@@ -72,7 +72,18 @@ pub struct HerdrConfig {
 /// [`crate::relay::classify`]) — pall8t is a guardrail, not a blocker.
 /// `readonly` permits only inspection (list/get/read/wait); `off` disables
 /// the bridge entirely (v1 behavior: the sandbox can't see herdr at all).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+///
+/// The variant order **is** the confinement order — `Full < Readonly < Off`
+/// — and [`merge`] relies on it to take the narrower of two configs. A mode
+/// added later belongs at the position matching how much it confines, not
+/// at the end of the list.
+///
+/// [`Hardening`] orders its variants for the same reason but spends the
+/// order differently: `merge` honors a project that lowers hardening and
+/// only *reports* it ([`project_hardening_loosened_notice`]), because
+/// hardening confines the box from the inside. This one is refused,
+/// because it decides what the box reaches outside itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HerdrSandbox {
     #[default]
@@ -107,7 +118,11 @@ impl HerdrSandbox {
 /// `--read-only` yields `EROFS` outside the mounts, `--cap-drop ALL`
 /// leaves `CapEff: 0000000000000000`.
 /// The variant order **is** the confinement order — `Default < Strict` —
-/// and [`merge`] relies on it to take the stricter of two configs. A level
+/// and [`project_hardening_loosened_notice`] relies on it to tell a
+/// project that lowered the human's setting from one that tightened it.
+/// (`merge` itself does not compare: a project's hardening wins either
+/// way, unlike [`HerdrSandbox`]. This doc said "merge takes the stricter"
+/// until issue #75, which is not what the code beside it does.) A level
 /// added later belongs at the position matching how much it confines, not
 /// at the end of the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
@@ -177,6 +192,35 @@ fn project_ssh_ignored_warning(global: &Raw, project: &Raw, project_path: &Path)
              authenticate as you anywhere your keys are trusted. Enable it \
              in ~/.pall8t/config.toml, or per run with `pall8t run --ssh`.",
             project_path.display()
+        )
+    })
+}
+
+/// A project config that asked to *widen* the herdr bridge policy beyond
+/// what the host's global config allows. [`merge`] ignores it by design —
+/// but the silence would hide the alarming half: that a repository tried
+/// to grant itself more of the host's herdr session than the human chose,
+/// and `full` reaches panes and agents that run on the host, outside the
+/// sandbox. `None` when the project asked for nothing, asked to narrow, or
+/// agrees with a global that is already at least as open.
+fn project_sandbox_ignored_warning(
+    global: &Raw,
+    project: &Raw,
+    project_path: &Path,
+) -> Option<String> {
+    let g = global.herdr.sandbox.unwrap_or_default();
+    let p = project.herdr.sandbox?;
+    (p < g).then(|| {
+        format!(
+            "[herdr] sandbox = \"{}\" in {} was ignored: a project config \
+             can close the herdr bridge further, never open it. It ships \
+             with the repository, and \"{}\" is what your \
+             ~/.pall8t/config.toml asks for — panes and agents a sandboxed \
+             agent creates through the bridge run on the host, outside the \
+             sandbox. Widen it in ~/.pall8t/config.toml if you mean to.",
+            p.as_str(),
+            project_path.display(),
+            g.as_str()
         )
     })
 }
@@ -526,6 +570,7 @@ pub fn load(project_dir: &Path) -> Result<Config> {
         .collect();
     let ssh_ignored = project_ssh_ignored_warning(&global, &project, &project_path);
     let hardening_notice = project_hardening_loosened_notice(&global, &project, &project_path);
+    let sandbox_ignored = project_sandbox_ignored_warning(&global, &project, &project_path);
     let merged = merge(global, project);
     // The inert-setting check reads the *merged* config, not each file:
     // a global `auto_rename = true` enables a project's `agent_name`, and
@@ -534,6 +579,7 @@ pub fn load(project_dir: &Path) -> Result<Config> {
         .into_iter()
         .chain(ssh_ignored)
         .chain(hardening_notice)
+        .chain(sandbox_ignored)
         .chain(inert_agent_name_warning(&merged.herdr))
         .collect();
     Ok(Config { warnings, ..merged })
@@ -619,11 +665,26 @@ fn merge(global: Raw, project: Raw) -> Config {
         // deprecation message, which `merge` (path-less) can't produce.
         warnings: Vec::new(),
         herdr: HerdrConfig {
-            sandbox: project
-                .herdr
-                .sandbox
-                .or(global.herdr.sandbox)
-                .unwrap_or_default(),
+            // Narrowing only, like `ssh` above and deliberately *unlike*
+            // `hardening`. The line between them is where the setting
+            // points: hardening confines the box from the inside, while
+            // `sandbox` decides how much of the host herdr session the
+            // box can reach *outside* itself — and `full` is documented
+            // as an audited opening, since panes and agents created
+            // through the bridge run on the host. A project config ships
+            // with the repository the sandbox exists to contain, so it
+            // may close the bridge further and never open it (issue #75,
+            // the same class as the `ssh` fix in #63).
+            //
+            // `max` because the variant order is the confinement order:
+            // the more confining of the two wins, whichever file it came
+            // from. The ignored widening is reported by
+            // [`project_sandbox_ignored_warning`] rather than dropped in
+            // silence.
+            sandbox: match (global.herdr.sandbox, project.herdr.sandbox) {
+                (g, Some(p)) => p.max(g.unwrap_or_default()),
+                (g, None) => g.unwrap_or_default(),
+            },
             // Per-field, like everything else here: a global
             // `auto_rename = true` stays on for a project that only sets
             // `agent_name`, and the pair is judged after merging (see
@@ -640,8 +701,8 @@ fn merge(global: Raw, project: Raw) -> Config {
 
 /// Skeleton written by `pall8t init` as `~/.pall8t/config.toml`.
 pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project .pall8t/config.toml overrides
-# these values field by field — except `ssh`, which a project may only
-# turn off (see below).
+# these values field by field — except `ssh` and `[herdr] sandbox`, which
+# a project may only narrow (see below).
 
 [container]
 # cpus = 4
@@ -709,8 +770,8 @@ pub const GLOBAL_SKELETON: &str = r#"# pall8t global configuration. Per-project 
 
 /// Skeleton written by `pall8t init` as `.pall8t/config.toml`.
 pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set here override
-# ~/.pall8t/config.toml — except `ssh`, which this file may only turn off
-# (see below).
+# ~/.pall8t/config.toml — except `ssh` and `[herdr] sandbox`, which this
+# file may only narrow (see below).
 
 [container]
 # cpus = 4
@@ -757,7 +818,10 @@ pub const PROJECT_SKELETON: &str = r#"# pall8t project configuration. Fields set
 #   pall8t run --readonly
 
 [herdr]
-# sandbox = "full"   # or "readonly" / "off" — see ~/.pall8t/config.toml
+# sandbox = "readonly" # or "off" — this file may only *narrow* what
+                      #   ~/.pall8t/config.toml allows, never widen it, so
+                      #   "full" here does nothing unless the human already
+                      #   allows it (and says so on stderr).
 # auto_rename = true # name this run's herdr tab and agent "<dir>-<n>"
 # agent_name = "api" # ... using this instead of the directory basename
 "#;
@@ -1180,14 +1244,69 @@ mod tests {
     }
 
     #[test]
-    fn herdr_sandbox_merges_per_field_and_rejects_unknown_values() {
-        let global = parse("[herdr]\nsandbox = \"readonly\"\n");
-        let cfg = merge(global.clone(), Raw::default());
-        assert_eq!(cfg.herdr.sandbox, HerdrSandbox::Readonly);
+    fn herdr_sandbox_merges_narrow_only_and_rejects_unknown_values() {
+        use HerdrSandbox::{Full, Off, Readonly};
 
-        let project = parse("[herdr]\nsandbox = \"off\"\n");
-        let cfg = merge(global, project);
-        assert_eq!(cfg.herdr.sandbox, HerdrSandbox::Off, "project wins");
+        // `None` is "the file said nothing", not a value.
+        let raw = |mode: Option<HerdrSandbox>| match mode {
+            Some(m) => parse(&format!("[herdr]\nsandbox = \"{}\"\n", m.as_str())),
+            None => Raw::default(),
+        };
+
+        for (global, project, want, why) in [
+            (
+                None,
+                None,
+                Full,
+                "nobody said anything: the documented default",
+            ),
+            (Some(Readonly), None, Readonly, "a global alone decides"),
+            (
+                Some(Readonly),
+                Some(Off),
+                Off,
+                "a project may close the bridge further than the human did — \
+                 narrowing costs the repository capability, never the human \
+                 safety",
+            ),
+            (
+                Some(Full),
+                Some(Readonly),
+                Readonly,
+                "narrowing from an explicit `full` is the same kind of ask",
+            ),
+            (
+                Some(Readonly),
+                Some(Full),
+                Readonly,
+                "and a project may NOT open it: the file ships with the \
+                 repository the sandbox exists to contain, and `full` reaches \
+                 panes and agents that run on the host, outside the sandbox \
+                 (issue #75, the class the `ssh` fix in #63 settled)",
+            ),
+            (
+                Some(Off),
+                Some(Readonly),
+                Off,
+                "the same one step down: a closed bridge stays closed",
+            ),
+            (
+                None,
+                Some(Full),
+                Full,
+                "an unset global already *is* `full`, so asking for it widens \
+                 nothing — the rule is about the human's choice, not about \
+                 the word appearing in a project file",
+            ),
+            (Some(Off), Some(Off), Off, "agreement changes nothing"),
+        ] {
+            let got = merge(raw(global), raw(project)).herdr.sandbox;
+            assert_eq!(
+                got, want,
+                "global {global:?} + project {project:?} must merge to \
+                 {want:?}, got {got:?} — {why}"
+            );
+        }
 
         assert!(
             toml::from_str::<Raw>("[herdr]\nsandbox = \"bogus\"\n").is_err(),
@@ -1197,6 +1316,59 @@ mod tests {
             toml::from_str::<Raw>("[herdr]\nsandbo = \"off\"\n").is_err(),
             "a misspelled key must fail the parse, not silently leave the \
              bridge in full mode (deny_unknown_fields)"
+        );
+    }
+
+    /// The refusal above is only half the fix: a dropped intent that
+    /// nobody is told about is the failure mode this repo treats as a bug.
+    #[test]
+    fn a_project_asking_to_widen_the_bridge_is_told_it_was_ignored() {
+        let path = Path::new("/x/.pall8t/config.toml");
+        let full = parse("[herdr]\nsandbox = \"full\"\n");
+        let readonly = parse("[herdr]\nsandbox = \"readonly\"\n");
+        let off = parse("[herdr]\nsandbox = \"off\"\n");
+
+        let warning = project_sandbox_ignored_warning(&readonly, &full, path)
+            .expect("a repository that tried to widen the bridge must be reported");
+        assert!(
+            warning.contains("/x/.pall8t/config.toml"),
+            "the warning must name the file that tried, or the user cannot \
+             tell which repository asked: {warning}"
+        );
+        // Asserted as rendered phrases, not as two words in any order: with
+        // `contains("full") && contains("readonly")` the message reads the
+        // same to this test whichever way round the two are formatted, and
+        // swapping them tells the user the exact inverse of the truth —
+        // that the *project* asked for readonly and their own config wants
+        // full. Verified that the loose form passes with them swapped.
+        assert!(
+            warning.contains(r#"sandbox = "full" in /x/.pall8t/config.toml"#),
+            "the warning must name what the project asked for, in the file \
+             it asked in: {warning}"
+        );
+        assert!(
+            warning.contains(r#""readonly" is what your"#),
+            "and must attribute the setting in force to the human's own \
+             config, or the two read as interchangeable: {warning}"
+        );
+
+        assert!(
+            project_sandbox_ignored_warning(&readonly, &off, path).is_none(),
+            "narrowing is honored, so there is nothing to report"
+        );
+        assert!(
+            project_sandbox_ignored_warning(&readonly, &readonly, path).is_none(),
+            "agreement ignored nothing"
+        );
+        assert!(
+            project_sandbox_ignored_warning(&Raw::default(), &full, path).is_none(),
+            "an unset global is already `full`: the project asked for what it \
+             would have got anyway, and warning here would train the user to \
+             ignore the line that matters"
+        );
+        assert!(
+            project_sandbox_ignored_warning(&readonly, &Raw::default(), path).is_none(),
+            "and a project that said nothing asked for nothing"
         );
     }
 
