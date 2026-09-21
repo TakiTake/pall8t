@@ -93,6 +93,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   built them — checked before removal, since that is the usual reason a
   stray artifact matters.
 
+- **A wedged subprocess can no longer hold a launch open forever.** Three
+  waits on the launch path had no bound: the `curl` that fetches the Linux
+  herdr CLI (whose `--retry 2` multiplied a stalled connection rather than
+  bounding it), asking the host's own `herdr` its version, and the read of
+  the relay's readiness line. All three are best-effort — the bridge is
+  documented as degrading to "no bridge" with a warning — so hanging was
+  strictly worse than failing: the user got no sandbox at all instead of a
+  sandbox without the bridge. `curl` now carries a connect timeout, a
+  stall floor (`--speed-limit`/`--speed-time`, which ends a dead transfer
+  without killing a slow one) and a bound on the retry loop as a whole;
+  the other two run under a deadline that kills and reaps the child
+  (issue #86).
+
 - **Four pure-inspection herdr methods were denied under
   `[herdr] sandbox = "readonly"`.** The relay's `READ` allowlist was last
   reconciled against herdr 0.8, and 0.9.1 (protocol 22) is what a user

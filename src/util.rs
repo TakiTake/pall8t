@@ -27,6 +27,86 @@ pub(crate) fn run_ok(program: &str, args: &[String]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// How often [`run_ok_timeout`] asks whether the child is done. Short
+/// enough that the bound is the bound rather than the bound plus a tick,
+/// long enough that waiting costs nothing measurable.
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// [`run_ok`] under a deadline, for the best-effort integrations on the
+/// launch path.
+///
+/// `run_ok` is the right contract where a wedged child means pall8t is
+/// broken anyway. It is the wrong one where the caller's own documented
+/// answer to failure is "warn and carry on" — the herdr bridge degrades
+/// to no bridge, so a child that never exits is strictly worse than one
+/// that fails: the user gets no sandbox at all instead of a sandbox
+/// without the bridge (issue #86).
+///
+/// The child is killed and reaped on expiry. Output is drained on threads
+/// rather than after the wait, because a child that fills a pipe buffer
+/// blocks on the write and would never reach the exit this function is
+/// waiting for — the deadline would hold, but only by killing a child
+/// that was merely talkative.
+pub(crate) fn run_ok_timeout(
+    program: &str,
+    args: &[String],
+    limit: std::time::Duration,
+) -> Result<String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run: {program} {}", args.join(" ")))?;
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = out_pipe.as_mut() {
+            let _ = std::io::Read::read_to_end(pipe, &mut buf);
+        }
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = err_pipe.as_mut() {
+            let _ = std::io::Read::read_to_end(pipe, &mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("failed to wait for: {program} {}", args.join(" ")))?
+        {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!(
+                    "`{program} {}` did not finish within {}s and was stopped",
+                    args.join(" "),
+                    limit.as_secs()
+                ));
+            }
+            None => std::thread::sleep(REAP_POLL),
+        }
+    };
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+    if !status.success() {
+        return Err(anyhow!(
+            "`{program} {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
 /// Runs `program` with `args`, streaming its output live instead of
 /// capturing it — for long commands (`container build`, `container system
 /// start`) whose progress the user needs to see, not parse. Both the
@@ -357,6 +437,49 @@ mod tests {
     // IS worth covering without any of that: a failing command still
     // surfaces as an `Err` carrying the command line, same contract as
     // `run_ok`.
+
+    #[test]
+    /// The bound is the point, so it is asserted against a child that
+    /// really does outlast it rather than against a mock. Two claims: the
+    /// call returns inside the bound (not after the child's own minute),
+    /// and it returns an error rather than an empty success — a launch
+    /// that silently treated a wedged download as "fine" would be worse
+    /// than one that hung, because it would go on to mount nothing.
+    fn run_ok_timeout_stops_a_child_that_outlasts_its_bound() {
+        let limit = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let err = run_ok_timeout("sleep", &["60".to_string()], limit)
+            .expect_err("a child still running at the deadline is a failure")
+            .to_string();
+        let waited = started.elapsed();
+
+        assert!(
+            err.contains("did not finish within"),
+            "the error must say it was the deadline rather than the command: {err}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "the call must return on the deadline, not on the child — waited {waited:?}"
+        );
+    }
+
+    #[test]
+    /// A child that exits inside the bound is unaffected, including one
+    /// that fails: the deadline must not turn every error into a timeout.
+    fn run_ok_timeout_is_transparent_to_a_child_that_finishes() {
+        let limit = std::time::Duration::from_secs(30);
+        let out = run_ok_timeout("echo", &["hello".to_string()], limit)
+            .expect("a command that finishes in time succeeds as usual");
+        assert_eq!(out.trim(), "hello", "and its stdout is returned intact");
+
+        let err = run_ok_timeout("false", &[], limit)
+            .expect_err("a non-zero exit is still an error")
+            .to_string();
+        assert!(
+            !err.contains("did not finish within"),
+            "and it is reported as the failure it is, not as a timeout: {err}"
+        );
+    }
 
     #[test]
     fn run_streaming_ok_on_success() {
