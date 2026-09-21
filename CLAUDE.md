@@ -5,7 +5,12 @@ Guidance for Claude Code (and other agents) working in this repo.
 ## Build & verify
 
 The Rust toolchain is pinned by the repo-top nix flake (`flake.nix` +
-`flake.lock`, replacing the old `mise.toml`). Inside the pall8t dev
+`flake.lock`, replacing the old `mise.toml`). That pin is the single
+source of truth: CI and release read it with `scripts/rust-version.sh`
+rather than installing a moving `stable`, so the compiler that gates a
+change is the one that produced it. `ci.yml` also runs a report-only
+`stable-canary` job, which says what a newer compiler thinks without
+letting it decide the build. Inside the pall8t dev
 container it is preinstalled — the image builds from the same lock file
 (`.pall8t/Containerfile`); on the host, `nix develop` opens a shell with
 it. Run checks directly with `cargo`:

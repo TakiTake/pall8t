@@ -6,6 +6,11 @@ on:
   pull_request:
 
 jobs:
+  # Every toolchain below comes from `scripts/rust-version.sh`, which reads
+  # the pin out of flake.nix. Before that, CI and release installed a
+  # moving `stable` while developers built on the flake's 1.96.0 — so the
+  # compiler that gated a change was never the one that produced it, and
+  # the release binary was built by a third (issue #91).
   test:
     # Both runners actually execute `cargo test`, not just build/lint — a
     # prior bug (ENOENT in the macOS `clonefile(2)` path of the since-removed
@@ -23,8 +28,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Toolchain version, from the flake
+        id: pin
+        run: echo "version=$(scripts/rust-version.sh)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.pin.outputs.version }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
@@ -36,3 +45,31 @@ jobs:
       # runs, on both runners.
       - name: CHANGELOG has a section for the current version
         run: scripts/release-notes.sh "$(cargo pkgid | sed 's/.*[@#]//')" > /dev/null
+
+  # What a newer compiler thinks, without letting it decide the build.
+  #
+  # Pinning CI to the flake fixes the drift that mattered — the gate now
+  # runs what developers run — but it also means a rustc release can
+  # break this crate and nobody hears until someone bumps the pin. This
+  # job is the early warning: report-only (`continue-on-error`), like
+  # mutants.yml and hygiene.yml, because a red build nobody chose teaches
+  # reflexive ignoring, and a toolchain the project has not adopted has
+  # not earned a veto.
+  #
+  # When it goes red the fix is usually to bump the flake pin on purpose
+  # and deal with the new lints in that PR.
+  stable-canary:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: rustc --version
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

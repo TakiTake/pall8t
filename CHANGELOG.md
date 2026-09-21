@@ -166,6 +166,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Development
 
+- **CI, release and the dev shell now build with the same compiler.**
+  `flake.nix` pinned Rust 1.96.0 while every workflow installed a moving
+  `stable` (1.98.1 at the time of writing), so the compiler that gated a
+  change was never the one that produced it, and the released binary was
+  built by a third. Every workflow now reads the pin from the flake via
+  `scripts/rust-version.sh` — one implementation, the way
+  `release-notes.sh` is — and it fails loudly if the flake ever changes
+  shape, rather than silently falling back to whatever `stable` is that
+  day. A report-only `stable-canary` job says what a newer compiler
+  thinks without letting it redden the build (issue #91).
+
 - **The `/release` skill's review step named a skill that doesn't exist.**
   Step 1 told the agent to run `/code-review` and `/skeptical-review` "until
   both come back clean"; there is no `/skeptical-review` in this repo, so
