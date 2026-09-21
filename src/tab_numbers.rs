@@ -376,10 +376,33 @@ enum Load {
     Frozen(u32),
 }
 
+/// Just the field that decides whether today's `State` is the right
+/// reader at all. Separate from [`State`] because it has to survive a
+/// body that `State` cannot deserialize — which is the whole point of
+/// [`Load::Frozen`].
+#[derive(Deserialize)]
+struct Envelope {
+    version: u32,
+}
+
 fn parse(text: &str) -> Load {
-    match serde_json::from_str::<State>(text) {
-        Ok(s) if s.version > SCHEMA => Load::Frozen(s.version),
-        Ok(s) => Load::Have(s),
+    // The version comes out of an envelope, before the body. Deciding it
+    // from a fully-deserialized `State` only worked while a newer file
+    // still happened to fit today's shape: `State`'s fields are required,
+    // so a v2 that renamed `sessions`, dropped a field or changed a type
+    // deserialized as `Err` → `Fresh` → overwritten. The guard stopped
+    // guarding in exactly the case it exists for (issue #89).
+    //
+    // A file that fails even at the envelope — truncated, not JSON, no
+    // `version` — is still legitimately `Fresh`: unreadable is not the
+    // same claim as "written by someone newer", and only the second one
+    // earns the file protection from our writer.
+    match serde_json::from_str::<Envelope>(text) {
+        Ok(env) if env.version > SCHEMA => Load::Frozen(env.version),
+        Ok(_) => match serde_json::from_str::<State>(text) {
+            Ok(s) => Load::Have(s),
+            Err(_) => Load::Fresh,
+        },
         Err(_) => Load::Fresh,
     }
 }
@@ -963,8 +986,32 @@ mod tests {
             "a file this version cannot read is not evidence another version \
              needs it: start over rather than give up forever"
         );
-    }
 
+        // The case the guard exists for, and the one it used to miss: a
+        // newer schema whose *body* today's `State` cannot deserialize.
+        // Before the envelope this fell to `Err` → `Fresh`, and the next
+        // write replaced a file belonging to a binary still using it.
+        for (label, text) in [
+            ("a renamed field", r#"{"version":2,"panes":{}}"#),
+            ("a retyped field", r#"{"version":2,"sessions":[]}"#),
+            ("a dropped field", r#"{"version":2}"#),
+        ] {
+            assert_eq!(
+                parse(text),
+                Load::Frozen(2),
+                "{label}: a file stamped newer than SCHEMA is frozen on the \
+                 strength of its version alone — whether today's State can \
+                 read the rest of it is not what decides who owns the file"
+            );
+        }
+
+        assert_eq!(
+            parse(r#"{"sessions":{}}"#),
+            Load::Fresh,
+            "no version at all is not a claim to be newer: unreadable stays \
+             Fresh, and only a readable-but-newer version earns protection"
+        );
+    }
     #[test]
     fn the_state_file_shape_is_the_contract_another_version_reads() {
         let literal = r#"{

@@ -79,6 +79,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `events.subscribe` may sit silent for hours, and a blanket idle timeout
   would cut exactly the streaming the bridge exists to carry (issue #85).
 
+- **A project's `.pall8t/config.toml` can no longer widen `[herdr] sandbox`.**
+  It merged per field with the project winning, so a cloned repository
+  carrying `sandbox = "full"` overrode a user who had globally chosen
+  `"readonly"` or `"off"` — and `full` is the mode whose panes and agents
+  run on the host, outside the sandbox. A project may now only narrow the
+  bridge (`full` → `readonly` → `off`), and one that asked to widen is
+  named on stderr rather than quietly dropped. Same rule, and the same
+  reasoning, as the `ssh` fix below: a project config shapes what runs
+  *inside* the box, never what the box reaches outside itself. The
+  `[[mounts]]` half of that question is deliberately left open (issue
+  #95) — mounting host paths is the feature's whole point, so the answer
+  there is not the same rule.
+
 - **A project's `.pall8t/config.toml` can no longer switch SSH forwarding
   on** — only your own `~/.pall8t/config.toml` or `pall8t run --ssh` can.
   A project config ships with the repository, so honoring `ssh = true`
@@ -109,6 +122,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.gitignore`. They carry no paths or identifiers from the machine that
   built them — checked before removal, since that is the usual reason a
   stray artifact matters.
+
+- **An unrecognized `container list` schema no longer reads as "no
+  containers".** `parse_list_all` accepted any JSON that was not an array
+  as an empty inventory, and silently dropped entries carrying no
+  identifier. That answer is what authorizes deletion: `pall8t build`
+  skips pruning superseded images when the in-use set is *unknown*, but a
+  schema that moved to, say, `{"containers": […]}` produced a confident
+  empty list instead — pruning images that running containers still used,
+  while reporting that it had checked. The listing schema is pre-1.0
+  (ADR-0001), so this is a version away rather than hypothetical. Both
+  cases are now errors that name what arrived (issue #84; the sibling
+  half, the per-run herdr binary sweep, went with the per-run copy in
+  0.7.0's read-only cache mount).
+- **A state file from a newer pall8t is left alone even when its body is
+  unreadable.** The downgrade guard decided the schema version *after*
+  deserializing the whole file as today's shape, so it only protected a
+  newer file that still happened to fit — a v2 that renamed a field or
+  changed a type fell through to "not readable, start over" and the next
+  run overwrote a file the newer binary was still using. The version now
+  comes from a `{"version": …}` envelope read before the body (issue #89).
+  A file that fails even at the envelope is still a legitimate reset, and
+  still says so.
 
 - **Four pure-inspection herdr methods were denied under
   `[herdr] sandbox = "readonly"`.** The relay's `READ` allowlist was last
@@ -147,6 +182,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool list to do it.
 
 ### Development
+
+- **CI, release and the dev shell now build with the same compiler.**
+  `flake.nix` pinned Rust 1.96.0 while every workflow installed a moving
+  `stable` (1.98.1 at the time of writing), so the compiler that gated a
+  change was never the one that produced it, and the released binary was
+  built by a third. Every workflow now reads the pin from the flake via
+  `scripts/rust-version.sh` — one implementation, the way
+  `release-notes.sh` is — and it fails loudly if the flake ever changes
+  shape, rather than silently falling back to whatever `stable` is that
+  day. A report-only `stable-canary` job says what a newer compiler
+  thinks without letting it redden the build (issue #91).
 
 - **The `/release` skill's review step named a skill that doesn't exist.**
   Step 1 told the agent to run `/code-review` and `/skeptical-review` "until
