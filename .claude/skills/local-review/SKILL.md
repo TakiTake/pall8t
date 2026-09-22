@@ -300,6 +300,27 @@ local review failed to catch first (source PRs noted).
   iterates the same constant the code does checks one thing fewer when an
   entry is deleted, and stays green.
 
+**Inserting an item next to an existing one** (PR #94, #105)
+- Anchoring an insertion on `#[test]`, `fn name(`, or any line that is
+  *part* of an item rather than its first line lands the new text between
+  that item's attributes/doc comment and the item itself. Two symptoms,
+  and only one of them is loud:
+  - an orphaned `#[test]` leaves the old test **silently not running**.
+    Caught here by `-D warnings` (the function becomes dead code) — but
+    only because nothing else referenced it.
+  - a split doc comment silently **documents the wrong item**: it
+    compiles, every test passes, and the item that lost its explanation
+    is the one a reader reaches for. Nothing in the toolchain catches
+    this; an external reviewer did.
+- Anchor on the whole item instead — the doc comment's first line, or the
+  blank line before it — and after inserting into a test module, check
+  the count rather than the output:
+  `cargo test --quiet -- --list | grep -c ': test$'` must rise by exactly
+  the number of tests added. A test that stopped being a test shows up
+  there and nowhere else.
+- This repo writes `/// doc` *above* `#[test]`, which is also the order
+  that makes a stray insertion visible rather than merely wrong.
+
 **Tests** (standing)
 - Per docs/testing.md: new tests use table form with reasoned assertion
   messages; each bug fix and each refuted review finding gets a pin;

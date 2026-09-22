@@ -438,13 +438,13 @@ mod tests {
     // surfaces as an `Err` carrying the command line, same contract as
     // `run_ok`.
 
-    #[test]
     /// The bound is the point, so it is asserted against a child that
     /// really does outlast it rather than against a mock. Two claims: the
     /// call returns inside the bound (not after the child's own minute),
     /// and it returns an error rather than an empty success — a launch
     /// that silently treated a wedged download as "fine" would be worse
     /// than one that hung, because it would go on to mount nothing.
+    #[test]
     fn run_ok_timeout_stops_a_child_that_outlasts_its_bound() {
         let limit = std::time::Duration::from_millis(200);
         // The child outlasts the bound by a wide margin but finishes
@@ -472,9 +472,9 @@ mod tests {
         );
     }
 
-    #[test]
     /// A child that exits inside the bound is unaffected, including one
     /// that fails: the deadline must not turn every error into a timeout.
+    #[test]
     fn run_ok_timeout_is_transparent_to_a_child_that_finishes() {
         let limit = std::time::Duration::from_secs(30);
         let out = run_ok_timeout("echo", &["hello".to_string()], limit)

@@ -535,7 +535,6 @@ fn a_config_still_using_repos_is_an_error_naming_its_replacement() {
     );
 }
 
-#[test]
 /// A mount the run will refuse costs a message, not a container build.
 /// Asserted with no `container` on PATH: the run has to fail on the mount
 /// and never reach the runtime check, so reading the *runtime's* absence
@@ -543,6 +542,7 @@ fn a_config_still_using_repos_is_an_error_naming_its_replacement() {
 ///
 /// Three shapes, because "validated before the build" has to hold for the
 /// whole check and not just the first one that happens to run early.
+#[test]
 fn a_bad_mount_is_refused_before_the_runtime_is_ever_started() {
     for (label, entry, needle) in [
         (
@@ -1201,22 +1201,13 @@ fn run_line(fake: &FakeRuntime) -> String {
         .to_string()
 }
 
-/// The provenance labels have to survive the same whole trip: `cmd_run`
-/// assembling them, `RunSpec`, `run_argv`. `container.rs` unit-tests the
-/// *emission* (one `--label` per entry, values sanitised) and the *reading*
-/// back out of `ls --json`, but neither notices if the run stops putting
-/// anything in the vector — `run_labels` returning `vec![]` passes every
-/// one of them. This is the test that would go red, and the reason the
-/// labels are worth anything: `pall8t ls` identifies its own containers by
-/// `pall8t.version` now, so a run that quietly stopped labelling would
-/// vanish from its own listing.
-#[test]
 /// The reservation is written where the pruner looks, naming the tag the
 /// run resolved. Asserted end to end because the two halves that can
 /// break it — *which* directory, and whether anything is written at all —
 /// are invisible to a unit test that is handed a directory: mutating
 /// either to a no-op left every in-module test green (`cargo mutants`),
 /// and the feature would then silently protect nothing.
+#[test]
 fn a_run_reserves_the_image_it_is_about_to_launch() {
     let sb = Sandbox::new("run-reserves");
     let fake = FakeRuntime::current(&sb);
@@ -1243,6 +1234,15 @@ fn a_run_reserves_the_image_it_is_about_to_launch() {
     );
 }
 
+/// The provenance labels have to survive the same whole trip: `cmd_run`
+/// assembling them, `RunSpec`, `run_argv`. `container.rs` unit-tests the
+/// *emission* (one `--label` per entry, values sanitised) and the *reading*
+/// back out of `ls --json`, but neither notices if the run stops putting
+/// anything in the vector — `run_labels` returning `vec![]` passes every
+/// one of them. This is the test that would go red, and the reason the
+/// labels are worth anything: `pall8t ls` identifies its own containers by
+/// `pall8t.version` now, so a run that quietly stopped labelling would
+/// vanish from its own listing.
 #[test]
 fn a_run_labels_the_container_with_its_own_provenance() {
     let sb = Sandbox::new("run-labels");
@@ -2138,13 +2138,13 @@ fn a_run_that_names_nothing_burns_no_number() {
 /// A state file from a newer pall8t is left exactly as it was. A rollback,
 /// or two builds sharing one `$HOME`, must not have their numbering
 /// silently rewritten by whichever binary ran last.
-#[test]
 /// The same protection, for the newer file that today's `State` cannot
 /// deserialize at all — a v2 that renamed its map rather than adding a
 /// field. That is the case the version check used to miss: it decided the
 /// version *after* deserializing, so this file fell through to "start
 /// over" and the run overwrote a file another binary was still using
 /// (issue #89).
+#[test]
 fn a_newer_state_file_is_kept_even_when_this_version_cannot_read_its_body() {
     let world = naming_world("run-naming-future-shape");
     let future = r#"{"version":2,"panes":{"w13:t2":{"n":7}}}"#;
