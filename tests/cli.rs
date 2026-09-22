@@ -176,10 +176,15 @@ case "$1" in
       # execs into it. A test that wants to observe the launch path removes
       # the runtime here (see `vanish_after_image_list`).
       list)   cat "{root}/images.json"; [ -f "{root}/vanish" ] && rm -f "{root}/bin/container" ;;
-      delete) ;;
+      # A delete that refuses, for the tests about what pall8t does with a
+      # tag it condemned and could not remove.
+      delete) [ -f "{root}/delete-fails" ] && exit 1 ;;
       *) exit 1 ;;
     esac ;;
-  build)   echo "fake build ok" >&2 ;;
+  # An optional hook lets a test give the build a side effect — changing
+  # a watched file mid-build is the only way to drive the poisoned path
+  # without racing a real build.
+  build)   [ -f "{root}/build-hook.sh" ] && sh "{root}/build-hook.sh"; echo "fake build ok" >&2 ;;
   stop)    ;;
   run|exec) echo "fake $1 reached" ;;
   *) exit 1 ;;
@@ -201,6 +206,23 @@ exit 0
             "[]",
             "[]",
         )
+    }
+
+    /// Makes `container image delete` refuse, so a condemned tag stays.
+    fn refuse_deletes(&self) {
+        std::fs::write(self.sandbox.root.join("delete-fails"), "").unwrap();
+    }
+
+    /// Gives `container build` a side effect, run before it reports
+    /// success. `sh` source, executed with the sandbox root available as
+    /// `$ROOT`.
+    fn build_hook(&self, script: &str) {
+        let root = self.sandbox.root.display();
+        std::fs::write(
+            self.sandbox.root.join("build-hook.sh"),
+            format!("ROOT={root}\n{script}\n"),
+        )
+        .unwrap();
     }
 
     fn set_containers(&self, json: &str) {
@@ -1231,6 +1253,130 @@ fn a_run_reserves_the_image_it_is_about_to_launch() {
         body.contains(&tag),
         "and it must name the tag this run resolved — a reservation for \
          some other string protects nothing: {body} (expected {tag})"
+    );
+}
+
+/// The write half: a build really poisoned, whose delete really failed,
+/// leaves a record behind.
+///
+/// Driven rather than simulated, because that is what the by-hand test
+/// below cannot show — mutation testing had `mark_poisoned` and
+/// `delete_poisoned` both surviving as no-ops with every other test
+/// green, since nothing reached them. A watched file changed *during* the
+/// build is the only way to reach the poisoned path without racing a real
+/// build, and a refused `image delete` is one of the two ways #103 names
+/// for a condemned tag to stay.
+#[test]
+fn a_poisoned_build_whose_delete_failed_records_the_tag() {
+    let sb = Sandbox::new("poisoned-record");
+    let fake = FakeRuntime::current(&sb);
+
+    // A watched file, so the post-build re-read has something to disagree
+    // about. `watch` needs a project Containerfile to be meaningful.
+    let proj = sb.project();
+    std::fs::create_dir_all(proj.join(".pall8t")).unwrap();
+    std::fs::write(proj.join(".pall8t").join("Containerfile"), "FROM scratch\n").unwrap();
+    std::fs::write(proj.join("watched.txt"), "before\n").unwrap();
+    sb.write_project_config("[container]\nwatch = [\"watched.txt\"]\n");
+
+    // Poison exactly once: the first build changes the watched file out
+    // from under itself, the retry then builds cleanly.
+    fake.build_hook(&format!(
+        "if [ ! -f \"$ROOT/poisoned-once\" ]; then \
+           echo after >> {}; touch \"$ROOT/poisoned-once\"; fi",
+        proj.join("watched.txt").display()
+    ));
+    fake.refuse_deletes();
+
+    let out = sb.run(&["build"]);
+    assert!(
+        out.status.success(),
+        "the retry against re-resolved content should still produce an \
+         image: {}",
+        stderr(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("could not delete poisoned tag"),
+        "the run must report the delete it could not do — that warning is \
+         the reason a record is needed at all: {err}"
+    );
+
+    let dir = sb.home().join(".pall8t").join("state").join("poisoned");
+    let records: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("no poisoned directory at {}: {e}", dir.display()))
+        .flatten()
+        .collect();
+    assert_eq!(
+        records.len(),
+        1,
+        "the condemned tag must be recorded, or the next run to resolve it \
+         reuses an image built from content it does not match"
+    );
+    let body = std::fs::read_to_string(records[0].path()).unwrap();
+    assert!(
+        body.contains("pall8t-") && body.contains("\"tag\""),
+        "and the record must name the tag it is about, so a human reading \
+         the directory can tell what was condemned: {body}"
+    );
+}
+
+/// A tag recorded as not matching its inputs is rebuilt, not reused —
+/// even though it exists.
+///
+/// This is the whole of issue #103 in one run: a poisoned build whose
+/// delete was refused (a container still using it) or failed leaves the
+/// tag in place, and because tags are content-addressed, the next run to
+/// resolve that same hash — a watched lockfile flapping back, a branch
+/// checked out again — used to be handed it straight back on the strength
+/// of `image_exists` alone.
+///
+/// Asserted end to end rather than on the predicate, because the two
+/// things that can break it are *which* file the record lives in and
+/// whether `ensure_built` consults it at all, and neither is visible to a
+/// unit test of the key.
+#[test]
+fn a_tag_recorded_as_poisoned_is_rebuilt_rather_than_reused() {
+    let sb = Sandbox::new("poisoned-tag");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    // Baseline, through `run` rather than `build`: `pall8t build` is the
+    // explicit "build it" command and always does (`BuildMode::Force`),
+    // so it cannot show the difference. `run` is the caller that asks
+    // whether the image is already there (`IfMissing`), which is the
+    // caller this issue is about.
+    sb.run(&["run"]);
+    assert!(
+        !fake.called("build "),
+        "an existing, untainted tag must not be rebuilt — otherwise this \
+         test cannot tell the record apart from ordinary behaviour: {}",
+        fake.argv_log()
+    );
+
+    // Now record it the way a refused delete does, by hand: the sandbox
+    // has no way to poison a build without racing a real one.
+    let dir = sb.home().join(".pall8t").join("state").join("poisoned");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Keyed through the crate's own derivation, not a hardcoded hash: a
+    // test that guessed the filename would pass while writing somewhere
+    // the code never reads, which is what it is here to rule out.
+    let key = pall8t::image::poisoned_key(&tag);
+    std::fs::write(dir.join(&key), format!(r#"{{"tag":"{tag}","ts":1}}"#)).unwrap();
+
+    fake.clear_log();
+    sb.run(&["run"]);
+    assert!(
+        fake.called("build "),
+        "a tag recorded as not matching its inputs must be rebuilt even \
+         though it exists — reusing it is exactly the bug: {}",
+        fake.argv_log()
+    );
+    assert!(
+        !dir.join(&key).exists(),
+        "and a clean rebuild must clear the record, or the tag is rebuilt \
+         on every run from now on"
     );
 }
 
