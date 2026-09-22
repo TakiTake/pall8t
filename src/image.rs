@@ -379,7 +379,17 @@ pub fn ensure_built(
     mode: BuildMode,
 ) -> Result<ResolvedImage> {
     let resolved = resolve(cwd, cfg, uid, gid)?;
-    if mode == BuildMode::IfMissing && container::image_exists(&resolved.tag) {
+    // Existence is not verification. A tag can outlive the check that
+    // would have condemned it — a poisoned build whose delete was refused
+    // because a container still used it, or failed outright — and because
+    // tags are content-addressed, a later run resolves that same tag the
+    // moment the content returns to that hash (a watched lockfile flapping
+    // back, a branch checked out again). Then this line would hand it
+    // straight back. The record is consulted so it cannot (issue #103).
+    if mode == BuildMode::IfMissing
+        && container::image_exists(&resolved.tag)
+        && !is_poisoned(&resolved.tag)
+    {
         return Ok(resolved);
     }
     match try_build(&resolved, uid, gid, mode.no_cache())? {
@@ -453,12 +463,26 @@ fn try_build(resolved: &ResolvedImage, uid: u32, gid: u32, no_cache: bool) -> Re
             watched,
         }) => combined_hash(&containerfile_bytes, &watched) != resolved.hash,
         Ok(ReadOutcome::Unreadable(path)) => {
+            // Not "continue" any more. The tag is content-addressed, so
+            // publishing one we could not confirm means every later run
+            // that resolves the same hash reuses an image nobody verified
+            // — and it will, because the only evidence `ensure_built`
+            // asks for is that the tag exists (issue #103).
+            //
+            // Folded into the poisoned path, which deletes the tag and
+            // retries once against freshly re-resolved content. A file
+            // that is transiently unreadable — an atomic rewrite caught
+            // mid-rename — is what the retry is for; one that is really
+            // gone fails the second resolve, naming the file, which is
+            // what the user needs to hear.
             eprintln!(
-                "pall8t: warning: could not re-read {} after building {} to confirm its tag — continuing",
+                "pall8t: could not re-read {} after building {}, so its tag \
+                 cannot be confirmed — rebuilding rather than publishing an \
+                 unverified image",
                 path.display(),
                 resolved.tag
             );
-            false
+            true
         }
         Err(_) => true,
     };
@@ -467,6 +491,9 @@ fn try_build(resolved: &ResolvedImage, uid: u32, gid: u32, no_cache: bool) -> Re
         return Ok(BuildAttempt::Poisoned);
     }
 
+    // Built from content it matches: whatever was recorded against this
+    // tag before is answered.
+    clear_poisoned(&resolved.tag);
     prune_superseded(resolved, uid, gid);
     Ok(BuildAttempt::Done)
 }
@@ -479,6 +506,13 @@ fn try_build(resolved: &ResolvedImage, uid: u32, gid: u32, no_cache: bool) -> Re
 /// later resolve of the same content would trust the wrong image — hence
 /// the instruction to rebuild once the container is gone.
 fn delete_poisoned(tag: &str) {
+    // Recorded before the delete is attempted, not after it fails. Both
+    // ways out of this function can leave the tag in place — a container
+    // still using it, or a delete that errors — and in both the tag then
+    // sits there as the only evidence `ensure_built` consults. The record
+    // is what stops "the tag exists" from meaning "the image is good"
+    // (issue #103).
+    mark_poisoned(tag);
     let in_use = match in_use_refs() {
         Some(refs) => container::in_use_contains(&refs, tag),
         None => true, // indeterminate — same safe posture as pruning
@@ -491,9 +525,74 @@ fn delete_poisoned(tag: &str) {
         );
         return;
     }
-    if let Err(e) = container::image_delete(tag) {
-        eprintln!("pall8t: warning: could not delete poisoned tag {tag}: {e:#}");
+    match container::image_delete(tag) {
+        // Gone, so there is nothing left to distrust.
+        Ok(()) => clear_poisoned(tag),
+        Err(e) => eprintln!("pall8t: warning: could not delete poisoned tag {tag}: {e:#}"),
     }
+}
+
+/// Where tags known not to match their inputs are recorded.
+fn poisoned_dir() -> Result<PathBuf> {
+    let dir = crate::config::state_dir()?.join("poisoned");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The filename a tag is recorded under.
+///
+/// Hashed rather than used verbatim: a tag carries a `:`, which is legal
+/// in a filename on both platforms pall8t runs on but reads like a path
+/// separator to anyone scanning the directory. The tag goes *inside* the
+/// file so the directory stays legible to a human.
+///
+/// `pub` so the integration suite can key the same file this module does.
+/// A test that hardcoded the hash would pass while reading a path the
+/// code never writes, which is the one thing it exists to rule out.
+pub fn poisoned_key(tag: &str) -> String {
+    format!("{}.json", container::sha256_hex_prefix(tag.as_bytes(), 16))
+}
+
+/// Records that `tag` was built from content it no longer matches.
+///
+/// Best-effort, and deliberately so: the alternative to a record we could
+/// not write is a rebuild we did not need, which costs minutes rather
+/// than correctness. A record we could not write costs a stale image.
+/// Neither is good; only the second is silent, so it warns.
+fn mark_poisoned(tag: &str) {
+    let write = || -> Result<()> {
+        let path = poisoned_dir()?.join(poisoned_key(tag));
+        let body = serde_json::json!({ "tag": tag, "ts": crate::util::epoch_secs() });
+        std::fs::write(&path, body.to_string())
+            .with_context(|| format!("cannot write {}", path.display()))
+    };
+    if let Err(e) = write() {
+        eprintln!(
+            "pall8t: warning: could not record {tag} as not matching its \
+             Containerfile ({e:#}); a later run may reuse it"
+        );
+    }
+}
+
+/// Forgets a poisoned record — the tag is gone, or has been rebuilt from
+/// content it does match.
+fn clear_poisoned(tag: &str) {
+    if let Ok(dir) = poisoned_dir() {
+        let _ = std::fs::remove_file(dir.join(poisoned_key(tag)));
+    }
+}
+
+/// Whether `tag` is recorded as not matching its inputs.
+///
+/// A record that cannot be read counts as *not* poisoned. That is the
+/// opposite of how this module treats an unreadable state elsewhere, and
+/// deliberately: distrusting on a read failure would rebuild every image
+/// on a machine whose state directory went unreadable, turning a
+/// diagnostic problem into minutes of work per run. The cost of being
+/// wrong here is bounded — one stale image, which the next real build
+/// replaces.
+fn is_poisoned(tag: &str) -> bool {
+    poisoned_dir().is_ok_and(|dir| dir.join(poisoned_key(tag)).exists())
 }
 
 /// Image references every existing container currently runs, from one
@@ -637,6 +736,67 @@ fn prune_superseded(resolved: &ResolvedImage, uid: u32, gid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record's round trip against a real directory: written,
+    /// observed, and cleared. `mark`/`is`/`clear` are three functions that
+    /// have to agree on one path, and the key test above proves only that
+    /// the path is stable — not that the three of them use it.
+    #[test]
+    fn a_poisoned_record_is_written_seen_and_cleared() {
+        // The state directory is HOME-derived, so this drives the three
+        // functions against the same path they would use in anger by
+        // pointing HOME at a temp dir for the length of the test. Done in
+        // one place, and the test is single-threaded within itself.
+        let dir = std::env::temp_dir().join(format!("p8t-poisoned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tag = "pall8t-x:501-20-abcdef123456";
+
+        // Written where `is_poisoned` looks, rather than asserted through
+        // HOME: the pair is what matters and the path is `poisoned_key`'s
+        // to decide.
+        let recorded = dir.join(poisoned_key(tag));
+        std::fs::write(&recorded, format!(r#"{{"tag":"{tag}","ts":1}}"#)).unwrap();
+        assert!(
+            recorded.exists(),
+            "the record has to be a file on disk — nothing else survives \
+             the process that wrote it, which is the point"
+        );
+        assert!(
+            recorded
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(&poisoned_key(tag)[..8])),
+            "and it has to be the file the key names"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The record is keyed so that two tags never collide and one tag is
+    /// always the same file — the whole mechanism is a filename lookup,
+    /// so the key *is* the correctness.
+    #[test]
+    fn a_poisoned_record_is_keyed_per_tag_and_stable() {
+        let a = "pall8t-x:501-20-aaaaaaaaaaaa";
+        let b = "pall8t-x:501-20-bbbbbbbbbbbb";
+        assert_eq!(
+            poisoned_key(a),
+            poisoned_key(a),
+            "the same tag must map to the same file, or a record written by \
+             one run is invisible to the next"
+        );
+        assert_ne!(
+            poisoned_key(a),
+            poisoned_key(b),
+            "and two tags must not share one, or condemning either would \
+             force a rebuild of both"
+        );
+        assert!(
+            !poisoned_key(a).contains(':') && poisoned_key(a).contains(".json"),
+            "the `:` a tag carries stays out of the filename: {}",
+            poisoned_key(a)
+        );
+    }
 
     /// The decision that protects an image from deletion, so the unknown
     /// case is pinned explicitly: this walk deletes images, and an
