@@ -246,14 +246,27 @@ pub fn list_all() -> Result<Vec<ContainerInfo>> {
     parse_list_all(&stdout)
 }
 
+/// The first step every `container … --format json` reader takes: empty
+/// output is "nothing to report" rather than a parse error, and anything
+/// else is parsed with `what` naming the command, so a schema change says
+/// which reader it broke. What a *non*-empty shape has to look like is the
+/// caller's own question — see [`parse_list_all`].
+fn parse_json_or_empty(stdout: &str, what: &str) -> Result<Option<Value>> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(trimmed)
+        .map(Some)
+        .with_context(|| format!("unexpected `{what}` JSON"))
+}
+
 /// Pure core of [`list_all`], factored out for testability against literal
 /// `container list --all --format json` output.
 fn parse_list_all(stdout: &str) -> Result<Vec<ContainerInfo>> {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
+    let Some(v) = parse_json_or_empty(stdout, "container list")? else {
         return Ok(Vec::new());
-    }
-    let v: Value = serde_json::from_str(trimmed).context("unexpected `container list` JSON")?;
+    };
     // An unrecognized shape is an error, never an empty list. Callers use
     // "no containers" to authorize deletion — `image::prune_superseded`
     // skips the prune when the in-use set is unknown, and that guard is
@@ -541,12 +554,9 @@ pub fn prunable_images(
     in_use: &[String],
 ) -> Result<Vec<String>> {
     let stdout = run_ok(["image", "list", "--format", "json"])?;
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
+    let Some(v) = parse_json_or_empty(&stdout, "container image list")? else {
         return Ok(Vec::new());
-    }
-    let v: Value =
-        serde_json::from_str(trimmed).context("unexpected `container image list` JSON")?;
+    };
     let mut refs = Vec::new();
     for_each_string(&v, &mut |s| refs.push(s.to_string()));
     Ok(filter_prunable(

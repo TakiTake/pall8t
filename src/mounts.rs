@@ -212,7 +212,7 @@ pub fn resolve(
 /// The per-mount `pall8t: mount …` lines already name every path and its
 /// mode. What they cannot say is which config asked, which is the fact
 /// this adds (issue #95).
-pub fn from_outside_the_project<'m>(
+fn from_outside_the_project<'m>(
     mounts: &'m [Mount],
     project: &Path,
     from_project: bool,
@@ -226,7 +226,7 @@ pub fn from_outside_the_project<'m>(
         .collect()
 }
 
-/// The line [`from_outside_the_project`] is worth printing, if any.
+/// The line `from_outside_the_project` is worth printing, if any.
 pub fn outside_project_notice(
     mounts: &[Mount],
     project: &Path,
