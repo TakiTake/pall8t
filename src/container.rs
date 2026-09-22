@@ -1535,13 +1535,13 @@ mod tests {
         assert_eq!(items[0].state, State::Running);
     }
 
-    #[test]
     /// "Empty" must mean an empty array was parsed, never "the shape was
     /// unrecognized". The distinction is load-bearing rather than tidy:
     /// `image::prune_superseded` deletes images that no container claims,
     /// and it decides that from this function's output — so a schema move
     /// that read as `Ok([])` would delete in-use images while reporting
     /// that it had verified they were free (issue #84).
+    #[test]
     fn an_unrecognized_listing_shape_is_an_error_not_an_empty_inventory() {
         for (label, json, needle) in [
             (
@@ -1893,12 +1893,12 @@ mod tests {
     /// property `Mount::spec` claims has to be enforced at construction —
     /// otherwise a home directory with a colon in it silently turns the
     /// container path into mount options.
-    #[test]
     /// The directory half of the same rule the socket guard states. A
     /// comma is to `--mount` what `:` is to `-v`: the field separator,
     /// with `ro` living in the list it separates — so a path carrying one
     /// does not fail, it reparses, and ADR-0009 is about a protection flag
     /// that must never be decided by a quiet misparse.
+    #[test]
     fn directory_mount_refuses_a_comma_in_either_path() {
         let ok = |m: &str| format!("/Users/me/{m}");
         for (label, host, dest) in [
@@ -1917,12 +1917,12 @@ mod tests {
         );
     }
 
-    #[test]
     /// `..` in a *target* is refused rather than normalized, because the
     /// target is resolved inside the container and never here. The case
     /// that makes it matter: `overlaps` compares components lexically, so
     /// `/home/../home/dev` clears the protected-path check and then lands
     /// on the container home anyway.
+    #[test]
     fn a_mount_target_refuses_a_parent_component() {
         let err = Mount::new("/Users/me/x".into(), "/home/../home/dev".into(), false)
             .expect_err("a target walking upward must be refused")

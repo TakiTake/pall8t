@@ -743,11 +743,11 @@ mod tests {
         );
     }
 
-    #[test]
     /// The download's bounds, asserted on the argv because the thing they
     /// guard — a stalled connection to github.com — is not something a
     /// test should reproduce. Each flag is here for a failure the others
     /// do not cover, so each is named.
+    #[test]
     fn download_argv_is_bounded_on_every_axis_that_can_hang() {
         let argv = download_argv(
             std::path::Path::new("/tmp/x.partial"),
