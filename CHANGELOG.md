@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A tag is no longer treated as proof the image behind it was
+  verified.** Two paths left a present-but-untrustworthy tag that later
+  runs reused on the strength of `container image inspect` alone. A build
+  whose Containerfile or watched files could not be re-read afterwards was
+  accepted with a warning — so its tag was published unconfirmed, and
+  because tags are content-addressed, every later run resolving the same
+  hash reused it. And a build found to be poisoned (its inputs changed
+  mid-build) keeps its tag when a container is still using it or the
+  delete fails, which is correct, but nothing recorded *why* it was being
+  kept: the moment the content returned to that hash — a watched lockfile
+  flapping back, a branch checked out again — the next run was handed the
+  mixed-content image. An unconfirmable build is now rebuilt rather than
+  published, and a tag known not to match its inputs is recorded under
+  `~/.pall8t/state/poisoned/` and rebuilt on the next run that resolves
+  it, with the record cleared once a clean build publishes that tag
+  (issue #103).
+
 ## [0.7.0] - 2026-09-21
 
 ### Added
