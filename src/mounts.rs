@@ -192,6 +192,74 @@ pub fn resolve(
 /// One line per mount for the user, naming what the agent may do with it.
 /// A run must never leave the difference implicit — read-only and writable
 /// are the whole point of the setting.
+/// What a project's own config asked to mount from outside the project,
+/// or `None` when there is nothing to say.
+///
+/// Measured before writing this (container 1.4.1): a socket inside a
+/// directory mount is *not* reachable from the guest — the node appears
+/// and `connect(2)` returns `ENOTSUP` — so a repository cannot use
+/// `[[mounts]]` to hand its own sandbox a live host socket, and
+/// `[herdr] sandbox = "off"` is not circumventable that way. That is why
+/// this reports rather than refuses: what is left is ordinary file
+/// exposure, and mounting host paths is the feature's whole point.
+///
+/// Scoped to *project*-declared mounts on purpose. A global mount is a
+/// path the human chose for themselves; this is about the file that
+/// arrives with the repository. And scoped to sources outside the project
+/// directory, because a repository mounting its own subdirectories is
+/// saying nothing the checkout does not already say.
+///
+/// The per-mount `pall8t: mount …` lines already name every path and its
+/// mode. What they cannot say is which config asked, which is the fact
+/// this adds (issue #95).
+pub fn from_outside_the_project<'m>(
+    mounts: &'m [Mount],
+    project: &Path,
+    from_project: bool,
+) -> Vec<&'m Mount> {
+    if !from_project {
+        return Vec::new();
+    }
+    mounts
+        .iter()
+        .filter(|m| !m.host.starts_with(project))
+        .collect()
+}
+
+/// The line [`from_outside_the_project`] is worth printing, if any.
+pub fn outside_project_notice(
+    mounts: &[Mount],
+    project: &Path,
+    from_project: bool,
+) -> Option<String> {
+    let outside = from_outside_the_project(mounts, project, from_project);
+    if outside.is_empty() {
+        return None;
+    }
+    let listed = outside
+        .iter()
+        .map(|m| {
+            format!(
+                "{} ({})",
+                m.host.display(),
+                if m.readonly { "read-only" } else { "writable" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "this repository's own .pall8t/config.toml mounts {} from outside \
+         the project: {listed} — a project config ships with the code the \
+         sandbox contains, so move any of these you would rather choose \
+         yourself into ~/.pall8t/config.toml",
+        if outside.len() == 1 {
+            "a path".to_string()
+        } else {
+            format!("{} paths", outside.len())
+        }
+    ))
+}
+
 pub fn describe(mount: &Mount) -> String {
     let mode = if mount.readonly {
         "read-only"
@@ -697,6 +765,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Who asked, and from where — the two axes that decide whether a
+    /// mount is worth a line. Both matter: reporting a global mount would
+    /// nag the human about their own choice, and reporting a project
+    /// mount inside the project would nag them about the checkout they
+    /// are standing in.
+    #[test]
+    fn only_a_project_config_reaching_outside_the_project_is_reported() {
+        let project = Path::new("/Users/me/src/app");
+        let inside = Mount::new(project.join("vendor"), project.join("vendor"), true).unwrap();
+        let outside = Mount::new("/Users/me/.ssh".into(), "/Users/me/.ssh".into(), false).unwrap();
+
+        assert!(
+            outside_project_notice(&[inside.clone(), outside.clone()], project, false).is_none(),
+            "a global config's mounts are the human's own choice; saying \
+             anything here would train them to skip the line that matters"
+        );
+        assert!(
+            outside_project_notice(std::slice::from_ref(&inside), project, true).is_none(),
+            "a project mounting its own subdirectory says nothing the \
+             checkout does not already say"
+        );
+
+        let msg = outside_project_notice(&[inside, outside], project, true)
+            .expect("a project config reaching outside itself is the case this is for");
+        assert!(
+            msg.contains("/Users/me/.ssh") && msg.contains("writable"),
+            "the notice must name the path and its mode — \"a path outside \
+             the project\" is not something a user can act on: {msg}"
+        );
+        assert!(
+            !msg.contains("vendor"),
+            "and must not list the in-project mount alongside it, or the \
+             one that matters is buried: {msg}"
+        );
+        assert!(
+            msg.contains("a path") && !msg.contains("1 paths"),
+            "one path reads as one path: {msg}"
+        );
+
+        let two = outside_project_notice(
+            &[
+                Mount::new("/a".into(), "/a".into(), true).unwrap(),
+                Mount::new("/b".into(), "/b".into(), true).unwrap(),
+            ],
+            project,
+            true,
+        )
+        .expect("two outside mounts are still reportable");
+        assert!(two.contains("2 paths"), "and two read as two: {two}");
     }
 
     #[test]

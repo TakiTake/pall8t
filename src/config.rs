@@ -41,6 +41,17 @@ pub struct Config {
     /// itself (see [`Hardening`]).
     pub hardening: Hardening,
     pub mounts: Vec<MountEntry>,
+    /// Whether [`Self::mounts`] came from the *project's*
+    /// `.pall8t/config.toml` rather than the user's global one.
+    ///
+    /// A single flag is the whole truth because [`merge`] replaces the
+    /// list rather than merging entries: if the project declared any
+    /// mounts, every mount is the project's. Carried because the two
+    /// cases mean different things — a global mount is a path the human
+    /// chose, while a project mount ships with the repository the sandbox
+    /// exists to contain, and one naming a path outside that repository
+    /// is worth saying out loud on the run that uses it (issue #95).
+    pub mounts_from_project: bool,
     /// `[herdr]` — how much of the host herdr session a sandboxed agent
     /// may reach through the relay bridge (see [`crate::relay`]).
     pub herdr: HerdrConfig,
@@ -660,6 +671,7 @@ fn merge(global: Raw, project: Raw) -> Config {
             .hardening
             .or(global.container.hardening)
             .unwrap_or_default(),
+        mounts_from_project: project.mounts.is_some(),
         mounts: project.mounts.or(global.mounts).unwrap_or_default(),
         // `[home]` is parsed and ignored; `load` turns its presence into a
         // deprecation message, which `merge` (path-less) can't produce.
