@@ -165,6 +165,16 @@ fn ensure_container_system() -> Result<()> {
             "the `container` CLI is not available — install apple/container from \
              https://github.com/apple/container/releases"
         )),
+        // Deliberately *not* the install message. This is the probe
+        // failing for a reason that says nothing about whether the
+        // runtime is installed, and telling someone to install software
+        // they already have sends them to fix the wrong thing.
+        container::SystemStatus::ProbeFailed(e) => Err(anyhow!(
+            "cannot check whether the `container` runtime is up: {e} — the \
+             CLI may be there and unreachable right now (a descriptor or \
+             process limit, or a `container` that is not executable), so \
+             retry before reinstalling"
+        )),
     }
 }
 

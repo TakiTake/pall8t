@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A runtime probe that could not run no longer reports the runtime as
+  missing.** `container system status` doubled as the is-it-installed
+  check, and *every* spawn failure became "the `container` CLI is not
+  available — install apple/container". Only `NotFound` means that.
+  `PermissionDenied` on a `container` that is there but not executable,
+  or a descriptor/process limit on a machine running several sandboxes,
+  all produced the same confident wrong instruction: reinstall software
+  the user already has, while hiding the limit they actually hit. Those
+  now report what failed and say to retry. Found by pall8t's own suite
+  producing it once on a loaded CI runner — the same line
+  `relay::connect_says_dead` already drew for the same reason.
+
 ### Added
 
 - **A run says when the repository's own config mounts a host path from
