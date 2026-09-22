@@ -878,6 +878,7 @@ mod tests {
             command: vec!["claude".to_string()],
             ssh: false,
             hardening: crate::config::Hardening::default(),
+            mounts_from_project: false,
             mounts: vec![],
             warnings: vec![],
             herdr: crate::config::HerdrConfig::default(),

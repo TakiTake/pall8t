@@ -1380,6 +1380,53 @@ fn a_tag_recorded_as_poisoned_is_rebuilt_rather_than_reused() {
     );
 }
 
+/// The run says when the *repository's own* config is the one mounting a
+/// host path from outside the project — the fact the per-mount lines
+/// cannot carry, since they name the path but not who asked (issue #95).
+#[test]
+fn a_project_config_mounting_outside_the_project_says_so_on_the_run() {
+    let sb = Sandbox::new("outside-mounts");
+    let fake = FakeRuntime::current(&sb);
+    let tag = build_once(&sb, &fake);
+    fake.set_images(std::slice::from_ref(&tag));
+
+    // Somewhere on the host that is not this project.
+    let elsewhere = sb.home().join("reference");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    sb.write_project_config(&format!(
+        "[[mounts]]\nsource = \"{}\"\nreadonly = true\n",
+        elsewhere.display()
+    ));
+
+    let err = stderr(&sb.run(&["run"]));
+    assert!(
+        err.contains("this repository's own .pall8t/config.toml mounts"),
+        "the run must say which config asked, not only what was mounted: {err}"
+    );
+    assert!(
+        err.contains(&elsewhere.display().to_string()) && err.contains("read-only"),
+        "and name the path with its mode, or there is nothing to act on: {err}"
+    );
+
+    // The same mount from the human's own global config is their choice,
+    // and must not draw the line — otherwise it fires on every run and
+    // stops being read.
+    std::fs::remove_file(sb.project().join(".pall8t").join("config.toml")).unwrap();
+    sb.write_global_config(&format!(
+        "[[mounts]]\nsource = \"{}\"\nreadonly = true\n",
+        elsewhere.display()
+    ));
+    let err = stderr(&sb.run(&["run"]));
+    assert!(
+        !err.contains("this repository's own"),
+        "a global mount is the human's own choice: {err}"
+    );
+    assert!(
+        err.contains(&elsewhere.display().to_string()),
+        "but it is still listed as a mount, as it always was: {err}"
+    );
+}
+
 /// The provenance labels have to survive the same whole trip: `cmd_run`
 /// assembling them, `RunSpec`, `run_argv`. `container.rs` unit-tests the
 /// *emission* (one `--label` per entry, values sanitised) and the *reading*

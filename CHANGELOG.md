@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A run says when the repository's own config mounts a host path from
+  outside the project.** `[[mounts]]` in a project's `.pall8t/config.toml`
+  can name any path on the host, and that file arrives with the code the
+  sandbox exists to contain — the per-mount lines named the path but not
+  which config asked for it. Each such mount is now reported with its
+  mode, and with where to move it. Only project-declared mounts reaching
+  outside the project: a global mount is the human's own choice, and a
+  project mounting its own subdirectory says nothing the checkout does
+  not. Reported rather than refused, and that is measured rather than
+  assumed — on container 1.4.1 a socket inside a directory mount is not
+  reachable from the guest (the node appears, `connect(2)` returns
+  `ENOTSUP`), so a repository cannot use `[[mounts]]` to hand its sandbox
+  a live host socket, and `[herdr] sandbox = "off"` is not circumventable
+  that way. What is left is ordinary file exposure, which is worth seeing
+  (issue #95).
+
 ### Fixed
 
 - **A tag is no longer treated as proof the image behind it was

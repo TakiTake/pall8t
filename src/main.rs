@@ -327,13 +327,25 @@ fn herdr_labels(env: &herdr::HerdrEnv, sandbox: config::HerdrSandbox) -> Vec<(St
     labels
 }
 
-fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<bool>) -> Result<()> {
-    let (cwd, cfg) = workspace_config()?;
-    let run_name = container::run_name(&cwd);
+/// Everything about a launch that is decidable from the config and this
+/// filesystem: the implicit mounts, a worktree's git directory, the
+/// configured `[[mounts]]`, and the container home.
+///
+/// A named phase because #90 made it one — it runs *before* the runtime
+/// starts and the image builds, so every way it can fail (a target that
+/// is not absolute, one that walks upward or overlaps a protected path, a
+/// source that does not exist or is not a directory, a comma in either)
+/// costs a message rather than a container build.
+struct MountPlan {
+    mounts: Vec<container::Mount>,
+    /// Probed here, and needed again for the provenance label.
+    main_git_dir: Option<PathBuf>,
+}
 
-    let mut mounts = vec![container::Mount::identity(cwd.clone())?];
+fn plan_mounts(cwd: &Path, cfg: &config::Config, readonly: Option<bool>) -> Result<MountPlan> {
+    let mut mounts = vec![container::Mount::identity(cwd.to_path_buf())?];
     // One probe, two consumers: the mount below and the provenance label.
-    let main_git_dir = worktree::main_git_dir(&cwd);
+    let main_git_dir = worktree::main_git_dir(cwd);
     if let Some(git_dir) = main_git_dir.clone() {
         eprintln!(
             "pall8t: git worktree detected — also mounting {}",
@@ -352,11 +364,29 @@ fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<boo
     if let Some(msg) = mounts::no_mounts_warning(readonly, cfg.mounts.len()) {
         eprintln!("{msg}");
     }
-    for m in mounts::resolve(&cfg.mounts, &protected, readonly)? {
+    let configured = mounts::resolve(&cfg.mounts, &protected, readonly)?;
+    if let Some(msg) = mounts::outside_project_notice(&configured, cwd, cfg.mounts_from_project) {
+        eprintln!("pall8t: warning: {msg}");
+    }
+    for m in configured {
         eprintln!("pall8t: {}", mounts::describe(&m));
         mounts.push(m);
     }
     mounts.push(container::Mount::rw(container::home_mount()?, home_dest)?);
+
+    Ok(MountPlan {
+        mounts,
+        main_git_dir,
+    })
+}
+
+fn cmd_run(cli_command: Vec<String>, readonly: Option<bool>, cli_ssh: Option<bool>) -> Result<()> {
+    let (cwd, cfg) = workspace_config()?;
+    let run_name = container::run_name(&cwd);
+
+    let plan = plan_mounts(&cwd, &cfg, readonly)?;
+    let mut mounts = plan.mounts;
+    let main_git_dir = plan.main_git_dir;
 
     // Everything above is decidable from the config and this filesystem,
     // and every way it can fail is the user's to fix before anything is
