@@ -411,12 +411,7 @@ fn reap_stale_sockets(dir: &Path, grace: std::time::Duration, is_live: impl Fn(&
 /// Append-only audit log: one JSON line per decision. Best-effort — the
 /// relay must keep serving even if the log can't be written.
 fn audit(log_path: &Path, entry: &serde_json::Value) {
-    let line = format!("{entry}\n");
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .and_then(|mut f| f.write_all(line.as_bytes()));
+    crate::util::append_line(log_path, &format!("{entry}\n"));
 }
 
 /// Exits the process the moment the parent changes — i.e. the exec'd

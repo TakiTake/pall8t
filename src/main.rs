@@ -202,30 +202,13 @@ fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
-/// Shared `run`/`build` preamble: canonical cwd, merged config, container
-/// system up, host ids, image resolved (and built if missing/forced).
-///
-/// Config is read *before* the container check so a config problem is
-/// reported even on a machine where the `container` CLI is missing — the
-/// user fixing one shouldn't have to fix the other first to hear about it.
-fn workspace_image(
-    mode: image::BuildMode,
-) -> Result<(
-    std::path::PathBuf,
-    config::Config,
-    u32,
-    u32,
-    image::ResolvedImage,
-)> {
-    let (cwd, cfg) = workspace_config()?;
-    let (uid, gid, resolved) = build_image(&cwd, &cfg, mode)?;
-    Ok((cwd, cfg, uid, gid, resolved))
-}
-
 /// The half of the preamble that touches nothing outside this machine's
 /// filesystem: where we are, and what the config says. Split out so a
 /// launch can be *planned* — and rejected — before [`build_image`] starts
-/// the runtime and builds anything (issue #90).
+/// the runtime and builds anything (issue #90). Reading it first is also
+/// what reports a config problem on a machine where the `container` CLI
+/// is missing — the user fixing one shouldn't have to fix the other first
+/// to hear about it.
 fn workspace_config() -> Result<(std::path::PathBuf, config::Config)> {
     let cwd = std::env::current_dir()?
         .canonicalize()
@@ -529,7 +512,8 @@ fn cmd_build(no_cache: bool) -> Result<()> {
     } else {
         image::BuildMode::Force
     };
-    let (_, _, _, _, resolved) = workspace_image(mode)?;
+    let (cwd, cfg) = workspace_config()?;
+    let (_, _, resolved) = build_image(&cwd, &cfg, mode)?;
     println!("built {}", resolved.tag);
     Ok(())
 }
