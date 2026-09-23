@@ -90,12 +90,34 @@ where
 pub enum SystemStatus {
     Running,
     Stopped,
-    /// The `container` CLI itself couldn't be spawned.
+    /// The `container` CLI is not installed: the spawn failed with
+    /// `NotFound`, which is the runtime answering rather than the probe
+    /// giving up.
     CliMissing,
+    /// The probe could not be made at all — it failed for a reason that
+    /// says nothing about whether the CLI is installed. Carries the
+    /// error so the caller can report what actually happened.
+    ProbeFailed(String),
 }
 
-/// One `container system status` probe. A spawn failure doubles as the
-/// missing-CLI check, so the happy path costs a single subprocess.
+/// Whether a failure to spawn `container` means it is not installed.
+///
+/// Only `NotFound` does. Every other spawn error is the probe failing,
+/// not an answer about the runtime: `PermissionDenied` on a `container`
+/// that is there but not executable, `WouldBlock`/`Other` when the
+/// process table or a descriptor limit is against us — which a machine
+/// running several sandboxes plus a test suite can manage.
+///
+/// The same rule [`crate::relay`]'s `connect_says_dead` follows, for the
+/// same reason: collapsing "could not ask" into "the answer is no"
+/// produces a confident wrong statement. Here the statement is "install
+/// apple/container", told to someone who already has it.
+fn spawn_error_means_missing(kind: std::io::ErrorKind) -> bool {
+    kind == std::io::ErrorKind::NotFound
+}
+
+/// One `container system status` probe, which doubles as the
+/// is-it-installed check — so the happy path costs a single subprocess.
 pub fn system_status() -> SystemStatus {
     match Command::new("container")
         .args(["system", "status"])
@@ -103,7 +125,8 @@ pub fn system_status() -> SystemStatus {
     {
         Ok(out) if out.status.success() => SystemStatus::Running,
         Ok(_) => SystemStatus::Stopped,
-        Err(_) => SystemStatus::CliMissing,
+        Err(e) if spawn_error_means_missing(e.kind()) => SystemStatus::CliMissing,
+        Err(e) => SystemStatus::ProbeFailed(e.to_string()),
     }
 }
 
@@ -1206,6 +1229,38 @@ mod tests {
                 None,
                 "nothing in {junk:?} is a version triple, and guessing one would \
                  produce a warning about a version nobody is running"
+            );
+        }
+    }
+
+    /// Which spawn failures are the runtime answering, and which are the
+    /// probe giving up. The table is the fix: one arm used to swallow all
+    /// of them and report "not installed", so a machine that momentarily
+    /// could not fork was told to install software it already had — and
+    /// pall8t's own suite produced exactly that, once, on a loaded CI
+    /// runner.
+    ///
+    /// Mirrors `relay::connect_says_dead`, which draws the same line for
+    /// the same reason.
+    #[test]
+    fn only_not_found_means_the_cli_is_missing() {
+        use std::io::ErrorKind;
+        assert!(
+            spawn_error_means_missing(ErrorKind::NotFound),
+            "nothing on PATH is the runtime answering: it is not installed"
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+            ErrorKind::OutOfMemory,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !spawn_error_means_missing(kind),
+                "{kind:?} says the probe failed, not that the CLI is absent — \
+                 reporting it as absent sends the user to reinstall a runtime \
+                 that is already there, and hides the limit they actually hit"
             );
         }
     }

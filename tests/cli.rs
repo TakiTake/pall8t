@@ -1427,6 +1427,38 @@ fn a_project_config_mounting_outside_the_project_says_so_on_the_run() {
     );
 }
 
+/// A `container` that is present but not executable must not be reported
+/// as absent.
+///
+/// The distinction is invisible to a unit test of the classifier —
+/// mutation testing had the guard in `system_status` surviving as `true`,
+/// which is the old behaviour restored — so this drives the real probe:
+/// a file named `container` on the child's PATH with no execute bit makes
+/// the spawn fail `PermissionDenied`, which is the runtime saying nothing
+/// about whether it is installed.
+#[test]
+fn a_container_that_cannot_be_executed_is_not_reported_as_missing() {
+    let sb = Sandbox::new("probe-perm");
+    // Deliberately not FakeRuntime: the point is a `container` that
+    // exists and cannot be run.
+    let bin = sb.root.join("bin").join("container");
+    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let err = stderr(&sb.run(&["build"]));
+
+    assert!(
+        err.contains("cannot check whether the `container` runtime is up"),
+        "the failure has to be reported as a failed check: {err}"
+    );
+    assert!(
+        !err.contains("install apple/container"),
+        "and must not tell the user to install a runtime that is sitting \
+         right there — that sends them to fix the wrong thing and hides \
+         what actually failed: {err}"
+    );
+}
+
 /// The provenance labels have to survive the same whole trip: `cmd_run`
 /// assembling them, `RunSpec`, `run_argv`. `container.rs` unit-tests the
 /// *emission* (one `--label` per entry, values sanitised) and the *reading*
