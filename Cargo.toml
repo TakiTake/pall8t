@@ -41,6 +41,7 @@ toml = "0.8"
 
 [dev-dependencies]
 # Property tests (docs/testing.md, "Properties with a reference model"). Only
-# `std`: the default `fork`/`timeout`/regex-strategy features pull in a
-# process-forking runner and a regex engine this suite does not use.
+# `std`: the defaults add `fork`/`timeout` (a process-forking runner, via
+# rusty-fork and tempfile) and `bit-set`, none of which this suite uses.
+# `std` itself still brings `regex-syntax` (proptest 1.11), so that one stays.
 proptest = { version = "1", default-features = false, features = ["std"] }
