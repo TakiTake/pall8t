@@ -116,9 +116,9 @@ cargo pkgid | sed 's/.*[@#]//'   # must equal $VERSION
 
 ## 5. Gates and PR
 
-Run the quality gates from `CLAUDE.md` — `scripts/lint.sh` (both targets)
-and `cargo test` — and **check their exit status**, not just that output
-scrolled past. Then run the `local-review` skill on the diff — before
+Run the local checks from `CLAUDE.md`'s Build & verify — `scripts/lint.sh`
+(both targets) and `cargo test` — and **check their exit status**, not just
+that output scrolled past. Then run the `local-review` skill on the diff — before
 *every* push to the PR, not only the first: a fix for a review finding is
 a new diff, and it is the revision nobody has reviewed yet.
 

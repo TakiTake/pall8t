@@ -5,7 +5,7 @@ Guidance for Claude Code (and other agents) working in this repo.
 ## Build & verify
 
 The Rust toolchain is pinned by the repo-top nix flake (`flake.nix` +
-`flake.lock`, replacing the old `mise.toml`). That pin is the single
+`flake.lock`). That pin is the single
 source of truth: CI and release read it with `scripts/rust-version.sh`
 rather than installing a moving `stable`, so the compiler that gates a
 change is the one that produced it. `ci.yml` also runs a report-only
@@ -52,7 +52,7 @@ tests with reasoned assertions, regression pins).
   merge speculatively.
 - Before opening or updating a PR, run the `local-review` skill on the
   branch diff — the external reviewers should come back empty-handed.
-- CodeRabbit no longer reviews on its own: opening or pushing to a PR
+- CodeRabbit does not review on its own: opening or pushing to a PR
   triggers nothing. Asking it for a review (`@coderabbitai review` as a
   PR comment) is the human's call — don't spend one unprompted.
 - PR review feedback (bot or human) is handled with the `review-loop`
@@ -83,7 +83,7 @@ stop there.
 - Homebrew formula: [TakiTake/homebrew-tap](https://github.com/TakiTake/homebrew-tap)
 - Requirements: [docs/requirements.md](docs/requirements.md)
 - Architecture decisions: [docs/adr/](docs/adr/)
-- Testing conventions (read before writing tests): [docs/testing.md](docs/testing.md)
+- Testing conventions: [docs/testing.md](docs/testing.md)
 - Sandbox environment details: `.claude/skills/pall8t`
 - Quality gates (`quality.yml`, per PR, **blocking**): incremental
   mutation testing over the PR's own diff (`cargo mutants --in-diff` — a
@@ -100,9 +100,8 @@ stop there.
   not a complete inventory of what it serves.
 - Review automation: Codex PR review (`codex-review.yml`) stays dormant
   until an `OPENAI_API_KEY` secret exists (paid); CodeRabbit config in
-  `.coderabbit.yaml` — installed, but automatic review is off, so it runs
-  only when someone comments `@coderabbitai review` on the PR (the free
-  plan meters reviews).
+  `.coderabbit.yaml` (on demand only — see Git workflow; the free plan
+  meters reviews).
 - herdr plugin (contrib): `contrib/herdr-plugin/` — sandbox status/shell/
   rebuild/stop from a herdr pane. A thin shell over the pall8t CLI whose
   only contract is `pall8t ls --json`; when that output shape changes, it
