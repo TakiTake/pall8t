@@ -199,6 +199,14 @@ local review failed to catch first (source PRs noted).
   memory.
 - Preconditions stated as absolutes ("X works inside the sandbox")
   that are actually conditional — qualify them.
+- **What a dependency pulls in** (PR #111): a comment saying which
+  crates a feature selection avoids is a claim about the *feature table*,
+  not about the flag. proptest's `std` itself enables `regex-syntax`, so
+  `default-features = false` did not drop the regex engine the comment
+  said it did. Read the dependency's `[features]` and confirm with
+  `cargo tree -i <crate>` — without narrowing `-e`: `-e dev` shows only
+  dev edges, and a crate reached through the dev-dependency's own normal
+  edge then prints "nothing to print", which reads as "not pulled in".
 
 **CI workflows** (PR #39)
 - `actions/checkout`: `persist-credentials: false` unless the job pushes.

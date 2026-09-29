@@ -97,6 +97,43 @@ It is still bound by the rule above — no live runtime, no live herdr:
   a single stalled read there wedges the whole mutation run — no report,
   no output, until someone notices.
 
+## Properties with a reference model
+
+Table tests pin the scenarios someone thought of. Where a function keeps a
+promise over *sequences* — a state machine, an encoder and its decoder — a
+property test checks the promise over sequences nobody wrote down, with
+[proptest](https://docs.rs/proptest) (a dev-dependency only). The first one
+is `tab_numbers::properties`, which drives `allocate` with random runs of
+allocations, server restarts, unreadable sockets and more sessions than the
+state keeps.
+
+- **Check against a model, not against the code's own bookkeeping.** The
+  model is what an outside observer could know, kept in a different shape
+  from the implementation — `allocate` keeps a running counter, its model
+  keeps the *set* of numbers a server run has seen — so the two agree only
+  if the counter is right. A model that copies a decision from the state
+  instead of making it (an early draft accepted whatever sessions `evict`
+  kept) passes against broken code; run the step below to find out.
+- **Borrow an oracle only for what has its own tests,** and say so in the
+  module doc (`number_in_label` there). The property is then about what the
+  code does with the answer, and cargo-mutants will report the borrowed
+  function as uncaught by the property — that is expected, not a gap.
+- **Generators keep the boundaries in.** Empty strings, a lone `-`, a
+  number 0, a name long enough to be capped, more sessions than the bound.
+  A generator tuned to produce only "realistic" input is how a guard-clause
+  bug survives a property test.
+- **Pin the case count** (`ProptestConfig { cases: 256, .. }`) with a
+  comment saying why: every mutant the PR gate tries runs the whole suite
+  again, so cases multiply its wall time. `PROPTEST_CASES=10000 cargo test
+  <module>` still overrides it for a deliberate soak.
+- **Assertion messages say why**, the same as table tests.
+- **Prove it goes red.** Run the property alone as the suite —
+  `cargo mutants -f src/<file>.rs -- --lib <module>::properties` — and read
+  what it misses; then break the code by hand in ways cargo-mutants does not
+  generate (delete a statement, drop a combinator) and watch it fail.
+- **Commit `proptest-regressions/` for a real failure you fixed**, since it
+  is the pinned regression. Delete the file a deliberate break wrote.
+
 ## Coverage
 
 `cargo llvm-cov --summary-only` (install once with `cargo install

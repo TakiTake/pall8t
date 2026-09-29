@@ -1062,3 +1062,271 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// [`allocate`] driven by random operation sequences and checked against a
+/// reference model (docs/testing.md, "Properties with a reference model").
+///
+/// The table tests above pin the scenarios someone thought of; these check
+/// the promise itself over sequences nobody wrote down — restarts between
+/// adoptions, pruning in the middle of a base switch, more sessions than
+/// [`MAX_SESSIONS`]. The model keeps what an observer could know from the
+/// outside — which numbers a server run has already *seen* — as a set, not
+/// as the allocator's running counter, so the two formulations can only
+/// agree if the counter bookkeeping is right.
+///
+/// What a label *means* is not re-derived here: the model asks
+/// [`number_in_label`] (via [`Alloc::adopt`] and directly), which has its own
+/// table tests. These properties are about what `allocate` does with it.
+#[cfg(test)]
+mod properties {
+    use super::*;
+    use crate::naming::with_counter;
+    use proptest::prelude::*;
+
+    /// `None` is the pane herdr gave no socket path; the rest are more
+    /// sessions than [`MAX_SESSIONS`] keeps, so eviction is part of the
+    /// sequences rather than a case of its own.
+    const SOCKETS: [Option<&str>; 11] = [
+        None,
+        Some("/tmp/s0.sock"),
+        Some("/tmp/s1.sock"),
+        Some("/tmp/s2.sock"),
+        Some("/tmp/s3.sock"),
+        Some("/tmp/s4.sock"),
+        Some("/tmp/s5.sock"),
+        Some("/tmp/s6.sock"),
+        Some("/tmp/s7.sock"),
+        Some("/tmp/s8.sock"),
+        Some("/tmp/s9.sock"),
+    ];
+    /// The empty id is a boundary herdr never sends, kept because nothing in
+    /// `allocate` should care.
+    const TABS: [&str; 5] = ["", "w1:t1", "w1:t2", "w2:t1", "w2:t2"];
+    /// A base that itself ends in a number (`api-2`), the empty base (which
+    /// `with_counter` renders as `p`), and one long enough that its labels
+    /// get shortened to fit herdr's cap.
+    const BASES: [&str; 4] = [
+        "demo",
+        "api-2",
+        "",
+        "a-rather-long-agent-name-that-hits-the-cap",
+    ];
+    /// Labels shaped like counters but not: a human's, a dangling dash, a
+    /// counter with no head, a `+`-signed and a non-digit tail.
+    const GARBAGE: [&str; 5] = ["human", "demo-", "-3", "demo-+3", "demo-3x"];
+
+    #[derive(Debug, Clone)]
+    struct Op {
+        socket: usize,
+        /// The server run the socket answers for, by inode; `None` is a
+        /// socket that could not be stat'ed.
+        server: Option<u64>,
+        tab: usize,
+        base: usize,
+        own_label: Option<String>,
+        live_tabs: Option<BTreeSet<String>>,
+        live_labels: Option<BTreeSet<String>>,
+    }
+
+    /// A label as it can be on screen: one pall8t wrote for some base
+    /// (number 0 included), that name after a collision walk, or garbage.
+    fn label() -> impl Strategy<Value = String> {
+        prop_oneof![
+            (0..BASES.len(), 0usize..6).prop_map(|(b, n)| with_counter(BASES[b], n)),
+            (0..BASES.len(), 0usize..6, 2usize..4)
+                .prop_map(|(b, n, k)| with_counter(&with_counter(BASES[b], n), k)),
+            (0..GARBAGE.len()).prop_map(|g| GARBAGE[g].to_string()),
+        ]
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        (
+            0..SOCKETS.len(),
+            prop::option::of(1u64..=3),
+            0..TABS.len(),
+            0..BASES.len(),
+            prop::option::of(label()),
+            prop::option::of(prop::sample::subsequence(TABS.to_vec(), 0..=TABS.len())),
+            prop::option::of(prop::collection::btree_set(label(), 0..4)),
+        )
+            .prop_map(
+                |(socket, server, tab, base, own_label, live_tabs, live_labels)| Op {
+                    socket,
+                    server,
+                    tab,
+                    base,
+                    own_label,
+                    live_tabs: live_tabs.map(|t| t.into_iter().map(String::from).collect()),
+                    live_labels,
+                },
+            )
+    }
+
+    fn server(ino: u64) -> ServerRun {
+        ServerRun {
+            dev: 1,
+            ino,
+            birth_secs: Some(1_700_000_000),
+            birth_nanos: Some(0),
+        }
+    }
+
+    /// What an outside observer knows about one session.
+    #[derive(Default)]
+    struct ModelSession {
+        /// The server run the numbers belong to, as last learned.
+        server: Option<u64>,
+        /// Per base, every number this server run has handed out or been
+        /// shown on a label while choosing a fresh one. A fresh number is
+        /// one past all of them.
+        seen: BTreeMap<String, BTreeSet<usize>>,
+        tabs: BTreeMap<String, (String, usize)>,
+        last_used: u64,
+    }
+
+    /// Runs `ops` through [`allocate`], checking each result against the
+    /// model, and returns the final state.
+    fn run(ops: &[Op]) -> Result<State, TestCaseError> {
+        let mut state = State::default();
+        let mut model: BTreeMap<String, ModelSession> = BTreeMap::new();
+        for (now, op) in (1u64..).zip(ops) {
+            let socket_path = SOCKETS[op.socket];
+            let key = socket_path.unwrap_or_default().to_string();
+            let tab = TABS[op.tab];
+            let base = BASES[op.base];
+            let req = Alloc {
+                socket_path,
+                base,
+                tab_id: tab,
+                own_label: op.own_label.as_deref(),
+                live_tabs: op.live_tabs.as_ref(),
+                live_labels: op.live_labels.as_ref(),
+                now,
+            };
+            let live = op.server.map(server);
+            let (n, next) = allocate(state, live.as_ref(), &req);
+            state = next;
+
+            // A restart is only ever *known*: two readable, different
+            // sockets. Every other combination keeps counting.
+            let mut ms = model.remove(&key).unwrap_or_default();
+            if matches!((ms.server, op.server), (Some(r), Some(l)) if r != l) {
+                ms = ModelSession::default();
+            }
+            if let Some(live_tabs) = &op.live_tabs {
+                ms.tabs.retain(|t, _| t == tab || live_tabs.contains(t));
+            }
+            match ms.tabs.get(tab) {
+                Some((b, recorded)) if b == base => prop_assert_eq!(
+                    n,
+                    *recorded,
+                    "a second run in the same tab under the same base keeps \
+                     the number the tab already advertises"
+                ),
+                _ => {
+                    let seen = ms.seen.entry(base.to_string()).or_default();
+                    seen.extend(
+                        op.live_labels
+                            .iter()
+                            .flatten()
+                            .filter_map(|l| number_in_label(l, base)),
+                    );
+                    if let Some(a) = req.adopt() {
+                        prop_assert_eq!(
+                            n,
+                            a,
+                            "a tab whose own label pall8t could have written \
+                             keeps that number instead of being renamed"
+                        );
+                    } else {
+                        let fresh = seen.last().map_or(1, |m| m + 1);
+                        prop_assert_eq!(
+                            n,
+                            fresh,
+                            "a fresh number is one past everything this \
+                             server run has handed out or shown on screen: \
+                             lower reissues a live tab's name, higher skips \
+                             numbers for nothing"
+                        );
+                    }
+                    seen.insert(n);
+                    ms.tabs.insert(tab.to_string(), (base.to_string(), n));
+                }
+            }
+            ms.server = op.server.or(ms.server);
+            ms.last_used = now;
+            model.insert(key.clone(), ms);
+            // Past the bound, the least recently used other session goes —
+            // decided here, not copied from the state, so an allocator that
+            // evicts too eagerly, too late or the wrong entry disagrees.
+            while model.len() > MAX_SESSIONS {
+                let oldest = model
+                    .iter()
+                    .filter(|(k, _)| **k != key)
+                    .min_by_key(|(k, s)| (s.last_used, (*k).clone()))
+                    .map(|(k, _)| k.clone())
+                    .expect("more than one session, so one is not this one");
+                model.remove(&oldest);
+            }
+
+            prop_assert_eq!(
+                state.sessions.keys().collect::<Vec<_>>(),
+                model.keys().collect::<Vec<_>>(),
+                "the state keeps at most MAX_SESSIONS sessions, drops only the \
+                 least recently used when over, and never the one just written"
+            );
+            prop_assert!(
+                state.sessions[&key].next[base] > n,
+                "the counter sits past every number it handed out, so the \
+                 next tab cannot be given this one"
+            );
+        }
+        Ok(state)
+    }
+
+    proptest! {
+        // Every mutant cargo-mutants tries runs this suite again, so the
+        // case count is a cost multiplier on the PR gate, not only on
+        // `cargo test`. 256 sequences of up to 40 operations is ~10k
+        // allocations — well under a second — and `PROPTEST_CASES` raises
+        // it for a deliberate soak.
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn allocate_matches_the_reference_model(ops in prop::collection::vec(op(), 0..40)) {
+            run(&ops)?;
+        }
+
+        #[test]
+        fn a_state_allocate_produced_survives_the_file_round_trip(
+            ops in prop::collection::vec(op(), 0..40),
+        ) {
+            let state = run(&ops)?;
+            let text = serde_json::to_string_pretty(&state).unwrap();
+            prop_assert_eq!(
+                parse(&text),
+                Load::Have(state),
+                "what `write_state` writes must read back as the same state, \
+                 or every run after the first silently renumbers"
+            );
+        }
+
+        #[test]
+        fn a_file_from_a_newer_pall8t_is_frozen_whatever_its_body(
+            version in (SCHEMA + 1)..=u32::MAX,
+            body in prop::sample::select(vec!["{}", "[]", "null", "42", "\"x\""]),
+        ) {
+            let text = format!(r#"{{"version":{version},"sessions":{body}}}"#);
+            prop_assert_eq!(
+                parse(&text),
+                Load::Frozen(version),
+                "a newer format is recognised from the version alone, so a \
+                 body today's `State` cannot read is still left alone rather \
+                 than overwritten (issue #89)"
+            );
+        }
+    }
+}
