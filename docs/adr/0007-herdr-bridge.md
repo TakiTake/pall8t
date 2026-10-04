@@ -128,10 +128,55 @@ classified:
   covers where admin methods actually land; the residual risk is a future
   admin method placed outside those namespaces, accepted and revisitable.
 
+Orthogonal to the three classes, and denied in **every** mode: a request
+whose `params.source` starts with `herdr:`. Those sources are herdr's own
+integrations — it recognizes them as official, stores the session
+identity they report, and after a server restart resumes such a pane by
+running the agent's own resume command in it, **on the host, outside the
+sandbox** (herdr 0.9.2: `persist/restore.rs` -> `agent_resume::plan`). A
+sandboxed agent claiming one would arrange for its own unsandboxed
+resurrection, so the bridge refuses it and says why. Reports under any
+other source — herdr documents `custom:<name>` for third parties — pass
+untouched. This costs nothing in state detection: herdr's Claude Code
+integration carries session identity only, and its state authority is the
+screen manifest either way.
+
+Two rules keep that one honest, because the source prefix alone does not:
+
+- **A `resume_argv` is refused whatever the source.** herdr stores a
+  reported resume command and runs it on the host after a restart, and
+  `can_record_reported_resume` (0.9.2, `terminal/state.rs`) accepts one
+  from any source whose label matches the agent herdr *detected* in the
+  pane — which a pall8t pane always satisfies, since making herdr detect
+  the sandboxed agent is the point of the argv0 hint. Denying only
+  `herdr:` would have left the same escape open under `custom:anything`,
+  with the sandbox choosing the argv.
+- **`params` the policy parser cannot read as an object is refused.**
+  serde fills a struct from a JSON array positionally, so the relay's
+  narrow view of `params` and herdr's full one can read the same array
+  differently — the relay seeing herdr's `pane_id` where it expects
+  `source`. Rather than reason about when the two agree, a shape the
+  relay cannot read is one it does not forward. herdr's own clients
+  serialize typed structs and send objects.
+
+All of this is checked on the first line of a connection. Bytes a client
+pipelines after it are forwarded without passing policy again, which is
+sufficient only because herdr dispatches one request per connection
+(0.9.2, `api/server.rs::handle_connection_with_stop`: one initial line,
+then either an answer or a subscription handler). The relay would have to
+police every line if that changed — recorded here because it is an
+invariant of someone else's code, and the kind of thing a herdr release
+can move without saying so.
+
 Denied requests get a herdr-shaped error
-(`{"id":…,"error":{"code":"sandbox_denied",…}}`) naming the config knob,
-so the in-container CLI fails legibly and the agent knows it's a policy,
-not a bug.
+(`{"id":…,"error":{"code":"sandbox_denied",…}}`), so the in-container CLI
+fails legibly and the agent knows it's a policy, not a bug. What the
+message points at differs with the denial, because the remedy does: a
+*mode* denial names the config knob, since widening `[herdr] sandbox` is
+what would permit the request. A *source* denial names the source and the
+resume hazard and deliberately does not mention the knob — no setting
+permits that report, and naming one would send the agent to change
+something that cannot help.
 
 ### Security posture, stated plainly
 

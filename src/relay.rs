@@ -28,6 +28,7 @@
 
 use crate::util::epoch_secs;
 use anyhow::{anyhow, Context, Result};
+use serde_json::value::RawValue;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -231,6 +232,52 @@ fn deny_response(id: &str, method: &str, mode: Mode) -> String {
          \"{}\"; see the pall8t config to change this)",
         mode.as_str()
     );
+    error_response(id, &msg)
+}
+
+/// Denial for a request claiming one of herdr's own integration sources.
+/// Separate from [`deny_response`] because this one is not about
+/// `[herdr] sandbox` at all — no mode permits it, and the message has to
+/// say why rather than point at a config knob the user can turn.
+fn reserved_source_response(id: &str, method: &str, source: &str) -> String {
+    let msg = format!(
+        "pall8t blocked `{method}` from the sandbox: it reports under \
+         `{source}`, a source herdr reserves for its own integrations. herdr \
+         would treat this pane as natively integrated and, after a server \
+         restart, resume it by running the agent on the host — outside the \
+         sandbox. Report under your own source instead (e.g. `custom:my-agent`)."
+    );
+    error_response(id, &msg)
+}
+
+/// Denial for a request registering a resume command. Separate from
+/// [`reserved_source_response`] because the remedy differs: there is
+/// none, under any source. Reporting state is fine; asking herdr to
+/// remember how to start the agent again is the part that escapes.
+fn reported_resume_response(id: &str, method: &str) -> String {
+    let msg = format!(
+        "pall8t blocked `{method}` from the sandbox: it carries \
+         `resume_argv`, a command herdr stores and runs itself after a \
+         server restart — in the pane, on the host, outside the sandbox. \
+         Report the session without `resume_argv`; pall8t owns how a \
+         sandboxed agent comes back."
+    );
+    error_response(id, &msg)
+}
+
+/// Denial for `params` the policy parser cannot read as an object.
+/// Refusing beats guessing: see [`policy_params`] for the array-shaped
+/// request this exists to stop.
+fn opaque_params_response(id: &str, method: &str) -> String {
+    let msg = format!(
+        "pall8t blocked `{method}` from the sandbox: its `params` is not a \
+         JSON object, so the bridge cannot read which source the request \
+         reports under. herdr's own clients send objects — send one."
+    );
+    error_response(id, &msg)
+}
+
+fn error_response(id: &str, msg: &str) -> String {
     serde_json::json!({
         "id": id,
         "error": { "code": "sandbox_denied", "message": msg }
@@ -242,18 +289,118 @@ fn deny_response(id: &str, method: &str, mode: Mode) -> String {
 /// than this is not a herdr request.
 const MAX_REQUEST_LINE: u64 = 1024 * 1024;
 
-/// Just the two fields the relay's policy check reads out of a request
-/// line. Deserializing only these skips materializing `params` (up to
+/// Just the fields the relay's policy check reads out of a request line.
+/// Deserializing only these skips materializing `params` (up to
 /// [`MAX_REQUEST_LINE`]: agent.prompt bodies, graphics payloads) per
 /// connection. `Cow` borrows straight out of the request line for the
 /// common unescaped case and only allocates for a value needing
 /// unescaping, so this parses any id/method the whole-`Value` path did.
+/// `params` stays a [`RawValue`] — a borrowed slice, not a parse — so
+/// [`policy_params`] can judge its *shape* before reading fields out of
+/// it.
 #[derive(serde::Deserialize)]
 struct ReqHead<'a> {
     #[serde(default, borrow)]
     method: Option<std::borrow::Cow<'a, str>>,
     #[serde(default, borrow)]
     id: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    params: Option<&'a RawValue>,
+}
+
+/// What policy reads out of `params`: the reporting source a request
+/// claims for itself (see [`claims_reserved_source`]), and whether it
+/// carries a resume command (see [`registers_resume`]). Every other param
+/// stays unparsed.
+// No `PartialEq`: `RawValue` has none, and the tests compare the two
+// things policy actually reads rather than the struct.
+#[derive(serde::Deserialize, Debug)]
+struct ReqParams<'a> {
+    #[serde(default, borrow)]
+    source: Option<std::borrow::Cow<'a, str>>,
+    #[serde(default, borrow)]
+    resume_argv: Option<&'a RawValue>,
+}
+
+/// `params` as policy can read it, or `None` when it arrives in a shape
+/// this parser cannot read as an object.
+///
+/// The shape check is the point. serde deserializes a struct from a JSON
+/// *array* as well as from an object, taking the fields positionally — so
+/// `"params": ["w1:p1", "herdr:claude", …]` would fill this struct's
+/// first field, `source`, from herdr's first parameter, `pane_id`.
+/// Policy would then read `w1:p1` as the source, find no reserved prefix,
+/// and forward a request herdr goes on to parse positionally into
+/// `source: "herdr:claude"`. Two parsers, one wire format, different
+/// answers — and the difference is a bypass of the rule below.
+///
+/// So anything but an object answers `None`, and [`handle`] refuses a
+/// request whose params it could not read. Note where the safety
+/// actually comes from: today a five-element array fails to parse into
+/// this two-field struct anyway, so the refusal would happen without the
+/// shape test. That is a coincidence of field counts — add a field here,
+/// or let herdr drop one, and a positional array starts fitting again.
+/// The explicit test is what keeps "readable" meaning *an object* rather
+/// than *whatever happened to line up*. herdr's own CLI serializes typed
+/// structs and sends objects; an array-shaped `params` is nothing a
+/// legitimate client produces.
+fn policy_params(raw: &RawValue) -> Option<ReqParams<'_>> {
+    let text = raw.get().trim_start();
+    if !text.starts_with('{') {
+        return None;
+    }
+    serde_json::from_str(text).ok()
+}
+
+/// Whether the request asks herdr to remember a command that resumes this
+/// pane's agent.
+///
+/// Denied from a sandbox for the same reason a reserved source is, and
+/// separately from it: herdr runs a reported resume command **on the
+/// host** after a server restart, and
+/// `TerminalState::can_record_reported_resume` (herdr 0.9.2,
+/// `terminal/state.rs`) accepts one from *any* source as long as the
+/// label matches the agent herdr detected in the pane — which for a
+/// pall8t pane it always does, since making herdr detect the sandboxed
+/// agent is what [`crate::herdr::agent_hint`] exists to do. Denying only
+/// `herdr:` sources would therefore have left the hazard reachable under
+/// `custom:anything`, with the sandbox choosing the argv.
+///
+/// Absence is the key being *missing*: herdr's own params carry
+/// `#[serde(skip_serializing_if = "Option::is_none")]`, so its CLI omits
+/// `resume_argv` rather than sending `null`. An explicit `null` still
+/// deserializes to `None` on herdr's side, so it is read as absence here
+/// too — a hand-written client that spells it out gets the same answer
+/// from both ends, which is the property that matters.
+fn registers_resume(params: &ReqParams<'_>) -> bool {
+    params.resume_argv.is_some_and(|v| v.get().trim() != "null")
+}
+
+/// Prefix herdr reserves for its own shipped integrations
+/// (`herdr:claude`, `herdr:codex`, …). Its custom-integration guide tells
+/// third parties to use something else (`custom:my-agent`).
+const RESERVED_SOURCE_PREFIX: &str = "herdr:";
+
+/// Whether a request claims to be one of herdr's own integrations.
+///
+/// A sandboxed agent reporting under `herdr:<agent>` is not a cosmetic
+/// lie: herdr recognizes exactly those sources as *official*
+/// (`is_official_agent_source`), stores the session reference they report,
+/// and on a server restart resumes the pane by running the agent's own
+/// resume command — `claude --resume <id>` — **in the pane on the host,
+/// outside the sandbox** (herdr 0.9.2, `persist/restore.rs` →
+/// `agent_resume::plan`; `[session] resume_agents_on_restore` defaults
+/// true). A pane the user sandboxed would come back unsandboxed. Reports
+/// under any other source are none of pall8t's business and pass
+/// untouched.
+///
+/// Denial is by prefix rather than by a list of known sources: herdr's
+/// `is_official_agent_source` enumerated 17 source/agent pairs at 0.8.2
+/// and 18 at 0.9.2, and a copy here would be a list of the integrations
+/// pall8t had heard of at build time, silently admitting whatever a newer
+/// herdr adds.
+pub fn claims_reserved_source(source: Option<&str>) -> bool {
+    source.is_some_and(|s| s.starts_with(RESERVED_SOURCE_PREFIX))
 }
 
 /// The one directory the relay may create, chmod, and sweep: its own run
@@ -647,6 +794,76 @@ fn handle(
         .and_then(|h| h.method.as_deref())
         .unwrap_or("");
     let id = head.as_ref().and_then(|h| h.id.as_deref()).unwrap_or("");
+    // Scope of everything below: the *first* line of this connection.
+    // What a client pipelines after it is forwarded by the pump at the
+    // end of this function without passing policy again. That is safe
+    // only because herdr dispatches one request per connection —
+    // `handle_connection_with_stop` reads one initial line and either
+    // answers it or hands the socket to a subscription/wait handler, so
+    // a second NDJSON line is never executed as a request (0.9.2,
+    // `api/server.rs`). It is someone else's invariant, in a version
+    // pall8t does not control: if herdr ever loops over request lines,
+    // every rule in this function has to move into the pump with it.
+    // Verified by reading that function, not inferred from behaviour.
+    //
+    // Shape first, fields second. `params` this parser cannot read as an
+    // object is refused outright rather than forwarded with the policy
+    // fields left empty: the two parsers do not agree on what a request
+    // is (see [`policy_params`]), and the gap between them is a bypass,
+    // not a curiosity. A line that fails to parse *at all* is a
+    // different case and still goes to the mode rule below — herdr
+    // answers `invalid_request` for it, and staying out of the way is
+    // the point of transparency.
+    let params = match head.as_ref().and_then(|h| h.params).map(policy_params) {
+        Some(None) => {
+            audit(
+                log_path,
+                &serde_json::json!({
+                    "ts": epoch_secs(), "event": "deny_params_shape",
+                    "method": method,
+                }),
+            );
+            conn.write_all(opaque_params_response(id, method).as_bytes())?;
+            conn.write_all(b"\n")?;
+            return Ok(());
+        }
+        other => other.flatten(),
+    };
+    let source = params.as_ref().and_then(|p| p.source.as_deref());
+
+    // Denied in every mode, ahead of the method policy: this is not about
+    // how much of herdr the sandbox may touch, but about the sandbox
+    // claiming to *be* a herdr integration (see [`claims_reserved_source`]).
+    if claims_reserved_source(source) {
+        let source = source.unwrap_or("");
+        audit(
+            log_path,
+            &serde_json::json!({
+                "ts": epoch_secs(), "event": "deny_source",
+                "method": method, "source": source,
+            }),
+        );
+        conn.write_all(reserved_source_response(id, method, source).as_bytes())?;
+        conn.write_all(b"\n")?;
+        return Ok(());
+    }
+
+    // The same hazard by the other door, and denied the same way: a
+    // resume command herdr would run on the host (see
+    // [`registers_resume`]). Checked after the source so a request doing
+    // both is reported as the source claim it also is.
+    if params.as_ref().is_some_and(registers_resume) {
+        audit(
+            log_path,
+            &serde_json::json!({
+                "ts": epoch_secs(), "event": "deny_resume_argv",
+                "method": method,
+            }),
+        );
+        conn.write_all(reported_resume_response(id, method).as_bytes())?;
+        conn.write_all(b"\n")?;
+        return Ok(());
+    }
 
     // An unparseable line has no method to check: in full mode it is
     // forwarded (herdr answers `invalid_request` itself — staying out of
@@ -848,6 +1065,83 @@ mod tests {
         assert!(allowed(Mode::Readonly, "pane.read"));
         assert!(!allowed(Mode::Readonly, "pane.split"));
         assert!(!allowed(Mode::Readonly, "server.stop"));
+    }
+
+    #[test]
+    fn claims_reserved_source_table() {
+        assert!(
+            claims_reserved_source(Some("herdr:claude")),
+            "herdr's own Claude integration source: reporting under it makes \
+             herdr resume this pane on the host after a restart"
+        );
+        assert!(
+            claims_reserved_source(Some("herdr:anything-new")),
+            "the whole prefix is reserved, so an integration source a newer \
+             herdr adds is covered before pall8t has heard of it"
+        );
+        assert!(
+            !claims_reserved_source(Some("custom:my-agent")),
+            "the source herdr's own custom-integration guide tells third \
+             parties to use must keep working from inside the sandbox"
+        );
+        assert!(
+            !claims_reserved_source(Some("user:pall8t")),
+            "pall8t's own host-side reports use this source; the rule is about \
+             what the sandbox claims, not about the string being pall8t's"
+        );
+        assert!(
+            !claims_reserved_source(Some("herdr")),
+            "only the `herdr:` namespace is reserved — a source that merely \
+             starts with the letters is not claiming an integration"
+        );
+        assert!(
+            !claims_reserved_source(None),
+            "most methods carry no source at all and must pass untouched"
+        );
+    }
+
+    /// The reserved-source check must not depend on the rest of the head
+    /// being well formed. herdr would reject this one — its `Request.id`
+    /// is a required `String` — but the relay must not be the thing that
+    /// relies on that: whether a denial fires is pall8t's rule to keep,
+    /// not a property borrowed from the other side of the bridge.
+    #[test]
+    fn reserved_source_is_denied_even_without_a_request_id() {
+        let dir = test_dir("noid");
+        let (listen, log) = start_relay(Mode::Full, &dir, test_limits());
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"method":"pane.report_agent_session","params":{"source":"herdr:claude","agent":"claude"}}"#,
+        );
+        assert_eq!(
+            resp["error"]["code"], "sandbox_denied",
+            "the source is what is refused; a missing id must not smuggle it past"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reserved_source_response_explains_the_hazard() {
+        let resp: serde_json::Value = serde_json::from_str(&reserved_source_response(
+            "req_3",
+            "pane.report_agent_session",
+            "herdr:claude",
+        ))
+        .unwrap();
+        assert_eq!(resp["id"], "req_3");
+        assert_eq!(resp["error"]["code"], "sandbox_denied");
+        let msg = resp["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("herdr:claude") && msg.contains("outside the sandbox"),
+            "the agent must learn what it did and why it is refused, not just \
+             that something was blocked: {msg}"
+        );
+        assert!(
+            !msg.contains("[herdr] sandbox"),
+            "no mode permits this, so the message must not point at a config \
+             knob as if turning it would help"
+        );
     }
 
     #[test]
@@ -1635,6 +1929,177 @@ mod tests {
         assert!(
             event.contains("pane.exited"),
             "and it must be the event, intact: {event}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bypass the first version of this rule had: serde reads a
+    /// struct from a JSON array as well as from an object, taking fields
+    /// positionally. herdr's `PaneReportAgentSessionParams` starts
+    /// `pane_id, source, …`; the relay's one-field view starts `source`.
+    /// So an array-shaped `params` handed the relay `w1:p1` as the source
+    /// — no reserved prefix, forwarded — while herdr read the same array
+    /// as `source: "herdr:claude"` and recorded the official session.
+    /// Same bytes, two parsers, opposite answers.
+    #[test]
+    fn array_form_params_cannot_smuggle_a_reserved_source() {
+        let dir = test_dir("arrayparams");
+        let (listen, log) = start_relay(Mode::Full, &dir, test_limits());
+
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r1","method":"pane.report_agent_session","params":["w1:p1","herdr:claude","claude",null,"abc"]}"#,
+        );
+        assert_eq!(
+            resp["error"]["code"], "sandbox_denied",
+            "a params shape the policy parser cannot read as an object must \
+             be refused, not forwarded with the source field left empty — \
+             herdr reads it positionally and finds the reserved source the \
+             relay missed"
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("deny_params_shape"),
+            "and the audit says which refusal this was, since it is not the \
+             same fact as a denied source"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hazard's other door. herdr accepts a reported resume command
+    /// from *any* source whose label matches the agent it detected in the
+    /// pane (`can_record_reported_resume`, 0.9.2) — and a pall8t pane is
+    /// always such a pane, because the argv0 hint exists to make herdr
+    /// detect the sandboxed agent. Denying `herdr:` sources alone would
+    /// have left `custom:anything` able to register `claude --resume <id>`
+    /// for herdr to run on the host.
+    #[test]
+    fn a_sandbox_may_not_register_a_resume_command() {
+        let dir = test_dir("resumeargv");
+        let (listen, log) = start_relay(Mode::Full, &dir, test_limits());
+
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r1","method":"pane.report_agent_session","params":{"pane_id":"%1","source":"custom:mine","agent":"claude","resume_argv":["claude","--resume","abc"]}}"#,
+        );
+        assert_eq!(
+            resp["error"]["code"], "sandbox_denied",
+            "an unreserved source does not make a host-side resume command \
+             the sandbox's to register"
+        );
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("deny_resume_argv"),
+            "audited as its own refusal: the source was fine, the argv was not"
+        );
+
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r2","method":"pane.report_agent_session","params":{"pane_id":"%1","source":"custom:mine","agent":"claude","agent_session_id":"abc"}}"#,
+        );
+        assert_eq!(
+            resp["result"]["echo"]["method"], "pane.report_agent_session",
+            "reporting a session under its own source stays allowed — the \
+             denial is of the resume command, not of reporting"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn policy_params_reads_only_objects() {
+        for (raw, want_source, want_resume, why) in [
+            (
+                r#"{"source":"herdr:claude"}"#,
+                Some("herdr:claude"),
+                false,
+                "the ordinary shape every herdr client sends",
+            ),
+            (
+                r#"{"pane_id":"%1","agent":"claude"}"#,
+                None,
+                false,
+                "an object with no source reports none, rather than failing",
+            ),
+            (
+                r#"{"source":"custom:mine","resume_argv":["claude","--resume","x"]}"#,
+                Some("custom:mine"),
+                true,
+                "a resume command is read whatever the source is, since the \
+                 source is not what makes it dangerous",
+            ),
+            (
+                r#"{"source":"custom:mine","resume_argv":null}"#,
+                Some("custom:mine"),
+                false,
+                "an explicit `null` reads as absence on herdr's side too, so \
+                 it must here — herdr's own CLI omits the key instead \
+                 (`skip_serializing_if`), and the two spellings must not \
+                 mean different things across the bridge",
+            ),
+        ] {
+            let raw = serde_json::from_str::<&RawValue>(raw).unwrap();
+            let got = policy_params(raw).expect("an object is readable");
+            assert_eq!(got.source.as_deref(), want_source, "{why}");
+            assert_eq!(registers_resume(&got), want_resume, "{why}");
+        }
+
+        for (raw, why) in [
+            (
+                r#"["w1:p1","herdr:claude","claude"]"#,
+                "an array fills this struct positionally, so `source` would \
+                 come out as herdr's `pane_id` — unreadable, not readable-as-\
+                 something-else",
+            ),
+            (r#""herdr:claude""#, "a bare string has no fields at all"),
+            ("42", "nor a number"),
+            ("null", "nor null, which herdr's typed params never are"),
+        ] {
+            let raw = serde_json::from_str::<&RawValue>(raw).unwrap();
+            assert!(policy_params(raw).is_none(), "{why}");
+        }
+    }
+
+    /// The hazard this rule exists for, end to end: herdr's own Claude
+    /// integration, installed in the container home, reports the sandboxed
+    /// session under `herdr:claude`. herdr would then store it as a native
+    /// session and resume the pane by running `claude --resume <id>` on the
+    /// host after a server restart — unsandboxed. `full` mode is otherwise
+    /// transparent, so this is the one thing it stops.
+    #[test]
+    fn relay_denies_a_sandbox_report_claiming_herdrs_own_source() {
+        let dir = test_dir("source");
+        let (listen, log) = start_relay(Mode::Full, &dir, test_limits());
+
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r1","method":"pane.report_agent_session","params":{"pane_id":"%1","source":"herdr:claude","agent":"claude","agent_session_id":"abc"}}"#,
+        );
+        assert_eq!(
+            resp["error"]["code"], "sandbox_denied",
+            "an official-source report must not reach herdr, even in full mode"
+        );
+
+        let resp = roundtrip(
+            &listen,
+            &log,
+            r#"{"id":"r2","method":"pane.report_agent","params":{"pane_id":"%1","source":"custom:mine","agent":"claude","state":"working"}}"#,
+        );
+        assert_eq!(
+            resp["result"]["echo"]["method"], "pane.report_agent",
+            "reporting under its own source is exactly what a sandboxed agent \
+             should be able to do, and still works"
+        );
+
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains("deny_source") && logged.contains("herdr:claude"),
+            "the audit log names the source, since that is what was refused"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -343,6 +343,49 @@ local review failed to catch first (source PRs noted).
   by hand and watch the property go red. Green against a hand-broken
   rule is a generator finding, not a passing test.
 
+**Two parsers over one wire format** (PR #118)
+- A proxy that reads a *subset* of a message and forwards the rest has
+  two parsers over the same bytes, and they disagree somewhere. The
+  disagreement is the bypass. serde fills a struct from a JSON array
+  positionally, so the relay's one-field view of `params` read herdr's
+  first parameter as the field it policed, found nothing to refuse, and
+  forwarded a request herdr parsed into the very source the rule
+  existed to stop. Enumerate the shapes the *other* parser accepts —
+  array for struct, missing-but-defaulted fields, differing
+  required/optional sets — not the ones your own type admits.
+- "Anything my parser rejects, theirs rejects too" is a claim about
+  someone else's code, in a version you do not control. Either verify
+  it against their source and pin the version, or stop relying on it:
+  refuse what you cannot read instead of forwarding it with the policy
+  fields left empty.
+- Watch for safety that is really a coincidence of field counts. Ours
+  held only because our struct had fewer fields than theirs; adding one
+  would have reopened it silently. Where that is the case, say so in
+  the comment and keep the explicit check anyway.
+
+**A denial that names one field** (PR #118)
+- Having found the field that reaches a bad outcome, ask what *else*
+  reaches it. Blocking `source: "herdr:"` left `resume_argv` — a
+  different field, same consequence, and accepted by the peer from any
+  source. A rule written around the first path you found is a rule
+  shaped by your search order.
+- Read the peer's acceptance check, not its documentation: herdr's
+  `can_record_reported_resume` turns on the agent it *detected* in the
+  pane, which is the thing this project works to make true.
+
+**An exception to a rule a doc states flatly** (PR #118)
+- Adding the first exception to a mechanism makes every unqualified
+  sentence about that mechanism false, and those sentences are usually
+  nowhere near the diff. ADR-0007 said denials name the config knob;
+  this PR added a denial that deliberately names the hazard instead —
+  with a test asserting the knob is *absent* from the message. The ADR
+  and the test contradicted each other in the same commit, and an
+  external reviewer found it.
+- When a diff adds an "except when…", grep the ADR, README and module
+  docs for the unqualified form of the claim ("always", "every",
+  "denied requests get…") and qualify each one. The tell is a sentence
+  that was true when nothing had an exception yet.
+
 **An assertion that forbids a string** (PR #117)
 - `assert!(!msg.contains(X))` forbids X everywhere in the output, which
   is almost always wider than the claim being made — and the extra width
