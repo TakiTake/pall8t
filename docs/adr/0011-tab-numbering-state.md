@@ -62,7 +62,11 @@ pall8t knows the path without guessing, because herdr sets
 
 Three rules make that coherent against herdr's own persistence:
 
-- **Unknown keeps counting.** An unreadable socket never triggers a reset.
+- **Unknown keeps counting.** An unreadable socket never triggers a reset,
+  and neither does a birthtime that is missing on either side of the
+  comparison: `(dev, ino)` decides there. An absent `st_birthtime` is not
+  evidence that the socket is a different one, so comparing it as a value
+  would invent a restart out of a filesystem difference (issue #113).
 - **A tab adopts the number its own label already carries**, so a tab herdr
   restored as `foo-3` stays `foo-3` rather than being renamed by a counter
   that just went back to 1.
