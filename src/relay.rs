@@ -366,8 +366,12 @@ fn policy_params(raw: &RawValue) -> Option<ReqParams<'_>> {
 /// `herdr:` sources would therefore have left the hazard reachable under
 /// `custom:anything`, with the sandbox choosing the argv.
 ///
-/// `null` is how herdr's own clients spell "no resume command" (its field
-/// is `Option<Vec<String>>`), so it is absence, not a registration.
+/// Absence is the key being *missing*: herdr's own params carry
+/// `#[serde(skip_serializing_if = "Option::is_none")]`, so its CLI omits
+/// `resume_argv` rather than sending `null`. An explicit `null` still
+/// deserializes to `None` on herdr's side, so it is read as absence here
+/// too — a hand-written client that spells it out gets the same answer
+/// from both ends, which is the property that matters.
 fn registers_resume(params: &ReqParams<'_>) -> bool {
     params.resume_argv.is_some_and(|v| v.get().trim() != "null")
 }
@@ -790,6 +794,18 @@ fn handle(
         .and_then(|h| h.method.as_deref())
         .unwrap_or("");
     let id = head.as_ref().and_then(|h| h.id.as_deref()).unwrap_or("");
+    // Scope of everything below: the *first* line of this connection.
+    // What a client pipelines after it is forwarded by the pump at the
+    // end of this function without passing policy again. That is safe
+    // only because herdr dispatches one request per connection —
+    // `handle_connection_with_stop` reads one initial line and either
+    // answers it or hands the socket to a subscription/wait handler, so
+    // a second NDJSON line is never executed as a request (0.9.2,
+    // `api/server.rs`). It is someone else's invariant, in a version
+    // pall8t does not control: if herdr ever loops over request lines,
+    // every rule in this function has to move into the pump with it.
+    // Verified by reading that function, not inferred from behaviour.
+    //
     // Shape first, fields second. `params` this parser cannot read as an
     // object is refused outright rather than forwarded with the policy
     // fields left empty: the two parsers do not agree on what a request
@@ -2020,8 +2036,10 @@ mod tests {
                 r#"{"source":"custom:mine","resume_argv":null}"#,
                 Some("custom:mine"),
                 false,
-                "`null` is how herdr's own clients spell no resume command — \
-                 an `Option` serialized in full, not a registration",
+                "an explicit `null` reads as absence on herdr's side too, so \
+                 it must here — herdr's own CLI omits the key instead \
+                 (`skip_serializing_if`), and the two spellings must not \
+                 mean different things across the bridge",
             ),
         ] {
             let raw = serde_json::from_str::<&RawValue>(raw).unwrap();

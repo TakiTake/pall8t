@@ -159,6 +159,15 @@ Two rules keep that one honest, because the source prefix alone does not:
   relay cannot read is one it does not forward. herdr's own clients
   serialize typed structs and send objects.
 
+All of this is checked on the first line of a connection. Bytes a client
+pipelines after it are forwarded without passing policy again, which is
+sufficient only because herdr dispatches one request per connection
+(0.9.2, `api/server.rs::handle_connection_with_stop`: one initial line,
+then either an answer or a subscription handler). The relay would have to
+police every line if that changed — recorded here because it is an
+invariant of someone else's code, and the kind of thing a herdr release
+can move without saying so.
+
 Denied requests get a herdr-shaped error
 (`{"id":…,"error":{"code":"sandbox_denied",…}}`), so the in-container CLI
 fails legibly and the agent knows it's a policy, not a bug. What the
