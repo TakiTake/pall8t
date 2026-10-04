@@ -1118,14 +1118,24 @@ mod properties {
     #[derive(Debug, Clone)]
     struct Op {
         socket: usize,
-        /// The server run the socket answers for, by inode; `None` is a
-        /// socket that could not be stat'ed.
-        server: Option<u64>,
+        /// The server run the socket answers for, as an index into [`RUNS`];
+        /// `None` is a socket that could not be stat'ed.
+        server: Option<usize>,
         tab: usize,
         base: usize,
         own_label: Option<String>,
         live_tabs: Option<BTreeSet<String>>,
         live_labels: Option<BTreeSet<String>>,
+        /// The clock this allocation sees: six values against sequences of
+        /// up to 40 operations, so the same instant repeats and time runs
+        /// backwards inside one sequence as a matter of course rather than
+        /// of luck. In production `now` is [`crate::util::epoch_secs`], a
+        /// wall clock an NTP step or a hand-set date can move either way.
+        /// Only a sequence where the session being written is the *least*
+        /// recently used of all — ties broken by session key, the order
+        /// [`evict`] itself minimises on — can tell an allocator that evicts
+        /// its own entry from one that keeps it.
+        now: u64,
     }
 
     /// A label as it can be on screen: one pall8t wrote for some base
@@ -1142,15 +1152,16 @@ mod properties {
     fn op() -> impl Strategy<Value = Op> {
         (
             0..SOCKETS.len(),
-            prop::option::of(1u64..=3),
+            prop::option::of(0..RUNS.len()),
             0..TABS.len(),
             0..BASES.len(),
             prop::option::of(label()),
             prop::option::of(prop::sample::subsequence(TABS.to_vec(), 0..=TABS.len())),
             prop::option::of(prop::collection::btree_set(label(), 0..4)),
+            1u64..=6,
         )
             .prop_map(
-                |(socket, server, tab, base, own_label, live_tabs, live_labels)| Op {
+                |(socket, server, tab, base, own_label, live_tabs, live_labels, now)| Op {
                     socket,
                     server,
                     tab,
@@ -1158,24 +1169,45 @@ mod properties {
                     own_label,
                     live_tabs: live_tabs.map(|t| t.into_iter().map(String::from).collect()),
                     live_labels,
+                    now,
                 },
             )
     }
 
-    fn server(ino: u64) -> ServerRun {
+    /// Server runs, each differing from the first in exactly one field: the
+    /// inode a re-bound socket changes, the device, and the two halves of
+    /// the birth time that tell a re-bound socket from one whose inode the
+    /// filesystem reused (see [`ServerRun`]). Holding any one of them fixed
+    /// here would let an identity check that ignores that field agree with
+    /// the model on every sequence this property generates. The one-field
+    /// difference is guaranteed against the first entry only; that the rest
+    /// also differ from each other in more than one field is incidental, and
+    /// a smaller case count would thin it out.
+    const RUNS: [(u64, u64, u64, u32); 5] = [
+        (1, 10, 1_700_000_000, 0),
+        (1, 11, 1_700_000_000, 0),
+        (2, 10, 1_700_000_000, 0),
+        (1, 10, 1_700_000_001, 0),
+        (1, 10, 1_700_000_000, 1),
+    ];
+
+    fn server(run: usize) -> ServerRun {
+        let (dev, ino, birth_secs, birth_nanos) = RUNS[run];
         ServerRun {
-            dev: 1,
+            dev,
             ino,
-            birth_secs: Some(1_700_000_000),
-            birth_nanos: Some(0),
+            birth_secs: Some(birth_secs),
+            birth_nanos: Some(birth_nanos),
         }
     }
 
     /// What an outside observer knows about one session.
     #[derive(Default)]
     struct ModelSession {
-        /// The server run the numbers belong to, as last learned.
-        server: Option<u64>,
+        /// The server run the numbers belong to, as last learned: an index
+        /// into [`RUNS`], where two different indexes are two different
+        /// [`ServerRun`]s.
+        server: Option<usize>,
         /// Per base, every number this server run has handed out or been
         /// shown on a label while choosing a fresh one. A fresh number is
         /// one past all of them.
@@ -1189,7 +1221,7 @@ mod properties {
     fn run(ops: &[Op]) -> Result<State, TestCaseError> {
         let mut state = State::default();
         let mut model: BTreeMap<String, ModelSession> = BTreeMap::new();
-        for (now, op) in (1u64..).zip(ops) {
+        for op in ops {
             let socket_path = SOCKETS[op.socket];
             let key = socket_path.unwrap_or_default().to_string();
             let tab = TABS[op.tab];
@@ -1201,7 +1233,7 @@ mod properties {
                 own_label: op.own_label.as_deref(),
                 live_tabs: op.live_tabs.as_ref(),
                 live_labels: op.live_labels.as_ref(),
-                now,
+                now: op.now,
             };
             let live = op.server.map(server);
             let (n, next) = allocate(state, live.as_ref(), &req);
@@ -1254,7 +1286,7 @@ mod properties {
                 }
             }
             ms.server = op.server.or(ms.server);
-            ms.last_used = now;
+            ms.last_used = op.now;
             model.insert(key.clone(), ms);
             // Past the bound, the least recently used other session goes —
             // decided here, not copied from the state, so an allocator that
@@ -1305,7 +1337,11 @@ mod properties {
             ops in prop::collection::vec(op(), 0..40),
         ) {
             let state = run(&ops)?;
-            let text = serde_json::to_string_pretty(&state).unwrap();
+            // `to_vec_pretty` is the call `write_state` makes.
+            // `to_string_pretty` renders the same bytes today, so this is
+            // not a fix for a difference: it is what keeps the claim below
+            // about the bytes that reach the file if the two ever part.
+            let text = String::from_utf8(serde_json::to_vec_pretty(&state).unwrap()).unwrap();
             prop_assert_eq!(
                 parse(&text),
                 Load::Have(state),

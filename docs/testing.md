@@ -122,6 +122,17 @@ state keeps.
   number 0, a name long enough to be capped, more sessions than the bound.
   A generator tuned to produce only "realistic" input is how a guard-clause
   bug survives a property test.
+- **Vary every field the code compares, and every order it derives from
+  the sequence.** A generator that holds one dimension fixed puts the code
+  reading that dimension out of the property's reach, and the property
+  stays green over it. `allocate` decides a restart by comparing four
+  fields of a `ServerRun`, so the generator varies each of them in turn
+  against a common first run; `evict` keeps the session being written,
+  which only a sequence where that session is the *least* recently used of
+  all can tell apart from plain LRU, so `now` is generated — repeating,
+  and running backwards, the way a wall clock does — instead of counted up
+  per step. Confirm it the same way as below: reduce the comparison to a
+  single field, drop the filter, and watch the property go red.
 - **Pin the case count** (`ProptestConfig { cases: 256, .. }`) with a
   comment saying why: every mutant the PR gate tries runs the whole suite
   again, so cases multiply its wall time. `PROPTEST_CASES=10000 cargo test
