@@ -542,9 +542,13 @@ mod tests {
     #[test]
     fn resolve_does_not_expand_tilde_in_a_target() {
         let dir = tmp_dir("tilde-target");
+        // A target nothing else can spell: the check below is that *this*
+        // path never appears host-expanded, and a name the error message
+        // happens to use as its example would answer the wrong question.
+        let target = "~/mount-target-probe";
         let e = MountEntry {
             source: dir.clone(),
-            target: Some("~/notes".into()),
+            target: Some(target.into()),
             readonly: None,
         };
 
@@ -555,9 +559,20 @@ mod tests {
             "rejecting it is only useful if the message explains why a target is \
              not tilde-expanded: {msg}"
         );
+        // What must not appear is this target with the host's home
+        // substituted for `~` — the expansion itself. Asserting instead
+        // that the home *prefix* appears nowhere answers a wider question
+        // than the test is asking, and gets it wrong wherever the host
+        // home equals the container home the message suggests
+        // (`/home/dev`, which is every pall8t sandbox).
+        let expanded = dirs::home_dir()
+            .unwrap()
+            .join(target.trim_start_matches("~/"));
         assert!(
-            !msg.contains(&dirs::home_dir().unwrap().display().to_string()),
-            "and the host's home must not appear in the target at all: {msg}"
+            !msg.contains(&expanded.display().to_string()),
+            "`~` in a target must not be expanded against the host's home — \
+             that path lands on the wrong side of the sandbox boundary and \
+             differs per machine: {msg}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
