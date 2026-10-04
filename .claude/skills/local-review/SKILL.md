@@ -343,6 +343,19 @@ local review failed to catch first (source PRs noted).
   by hand and watch the property go red. Green against a hand-broken
   rule is a generator finding, not a passing test.
 
+**An exception to a rule a doc states flatly** (PR #118)
+- Adding the first exception to a mechanism makes every unqualified
+  sentence about that mechanism false, and those sentences are usually
+  nowhere near the diff. ADR-0007 said denials name the config knob;
+  this PR added a denial that deliberately names the hazard instead —
+  with a test asserting the knob is *absent* from the message. The ADR
+  and the test contradicted each other in the same commit, and an
+  external reviewer found it.
+- When a diff adds an "except when…", grep the ADR, README and module
+  docs for the unqualified form of the claim ("always", "every",
+  "denied requests get…") and qualify each one. The tell is a sentence
+  that was true when nothing had an exception yet.
+
 **An assertion that forbids a string** (PR #117)
 - `assert!(!msg.contains(X))` forbids X everywhere in the output, which
   is almost always wider than the claim being made — and the extra width

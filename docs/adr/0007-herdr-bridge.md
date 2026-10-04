@@ -142,9 +142,14 @@ integration carries session identity only, and its state authority is the
 screen manifest either way.
 
 Denied requests get a herdr-shaped error
-(`{"id":…,"error":{"code":"sandbox_denied",…}}`) naming the config knob,
-so the in-container CLI fails legibly and the agent knows it's a policy,
-not a bug.
+(`{"id":…,"error":{"code":"sandbox_denied",…}}`), so the in-container CLI
+fails legibly and the agent knows it's a policy, not a bug. What the
+message points at differs with the denial, because the remedy does: a
+*mode* denial names the config knob, since widening `[herdr] sandbox` is
+what would permit the request. A *source* denial names the source and the
+resume hazard and deliberately does not mention the knob — no setting
+permits that report, and naming one would send the agent to change
+something that cannot help.
 
 ### Security posture, stated plainly
 
