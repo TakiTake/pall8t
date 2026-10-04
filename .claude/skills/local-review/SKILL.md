@@ -199,6 +199,14 @@ local review failed to catch first (source PRs noted).
   memory.
 - Preconditions stated as absolutes ("X works inside the sandbox")
   that are actually conditional — qualify them.
+- **What a dependency pulls in** (PR #111): a comment saying which
+  crates a feature selection avoids is a claim about the *feature table*,
+  not about the flag. proptest's `std` itself enables `regex-syntax`, so
+  `default-features = false` did not drop the regex engine the comment
+  said it did. Read the dependency's `[features]` and confirm with
+  `cargo tree -i <crate>` — without narrowing `-e`: `-e dev` shows only
+  dev edges, and a crate reached through the dev-dependency's own normal
+  edge then prints "nothing to print", which reads as "not pulled in".
 
 **CI workflows** (PR #39)
 - `actions/checkout`: `persist-credentials: false` unless the job pushes.
@@ -320,6 +328,20 @@ local review failed to catch first (source PRs noted).
   there and nowhere else.
 - This repo writes `/// doc` *above* `#[test]`, which is also the order
   that makes a stray insertion visible rather than merely wrong.
+
+**Property-test generators** (PR #111)
+- A generator that holds a dimension constant puts the code reading that
+  dimension out of the property's reach, and the property still passes:
+  a server identity whose device and birth time never varied passed an
+  identity check reduced to the inode alone, and a clock counted up per
+  step (`1, 2, 3, …`) left the session being written always the newest,
+  so an evictor without its "never the entry just written" filter agreed
+  with the model on every generated sequence.
+- For each field the code under test compares, and each order it derives
+  from the sequence, ask what the generator would have to emit to tell
+  the real rule from the plausible wrong one — then make that wrong rule
+  by hand and watch the property go red. Green against a hand-broken
+  rule is a generator finding, not a passing test.
 
 **Tests** (standing)
 - Per docs/testing.md: new tests use table form with reasoned assertion
