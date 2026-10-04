@@ -141,6 +141,24 @@ untouched. This costs nothing in state detection: herdr's Claude Code
 integration carries session identity only, and its state authority is the
 screen manifest either way.
 
+Two rules keep that one honest, because the source prefix alone does not:
+
+- **A `resume_argv` is refused whatever the source.** herdr stores a
+  reported resume command and runs it on the host after a restart, and
+  `can_record_reported_resume` (0.9.2, `terminal/state.rs`) accepts one
+  from any source whose label matches the agent herdr *detected* in the
+  pane — which a pall8t pane always satisfies, since making herdr detect
+  the sandboxed agent is the point of the argv0 hint. Denying only
+  `herdr:` would have left the same escape open under `custom:anything`,
+  with the sandbox choosing the argv.
+- **`params` the policy parser cannot read as an object is refused.**
+  serde fills a struct from a JSON array positionally, so the relay's
+  narrow view of `params` and herdr's full one can read the same array
+  differently — the relay seeing herdr's `pane_id` where it expects
+  `source`. Rather than reason about when the two agree, a shape the
+  relay cannot read is one it does not forward. herdr's own clients
+  serialize typed structs and send objects.
+
 Denied requests get a herdr-shaped error
 (`{"id":…,"error":{"code":"sandbox_denied",…}}`), so the in-container CLI
 fails legibly and the agent knows it's a policy, not a bug. What the

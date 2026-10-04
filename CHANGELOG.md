@@ -41,7 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resume command **on the host, outside the sandbox**. Reporting under
   any other source (e.g. `custom:my-agent`) is unaffected, and Claude
   Code's state detection is unaffected either way — herdr's integration
-  for it carries session identity only.
+  for it carries session identity only. Two refusals close the same
+  hazard's other doors: a report carrying `resume_argv`, which herdr
+  stores and runs on the host after a restart whatever source reported
+  it, and a request whose `params` is not a JSON object, where the
+  bridge's parser and herdr's could read the same bytes differently.
 - **Sandbox provenance tokens for the herdr sidebar**: `$pall8t_image`
   and `$pall8t_container` are reported alongside the pane's display name.
 

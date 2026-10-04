@@ -873,8 +873,9 @@ mod tests {
         assert_eq!(
             cut.chars().count(),
             80,
-            "herdr caps a token value at 80 characters; sending more costs the \
-             whole metadata report, sidebar name included"
+            "herdr caps a token value at 80 characters — it truncates rather \
+             than refusing, so sending more does not cost the report; what it \
+             costs is the choice of which 80 characters survive"
         );
         assert!(
             cut.ends_with("501-20-deadbeefcafe"),
@@ -883,7 +884,9 @@ mod tests {
         );
         assert!(
             !token_value("tag\nwith\tcontrols").contains('\n'),
-            "control characters would make herdr reject the report"
+            "herdr strips control characters itself, so this is not what \
+             keeps the report alive — it keeps pall8t from building an argv \
+             with a newline in it, which is its own problem"
         );
     }
 
