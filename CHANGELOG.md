@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A birth time that comes and goes no longer resets the tab counters.**
+  A herdr server run is identified by its API socket's
+  `(dev, ino, birthtime)`, but the birth time was compared as a plain
+  value, so a socket whose `st_birthtime` was readable on one run and not
+  on the next — the same socket, stat'ed from a filesystem that reports
+  one and one that does not — read as a different run. A different run
+  resets the count, which renames every tab the live server still has on
+  screen: the one direction this module promises never to invent. What
+  cannot be read now decides nothing, and `(dev, ino)` alone decides
+  there, which is what the field already documented (issue #113).
+
 - **A runtime probe that could not run no longer reports the runtime as
   missing.** `container system status` doubled as the is-it-installed
   check, and *every* spawn failure became "the `container` CLI is not

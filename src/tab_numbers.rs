@@ -115,6 +115,10 @@ struct Assigned {
 }
 
 /// The identity of one herdr server *run*, read off its API socket.
+///
+/// The derived `PartialEq` is "the same stat", which is not the same
+/// question as "the same run" — see [`ServerRun::same_run`], and ask that
+/// one before concluding anything about a restart.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct ServerRun {
     dev: u64,
@@ -142,6 +146,36 @@ impl ServerRun {
             birth_secs: birth.map(|d| d.as_secs()),
             birth_nanos: birth.map(|d| d.subsec_nanos()),
         }
+    }
+
+    /// The birth time as one value. Both halves come from the same
+    /// `created()` call, so they are present or absent together, and
+    /// nothing should have to re-establish that.
+    fn birth(&self) -> Option<(u64, u32)> {
+        self.birth_secs.zip(self.birth_nanos)
+    }
+
+    /// Whether these two stats are of the same server run.
+    ///
+    /// `(dev, ino)` has to match, and the birth time decides only where
+    /// both sides have one. Comparing the two `Option`s as values — which
+    /// the derived `PartialEq` does — made a birth time that *appeared or
+    /// disappeared* read as a restart: the same socket stat'ed from a
+    /// filesystem that reports `st_birthtime` and one that does not is one
+    /// run, and resetting its counters there is the invented restart the
+    /// module's "unknown keeps counting" rule exists to prevent
+    /// (issue #113).
+    ///
+    /// Deliberately not transitive: an observation with no birth time
+    /// matches two runs that differ only in theirs. That is the shape of
+    /// the evidence rather than an oversight — what cannot be read may not
+    /// tell two runs apart, and may not merge them either.
+    fn same_run(&self, other: &ServerRun) -> bool {
+        (self.dev, self.ino) == (other.dev, other.ino)
+            && match (self.birth(), other.birth()) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
     }
 }
 
@@ -206,7 +240,7 @@ fn keeps_counting(recorded: Option<&ServerRun>, live: Option<&ServerRun>) -> boo
         // is listening, rather than a restart invented out of an old
         // ignorance.
         (_, None) | (None, Some(_)) => true,
-        (Some(r), Some(l)) => r == l,
+        (Some(r), Some(l)) => r.same_run(l),
     }
 }
 
@@ -582,6 +616,17 @@ mod tests {
         }
     }
 
+    /// The same run as [`server`], seen where the filesystem reports no
+    /// `st_birthtime`: the stat succeeded, the birth time is simply not
+    /// there to read.
+    fn server_without_birth(ino: u64) -> ServerRun {
+        ServerRun {
+            birth_secs: None,
+            birth_nanos: None,
+            ..server(ino)
+        }
+    }
+
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|s| (*s).to_string()).collect()
     }
@@ -738,6 +783,82 @@ mod tests {
             Some(&server(1)),
             "and the identity is recorded now that it is known, so the *next* \
              restart is visible"
+        );
+    }
+
+    /// A birth time is evidence when it is there; its absence is not
+    /// evidence of anything. Comparing the two `Option`s as values made a
+    /// birth time that appeared or disappeared read as a restart, which is
+    /// the one direction the module promises never to invent (issue #113).
+    #[test]
+    fn a_birth_time_that_comes_and_goes_is_not_a_restart() {
+        let later_birth = ServerRun {
+            birth_secs: Some(1_700_000_001),
+            ..server(1)
+        };
+        for (recorded, live, keeps_going, why) in [
+            (
+                server(1),
+                server_without_birth(1),
+                true,
+                "the socket stopped reporting a birth time, which says \
+                 nothing about whether it was re-bound — one filesystem \
+                 answers `st_birthtime` and another does not",
+            ),
+            (
+                server_without_birth(1),
+                server(1),
+                true,
+                "and the same in the other direction: learning a birth time \
+                 that was unreadable before is not a restart either",
+            ),
+            (
+                server_without_birth(1),
+                server_without_birth(1),
+                true,
+                "with no birth time on either side, `(dev, ino)` alone \
+                 decides, exactly as the field's doc says",
+            ),
+            (
+                server_without_birth(1),
+                server_without_birth(2),
+                false,
+                "a different inode is still a restart without a birth time \
+                 — dropping the only evidence left would mean never \
+                 resetting at all",
+            ),
+            (
+                server(1),
+                later_birth,
+                false,
+                "and where both sides have one, a birth time that differs is \
+                 the whole point of reading it: same inode, reused by a \
+                 socket bound later",
+            ),
+        ] {
+            assert_eq!(
+                keeps_counting(Some(&recorded), Some(&live)),
+                keeps_going,
+                "{why}"
+            );
+        }
+    }
+
+    /// The regression pin at the level a user feels it: a count that
+    /// survives the socket's birth time becoming unreadable.
+    #[test]
+    fn the_count_survives_a_birth_time_that_stops_being_readable() {
+        let (_, state) = allocate(State::default(), Some(&server(1)), &alloc("demo", "w:t1"));
+        let (n, _) = allocate(
+            state,
+            Some(&server_without_birth(1)),
+            &alloc("demo", "w:t2"),
+        );
+        assert_eq!(
+            n, 2,
+            "the same socket read where no birth time is available is the \
+             same run, so the counter carries on. Resetting here renames \
+             every tab the live server still has on screen (issue #113)"
         );
     }
 
@@ -1183,6 +1304,13 @@ mod properties {
     /// difference is guaranteed against the first entry only; that the rest
     /// also differ from each other in more than one field is incidental, and
     /// a smaller case count would thin it out.
+    ///
+    /// Every entry carries a birth time, deliberately. An observation
+    /// without one is the same run as two runs that differ only in theirs
+    /// ([`ServerRun::same_run`] is not transitive), so "a different index is
+    /// a different run" — the independent oracle the model below is built
+    /// on — would stop holding. That rule is pairwise rather than
+    /// sequential, so the table tests pin it instead.
     const RUNS: [(u64, u64, u64, u32); 5] = [
         (1, 10, 1_700_000_000, 0),
         (1, 11, 1_700_000_000, 0),

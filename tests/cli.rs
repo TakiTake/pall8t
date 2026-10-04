@@ -1936,7 +1936,22 @@ impl NamingWorld {
     /// Replaces the socket file, so its inode is a different one — what
     /// `tab_numbers` reads as "a new herdr server run".
     fn restart_herdr_server(&self) {
-        let _ = std::fs::remove_file(self.socket());
+        use std::os::unix::fs::MetadataExt;
+        // Replacing a socket only *usually* gets a new inode, and this
+        // fixture is what the restart tests rest on, so it enforces the
+        // difference rather than hoping for it: a hard link keeps the old
+        // inode allocated, which stops the filesystem handing the same one
+        // back. Where `st_birthtime` is unavailable — pall8t's own dev
+        // sandbox runs on such a filesystem — a reused inode makes the new
+        // socket a byte-identical `ServerRun`, and the test then asserts a
+        // restart it never produced. First call creates the socket, so
+        // there is nothing to pin yet.
+        if let Ok(m) = std::fs::metadata(self.socket()) {
+            let pin = self.sb.root.join(format!("herdr-sock.pinned.{}", m.ino()));
+            std::fs::hard_link(self.socket(), &pin)
+                .expect("the fixture's filesystem must support hard links");
+            std::fs::remove_file(self.socket()).unwrap();
+        }
         std::fs::write(self.socket(), b"").unwrap();
     }
 
