@@ -1326,7 +1326,13 @@ mod tests {
         let script = "#!/bin/sh\nexec \"/usr/local/libexec/container\" \"$@\"\n";
         let (target, env) = parse_exec_wrapper(script).unwrap();
         assert_eq!(target, "/usr/local/libexec/container");
-        assert!(env.is_empty());
+        assert!(
+            env.is_empty(),
+            "a wrapper that assigns nothing sets nothing — `exec_container` \
+             hands these straight to `Command::envs`, so an invented pair \
+             here would be set on the real `container` process that the \
+             wrapper never wrote: {env:?}"
+        );
     }
 
     #[test]
@@ -1648,8 +1654,18 @@ mod tests {
 
     #[test]
     fn parse_list_all_empty_output_is_empty() {
-        assert!(parse_list_all("").unwrap().is_empty());
-        assert!(parse_list_all("   ").unwrap().is_empty());
+        assert!(
+            parse_list_all("").unwrap().is_empty(),
+            "no output is no containers rather than a parse failure, and \
+             callers read an empty list as permission to prune — so it has \
+             to be the honest answer here, not a shrug"
+        );
+        assert!(
+            parse_list_all("   ").unwrap().is_empty(),
+            "whitespace says the same thing, because the trim in \
+             `parse_json_or_empty` happens before the parse — the two \
+             inputs must not be able to diverge"
+        );
     }
 
     #[test]

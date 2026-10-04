@@ -903,10 +903,26 @@ mod tests {
         assert_eq!(cfg.cpus, 4);
         assert_eq!(cfg.memory, "8g");
         assert_eq!(cfg.containerfile, None);
-        assert!(cfg.watch.is_empty());
+        assert!(
+            cfg.watch.is_empty(),
+            "nothing configured means nothing watched — a default watch path \
+             would rebuild the sandbox on a file nobody asked it to track: \
+             {:?}",
+            cfg.watch
+        );
         assert_eq!(cfg.command, vec!["claude".to_string()]);
-        assert!(cfg.mounts.is_empty());
-        assert!(cfg.warnings.is_empty());
+        assert!(
+            cfg.mounts.is_empty(),
+            "mounts are explicit (ADR-0009), so an unconfigured pall8t hands \
+             the sandbox no host path at all: {:?}",
+            cfg.mounts
+        );
+        assert!(
+            cfg.warnings.is_empty(),
+            "an empty config asked for nothing, so there is nothing to warn \
+             about — a warning here would fire on every default run: {:?}",
+            cfg.warnings
+        );
         assert_eq!(
             cfg.herdr.sandbox,
             HerdrSandbox::Full,
