@@ -343,6 +343,20 @@ local review failed to catch first (source PRs noted).
   by hand and watch the property go red. Green against a hand-broken
   rule is a generator finding, not a passing test.
 
+**An assertion that forbids a string** (PR #117)
+- `assert!(!msg.contains(X))` forbids X everywhere in the output, which
+  is almost always wider than the claim being made — and the extra width
+  is invisible until something legitimate says X. The host's home must
+  not appear as the *expanded target*; asserting it appears nowhere also
+  forbade the message's own `e.g. /home/dev/notes`, and the test then
+  failed on the advice rather than on a bug, in every environment where
+  `$HOME` is `/home/dev` (which is every pall8t sandbox).
+- Name the exact string that would mean the bug, build it from the
+  test's own input, and pick an input nothing else in the message can
+  spell. Then ask the other direction too: would this assertion fail on
+  a message that is *right*? A proxy that can is a flake with a date on
+  it.
+
 **Tests** (standing)
 - Per docs/testing.md: new tests use table form with reasoned assertion
   messages; each bug fix and each refuted review finding gets a pin;
